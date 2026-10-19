@@ -3,12 +3,16 @@
   "onboarding": false,
   "requireConfig": "ignored",
   "autodiscover": false,
-  "enabledManagers": ["custom.regex"],
+  "enabledManagers": [
+    "custom.regex"
+  ],
   "dependencyDashboard": false,
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": ["^port/upstream\\.renovate$"],
+      "fileMatch": [
+        "^port/upstream\\.renovate$"
+      ],
       "matchStrings": [
         "termuxChromiumVersion\\s*=\\s*\"(?<currentValue>[0-9][0-9.]*)\""
       ],
@@ -22,15 +26,20 @@
       "defaultRegistryUrlTemplate": "https://raw.githubusercontent.com/termux/termux-packages/master/x11-packages/chromium/build.sh",
       "format": "plain",
       "transformTemplates": [
-        "{\"releases\": [ $map($filter($.releases, function($r){ $contains($r.version, "TERMUX_PKG_VERSION=") }), function($r){ {\"version\": $match($r.version, /TERMUX_PKG_VERSION=([0-9][0-9.]*)/).groups[0]} }) ] }"
+        "{\"releases\": [ $map($filter($.releases, function($r){ $contains($r.version, \"TERMUX_PKG_VERSION=\") }), function($r){ {\"version\": $match($r.version, /TERMUX_PKG_VERSION=([0-9][0-9.]*)/).groups[0]} }) ] }"
       ]
     }
   },
   "packageRules": [
     {
-      "matchDepNames": ["termux-chromium-upstream"],
+      "matchDepNames": [
+        "termux-chromium-upstream"
+      ],
       "enabled": true,
-      "labels": ["upstream", "renovate"],
+      "labels": [
+        "upstream",
+        "renovate"
+      ],
       "commitMessageTopic": "Termux upstream Chromium"
     }
   ]

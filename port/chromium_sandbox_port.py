@@ -163,17 +163,26 @@ class Port:
         downgrade mystery, DESIGN.md Phase 0.3)."""
         import re
         pattern = re.compile(r"AppendSwitch\(\s*(sandbox::policy::)?switches::kNoSandbox\s*\)")
+        # Reviewed allowlist (production):
+        #  - sandbox_type.cc: the official per-child-type token mechanism
+        #  - render_process_host_impl.cc: upstream unsandboxed-relaunch site
+        #    (browser-side child spawn, NOT a browser-process downgrade)
+        # Test sources (unittest/browsertest/content/test, headless/test) are
+        # exempt: they never ship in the package build graph.
+        allowed = {
+            "sandbox/policy/sandbox_type.cc",
+            "content/browser/renderer_host/render_process_host_impl.cc",
+        }
+        test_pat = re.compile(r"(_unittest|_browsertest|_test)\.cc$|(^|/)tests?/")
         offenders: list[str] = []
-        allowed = {"sandbox/policy/sandbox_type.cc",
-                   "sandbox/policy/sandbox_type_unittest.cc",
-                   "content/browser/zygote_host/zygote_host_impl_linux.cc",  # our R1 file legitimately reads it
-                   }
         for d in dirs:
             base = self.root / d
             if not base.is_dir():
                 continue
             for f in base.rglob("*.cc"):
                 rel = str(f.relative_to(self.root))
+                if test_pat.search(rel):
+                    continue
                 txt = f.read_text(errors="ignore")
                 if pattern.search(txt) and rel not in allowed:
                     offenders.append(rel)
