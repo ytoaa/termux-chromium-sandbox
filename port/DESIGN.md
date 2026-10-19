@@ -138,3 +138,30 @@ to be committed). Logs: chromium-sandbox-poc/test[A-N]*.{log,txt} (local).
   relaunch loops mask a failing zygote boot (would inform P3).
 - Utility services (network) also carry 0 filters today; target policy set:
   renderer, gpu, utility*, (network service last — hardest socket rules).
+
+## Phase 0 FINAL verdict (round 2) — source patches are mandatory
+
+Flag matrix on the stock binary (exe-verified filter census, all runs
+`Seccomp_filters=1` == Android baseline, zero Chromium BPF):
+
+| combo | processes seen | Chromium filters |
+|---|---|---|
+| (none) | browser, utility, 10×zygote | 0 |
+| --disable-namespace-sandbox | same | 0 |
+| --no-zygote --no-sandbox | browser, gpu, 6×renderer, 2×utility | 0 |
+
+Also: kNoSandbox token appears nowhere in the argv of our launches, and the
+four classic early-startup files (chrome_main.cc, content_main.cc,
+chrome_browser_main[_posix].cc) contain zero kNoSandbox references — the
+in-memory downgrade rides upstream fallback paths (see Phase 0.3 verdict).
+
+**Phase 0 CLOSED (all PASS):** (1) seccomp-bpf self-install viable; (2) every
+namespace blocked (NEWUSER=EINVAL via Chromium's own probe semantics); (3) no
+configuration-only route to BPF — P1 (ZygoteHostImpl third usable mode),
+P2 (InitializeSandbox engage_namespace_sandbox=false), P3 (zygote children
+must install BPF without setuid/pidns) confirmed as the minimal patch set.
+
+Build strategy: follow the Firefox port — cloud GitHub Actions build of the
+Termux package with our transformer applied (device-side chromium builds are
+impractical); apt channel + version lead per the proven scheme, under the
+separate-package-identity constraint (stock chromium untouched).
