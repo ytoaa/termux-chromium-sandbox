@@ -256,3 +256,13 @@ Port response (fail-closed layers):
 - On compile/source failure: diagnose + fix code is allowed (that's normal
   porting work); a fresh dispatch after a real fix is considered a new
   attempt, not a blind retry — still worth a one-line confirmation.
+
+## Test device policy (updated run #10 wait)
+- MAIN device: extract-only, never dpkg, stock profile off-limits (unchanged).
+- DEDICATED REMOTE TEST DEVICE (S20 FE class, Android 13 / kernel 4.19, aarch64):
+  probe-verified same kernel posture as main (CLONE_NEWUSER EINVAL; seccomp-bpf
+  self-install works) ⇒ seccomp-only port is equally applicable.
+  No chromium ever installed ⇒ real dpkg/apt install-path tests allowed there;
+  remote_gate.sh installs, gates, then dpkg -r to keep it clean.
+- Gate scripts are synced to ~/chromium-gate on the remote; bpf_evidence
+  selftest already PASSes on-device.
