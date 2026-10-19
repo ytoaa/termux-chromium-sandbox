@@ -63,6 +63,6 @@ echo "baseline renderer filters=${base_max:-none} | ported renderer=${port_ren:-
 verdict=PASS
 [ "${base_max:-0}" -le 1 ] || { echo "GATE FAIL: baseline unexpectedly sandboxed (compare apples to apples)"; verdict=FAIL; }
 [ "${port_ren:-0}" -ge 2 ] || { echo "GATE FAIL: no ported renderer with >=2 filters (BPF missing)"; verdict=FAIL; }
-if [ -s "$CODEC_OUT" ] && ! grep -qE '=! grep -q '=> no' "$CODEC_OUT"gt; no|=> no' "$CODEC_OUT"; then echo "codecs ok"; else echo "GATE WARN/FAIL: codec report incomplete or unsupported"; grep -c '=> no' "$CODEC_OUT" >/dev/null 2>&1 || verdict=FAIL; fi
+if [ -s "$CODEC_OUT" ] && ! grep -qE "=&gt; no|=> no" "$CODEC_OUT"; then echo "codecs ok"; else echo "GATE FAIL: codec report incomplete or unsupported"; verdict=FAIL; fi
 echo "DEVICE GATE: $verdict"
 [ "$verdict" = PASS ]
