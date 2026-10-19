@@ -225,3 +225,25 @@ Firefox pattern).
   anchor key `termuxChromiumVersion`, recipe `x11-packages/chromium/build.sh`
   (TERMUX_PKG_VERSION is UNQUOTED there — extraction tolerant), version
   invariant N.0[.k] → exactly 4-segment `N.N.N.N`.
+
+## MYSTERY SOLVED (run #9, 2026-10-19): the stock silent-downgrade injector
+Phase 0.3's open question — "who appends --no-sandbox to the browser command
+line?" — was answered by our own anti-injection gate firing during build run
+#9 AFTER cr-patches applied:
+termux-packages `x11-packages/chromium-host-tools/cr-patches/`
+- `1001-chromium-disable-sandbox.patch`: under `#ifdef __TERMUX__` appends
+  `sandbox::policy::switches::kNoSandbox` to ForCurrentProcess() in BOTH
+  `chrome/app/chrome_main_delegate.cc::PreSandboxStartup` and
+  `content/shell/app/shell_main_delegate.cc::PreSandboxStartup`, and hides
+  the sandbox-disabling flags from bad_flags_prompt.cc (why users never saw
+  a warning either).
+- `1004-chromium-headless-disable-sandbox-by-default.patch`: same for headless.
+Earlier greps found nothing because they inspected UNPATCHED upstream files —
+the injection is Termux-patch-provided, not upstream, not runtime fallback.
+
+Port response (fail-closed layers):
+1. prepare_recipe excludes exactly those two patches from the recipe's
+   cr-patches loop (audit + harness [12] enforce).
+2. transformer anti-injection scan remains: if upstream renames/reshuffles
+   the patches, the surviving injection kills the build (run #9 demonstrated
+   the tripwire in production).
