@@ -29,7 +29,7 @@ case "$cmd" in
   prepare-builder) [ -n "${2:-}" ] || { echo "usage: ci.sh prepare-builder <termux-packages>" >&2; exit 2; }; prepare_builder "$2" ;;
   build) [ -n "${2:-}" ] || { echo "usage: ci.sh build <termux-packages>" >&2; exit 2; }; build_chromium "$2" ;;
   resolve-ref)    # $2 = termux-packages ref -> prints exact sha
-    : "${GITHUB_TOKEN:?}"
+    : "${GITHUB_TOKEN:=${GH_TOKEN:?need GITHUB_TOKEN or GH_TOKEN}}"
     ref=${2:-main}
     gh api --method GET "repos/termux/termux-packages/commits/${ref}" --jq .sha
     ;;
