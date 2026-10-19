@@ -71,6 +71,9 @@ def prepare(termux_dir: Path) -> dict:
                 text += HOOK
             target.write_text(text)
             report["build.sh"] = sha(target)
+        elif f.is_dir():
+            shutil.copytree(f, target, dirs_exist_ok=True)
+            report[f.name + "/"] = "tree"
         else:
             if target.is_file() and sha(target) == sha(f):
                 continue
