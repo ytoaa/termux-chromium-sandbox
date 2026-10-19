@@ -247,3 +247,12 @@ Port response (fail-closed layers):
 2. transformer anti-injection scan remains: if upstream renames/reshuffles
    the patches, the surviving injection kills the build (run #9 demonstrated
    the tripwire in production).
+
+## Runner operations policy (maintainer decision, 2026-10-19)
+- Builds run on GitHub-hosted ubuntu-26.04 (cloud; device untouched).
+- On TIMEOUT (350-min cap) or any infra failure: **STOP and report — do NOT
+  auto-redispatch.** sccache accumulation re-dispatch happens only on
+  explicit maintainer go-ahead.
+- On compile/source failure: diagnose + fix code is allowed (that's normal
+  porting work); a fresh dispatch after a real fix is considered a new
+  attempt, not a blind retry — still worth a one-line confirmation.
