@@ -64,8 +64,10 @@ jobs:
           path: termux-packages/.sccache
           key: chromium-sccache-aarch64-${{ env.termux_sha }}
           restore-keys: chromium-sccache-aarch64-
+      - name: Prepare Termux zram workspace bridge
+        run: bash port/ci.sh prepare-zram-workspace "$PWD/termux-packages"
       - name: Enable zram
-        uses: ./termux-packages/.github/actions/zram
+        uses: ./.github/actions/zram
       - name: Prepare Termux builder (docker + sccache image)
         run: bash port/ci.sh prepare-builder "$PWD/termux-packages"
       - name: Build chromium-sandboxed (port hook runs at post_get_source)
