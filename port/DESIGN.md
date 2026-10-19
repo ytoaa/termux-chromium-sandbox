@@ -89,3 +89,52 @@ Empirical (isolated profiles only; stock profile/package untouched):
 
 Evidence scripts: poc/seccomp_probe.c, poc/clone_ns_probe.c (clone_ns_probe
 to be committed). Logs: chromium-sandbox-poc/test[A-N]*.{log,txt} (local).
+
+## Phase 0.3 verdict (2026-10-19, round 2)
+
+### Why chromium runs unsandboxed WITHOUT dying (mechanism, code-verified)
+
+1. `Credentials::CanCreateProcessInNewUserNS()` (sandbox/linux/services/
+   credentials.cc:267-301) probes via forked-child `unshare(CLONE_NEWUSER)`
+   → EINVAL on this kernel → false (matches our clone probe: EINVAL; all other
+   namespace flags EPERM).
+2. `ZygoteHostImpl::Init` (zygote_host_impl_linux.cc:102-157) therefore can
+   reach neither `use_namespace_sandbox_` (needs userns) nor
+   `use_suid_sandbox_` (no chrome-sandbox binary ships) → upstream would
+   `LOG(FATAL) "No usable sandbox!"` at L144.
+3. Reality: no FATAL, browser healthy → L103 early-return fires, i.e. the
+   in-memory browser CommandLine carries kNoSandbox by then. Note the
+   call site passes `*CommandLine::ForCurrentProcess()`
+   (content_main_runner_impl.cc:1119-1120) — a MUTABLE singleton, and child
+   zygote cmd_lines are built from it (LaunchZygoteHelper ~L300-347, incl.
+   `AppendExtraCommandLineSwitches` → sandbox_type.cc:116-124 appends a real
+   --no-sandbox token per computed sandbox type).
+4. `LaunchZygote` (zygote_host_impl_linux.cc:177-226): zygotes carrying
+   `--no-zygote-sandbox` launch via plain `base::LaunchProcess` — NO pid-ns
+   boot handshake (`CHECK_GT(boot_pid,1)`), no premature-exit FATAL. The
+   9-zygote churn + zero BPF filters are consistent with pure-unsandboxed
+   operation using upstream-provided fallback paths.
+5. Remaining task (next round): pin the exact in-memory injector file among
+   the not-yet-grepped early-browser-startup sources:
+   chrome/app/chrome_main.cc, content/app/content_main.cc,
+   chrome/browser/chrome_browser_main.cc, chrome/browser/chrome_browser_main_posix.cc.
+
+### Port intervention points (first semantic patches, Phase 1 targets)
+
+- P1 `ZygoteHostImpl::Init`: introduce a third usable mode — seccomp-only
+  (no userns, no setuid, no FATAL) — gated by a Termux marker constant,
+  fail-closed elsewhere.
+- P2 `SandboxLinux::InitializeSandbox` options: force
+  `engage_namespace_sandbox=false` while KEEPING the BPF layer (the
+  seccomp-bpf support probe at sandbox_linux.cc:209-216 already passes on
+  this device per poc/seccomp_probe.c).
+- P3 ensure `--no-zygote-sandbox`-style unsandboxed shortcut is NOT taken
+  when the port is active: zygote must still fork children that install BPF
+  (zygote_main_linux.cc path) — mirror what Chrome-on-Android app sandbox does.
+
+### Risk register (updated)
+
+- 9-zygote churn observed even unsandboxed — investigate whether preload
+  relaunch loops mask a failing zygote boot (would inform P3).
+- Utility services (network) also carry 0 filters today; target policy set:
+  renderer, gpu, utility*, (network service last — hardest socket rules).
