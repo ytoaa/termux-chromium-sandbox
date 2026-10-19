@@ -207,3 +207,21 @@ Firefox pattern).
   prepare_recipe audit (hook + identity intact), (c) device gate measuring
   per-process Seccomp_filters > baseline + renderer's own
   CHECK(seccomp_bpf_started()) (crash-instead-of-silence property).
+
+## Phase 2b design notes (round 10)
+
+- **Version-lead simplification**: because the port ships as a DISTINCT
+  package name `chromium-sandboxed` (not a same-name replacement), the
+  Firefox-pack's `M.(m+1).p` packaging lead is NOT needed — dpkg never races
+  Termux's `chromium`. We keep plain `source_version-port_version`
+  (e.g. `155.0.8059.79-1.0.1`), with monotonicity enforced within our own
+  channel only.
+- Automation ported from the hardened Firefox line (exact-bot-identity
+  gate): port/auto_merge_upstream.sh + two workflow drafts (renovate,
+  auto-merge) under port/workflows/*.draft. They remain INERT until the
+  Phase 3 device gate passes (promotion = explicit commit moving them to
+  .github/workflows, reviewed diff — incident lesson).
+- Chromium adaptation deltas: branch pattern `renovate/termux-chromium-upstream-`,
+  anchor key `termuxChromiumVersion`, recipe `x11-packages/chromium/build.sh`
+  (TERMUX_PKG_VERSION is UNQUOTED there — extraction tolerant), version
+  invariant N.0[.k] → exactly 4-segment `N.N.N.N`.

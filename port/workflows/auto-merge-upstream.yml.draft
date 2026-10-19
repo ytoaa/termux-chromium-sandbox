@@ -1,0 +1,149 @@
+name: Auto-merge Renovate upstream bump PRs
+
+# Exception-only maintainer policy: merge Renovate's anchor-bump PRs when the
+# fail-closed checks in port/auto_merge_upstream.sh all pass; escalate
+# anything else with a needs-human comment instead of merging.
+#
+# Triggered by the watcher's completion (workflow_run is the
+# sanctioned chain that bypasses GITHUB_TOKEN event suppression).  The merge
+# itself is performed with GITHUB_TOKEN, which by design does NOT fire the
+# repo's push trigger, so the build is invoked explicitly below via
+# workflow_call(force=true).  Human merges keep using the push fast path.
+
+on:
+  workflow_run:
+    workflows: ["Renovate upstream chromium watcher"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Evaluate only this PR number (leave empty for auto-discovery)'
+        required: false
+        type: string
+      dry_run:
+        description: 'true = verdict comments only, never merge'
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: auto-merge-upstream
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    name: Evaluate & merge anchor bump PRs
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write        # merge (GITHUB_TOKEN), read anchor
+      pull-requests: write   # comment + merge
+      issues: write          # needs-human label
+    outputs:
+      merged: ${{ steps.evaluate.outputs.merged }}
+      # Exact termux-packages commit the gate EVALUATED against.  Propagated
+      # to build-after-merge so the build consumes the SAME upstream state
+      # the version ground-truth was read from — closing the gate-evaluated-
+      # X-vs-build-pulls-Y TOCTOU (a master move between merge and build
+      # would otherwise ship an un-audited recipe, and the audit tuple in
+      # the merge commit would reference a state the build never used).
+      termux_commit: ${{ steps.live.outputs.termux_commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      # Renovate runs under this repository's GITHUB_TOKEN. PR events caused
+      # by that token are not a reliable enforcement point: GitHub may suppress
+      # the child workflow or surface action_required with zero jobs.
+      # workflow_run is already the recursion-safe chain, so the same harness
+      # runs here before any merge authority is used.
+      - name: Pre-merge harness (authoritative for Renovate bot PRs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          find port -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          python3 -m py_compile port/prepare_recipe.py port/chromium_sandbox_port.py
+          python3 - <<'PY'
+          import glob, sys
+          try:
+              import yaml
+          except ImportError:
+              print("PyYAML unavailable on runner — structural greps still run in the harness")
+              sys.exit(0)
+          bad = []
+          for p in sorted(glob.glob(".github/workflows/*.yml")):
+              try:
+                  yaml.safe_load(open(p))
+              except Exception as e:
+                  bad.append(f"{p}: {e}")
+          if bad:
+              print("\n".join(bad), file=sys.stderr)
+              sys.exit(1)
+          print(f"YAML parse OK: {len(glob.glob('.github/workflows/*.yml'))} workflows")
+          PY
+          bash port/tests/run_tests.sh
+
+      - name: Fetch live Termux recipe (ground truth, commit-pinned)
+        id: live
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Pin the recipe to the last commit that touched it, then fetch raw
+          # AT that commit: the parsed version and the recorded termux-packages
+          # SHA in the audit tuple can never refer to different states.
+          # NOTE: query params must stay in the URL — `gh api -f/--field` flips
+          # the default method to POST, and POST /repos/*/commits is a 404
+          # (live-verified failure, auto-merge runs 2026-09-28..29).
+          SHA=$(gh api \
+            "repos/termux/termux-packages/commits?path=x11-packages/chromium/build.sh&per_page=1" \
+            --jq '.[0].sha')
+          [ -n "$SHA" ] || { echo "cannot resolve termux-packages commit for recipe path"; exit 1; }
+          printf '%s' "$SHA" | grep -qE '^[0-9a-f]{40}$' \
+            || { echo "resolved termux-packages commit is not a 40-hex SHA: $SHA"; exit 1; }
+          curl -fsSL \
+            "https://raw.githubusercontent.com/termux/termux-packages/${SHA}/x11-packages/chromium/build.sh" \
+            -o /tmp/build.sh
+          echo "TERMUX_PACKAGES_SHA=${SHA}" >> "$GITHUB_ENV"
+          echo "termux_commit=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate candidates
+        id: evaluate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          TERMUX_PACKAGES_SHA: ${{ env.TERMUX_PACKAGES_SHA }}
+        run: bash port/auto_merge_upstream.sh
+
+  build-after-merge:
+    name: Build merged upstream bump
+    needs: triage
+    # always(): a post-merge-verify failure makes the gate exit nonzero
+    # (5) WHILE merged=true — main HAS changed, so the build of the landed
+    # version is mandatory even though the gate run is red.  Without
+    # always() a verify-failed merge would ship an unbuilt main.
+    # A triage failure BEFORE any merge leaves merged unset -> expression
+    # false -> no build (fail closed).
+    if: always() && needs.triage.outputs.merged == 'true' && inputs.dry_run != true
+    # Reusable calls cannot request more than the CALLING job grants, and
+    # this workflow's top-level 'permissions: {}' would grant none -> startup
+    # error. FIX-3 added a 'release' job in chromium-sandbox.yml requesting
+    # contents: write (GitHub release + gh-pages push), so this call must
+    # grant contents: write or every workflow_run chain startup_fails.
+    permissions:
+      contents: write
+    uses: ./.github/workflows/chromium-sandbox.yml
+    with:
+      force: true
+      # Exact commit SHA the gate evaluated against (job output; validated
+      # 40-hex at the source).  NEVER 'master': a mutable ref here would let
+      # Termux move between the gate's evaluation and the build's checkout,
+      # shipping a recipe state that was never audited.
+      termux_ref: ${{ needs.triage.outputs.termux_commit }}

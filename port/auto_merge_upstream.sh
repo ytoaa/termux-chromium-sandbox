@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+# Auto-merge gate for Renovate upstream chromium bump PRs (exception-only policy).
+#
+# Policy: the maintainer is NOT a steady-state gate.  A Renovate PR that
+# updates port/upstream.renovate is merged automatically ONLY when every
+# check below passes; anything else leaves the PR open and escalates it with
+# a needs-human comment (the sole human touchpoints, per repo policy).
+#
+# Fail-closed checks (all required for accept):
+#   1. head branch matches ^renovate/termux-chromium-upstream-
+#   2. PR head and base are the SAME repository and the PR creator is
+#      exactly github-actions[bot] with type Bot.
+#      author_association is deliberately NOT a trust input: same-repo PRs
+#      created by this repository's GITHUB_TOKEN have been observed as NONE
+#      and CONTRIBUTOR.  Trust instead comes from exact bot identity +
+#      same-repo provenance + the content/live-version/head-SHA checks below.
+#      Do NOT use isCrossRepository: the key is absent on this repo's PR
+#      responses and jq's `null == false` is false, which would silently drop
+#      every legit PR (panel struck-claim (g), 2026-09-28).
+#   3. PR changes exactly one file: port/upstream.renovate
+#   4. the proposed termuxChromiumVersion parses as N.N.N.N (4-segment)
+#   5. proposed == TERMUX_PKG_VERSION in the LIVE Termux recipe (ground truth,
+#      fetched at a pinned termux-packages commit; see TERMUX_PACKAGES_SHA)
+#   6. proposed > current anchor (semantic-ordered; rejects downgrades)
+#   7. version is exactly 4-segment N.N.N.N (chromium release shape)
+#
+# Atomicity (panel finding F-01): every per-PR fact comes from ONE gh api
+# round-trip, the diff is fetched after that read, and head.sha is RE-READ
+# after evaluation; any drift aborts the merge (the next watcher cycle re-evaluates
+# the new head cleanly).  The merge itself pins --match-head-commit, so no
+# window remains between the final re-read and GitHub's own verification.
+#
+# Escalation integrity (F-06): a declined PR MUST end up with the
+# needs-human label; comment dedup never skips the label.  Any escalation
+# write failure makes the run exit nonzero (a silent decline is a
+# policy-integrity failure).  DRY_RUN performs no writes at all.
+#
+# Audit record (compliance C-1): the full evaluation tuple (head sha,
+# termux-packages commit SHA used for the live-recipe check, anchor
+# transition, gate-script hash, run URL) is written into the MERGE COMMIT
+# MESSAGE on protected main — append-only, not erasable by the audited
+# subject.  The AUTO-MERGE-ACCEPT PR comment is posted only after the merge
+# lands and is a convenience copy, not the record.
+#
+# Post-merge build note: merges performed with GITHUB_TOKEN do NOT fire the
+# repository's `push` trigger (GitHub recursion suppression).  The workflow
+# that calls this script must run the build explicitly via workflow_call with
+# force=true.  Manual human merges still use the push trigger fast path.
+#
+# Truth-state model (10-02 review): `merged` output reflects what LANDED on
+# main, decided the moment `gh pr merge` returns success.  Post-merge
+# verification is a separate observation channel: on verify failure the run
+# still says merged=true (main WAS changed), the candidate loop halts, and
+# the gate exits nonzero so the caller workflow (`if: always()`) still builds
+# the landed version and the heartbeat sees the failure.
+#
+# Exit codes: 0 ok | 2 anchor/live recipe unparsable | 3 candidate listing or
+# main-blob read failed (fail closed, never "no candidates") | 4 escalation
+# write failed | 5 merge landed but post-merge verification failed.
+#
+# Env: DRY_RUN=true  -> evaluate only; no merge, no PR writes.
+#      PR_NUMBER     -> evaluate that single PR (manual dispatch testing).
+#      TERMUX_PACKAGES_SHA -> commit SHA the live recipe was fetched at
+#                             (audit tuple; empty tolerated, logged as unknown).
+# Expects: /tmp/build.sh (live recipe at TERMUX_PACKAGES_SHA), repo checkout
+# in CWD, gh authed (GITHUB_TOKEN). Tests: port/tests/run_tests.sh.
+set -uo pipefail
+
+ANCHOR="port/upstream.renovate"
+DRY_RUN="${DRY_RUN:-false}"
+PR_NUMBER="${PR_NUMBER:-}"
+ESCALATION_MARKER="AUTO-MERGE-REJECT"
+REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
+RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${REPO}/actions/runs/${GITHUB_RUN_ID:-unknown}"
+TERMUX_PACKAGES_SHA="${TERMUX_PACKAGES_SHA:-}"
+
+log() { printf '[auto-merge] %s\n' "$*"; }
+# Retry diagnostics go to STDERR only: callers capture stdout as the API
+# payload (`candidates=$(gh_retry ...)`), so a WARN printed on stdout after a
+# failed first attempt would be prepended to the successful payload and
+# corrupt the parse (e.g. candidates containing 'WARN:...' tokens).
+warn() { printf '[auto-merge] %s\n' "$*" >&2; }
+
+# stderr sink for retry diagnostics (never a hardcoded /tmp path: some
+# sandboxes mount it read-only)
+GH_RETRY_ERR="$(mktemp 2>/dev/null || echo "${TMPDIR:-.}/gh_retry_err.$$")"
+
+# Retry a gh call (transient API failures must not masquerade as declines or
+# empty candidate sets — F-10).  Usage: gh_retry <max> -- <args...>
+# SUCCESS PAYLOAD ONLY on stdout; every diagnostic on stderr (see warn()).
+gh_retry() {
+  local max="$1"; shift; [ "${1:-}" = "--" ] && shift
+  local attempt=1 rc=0 out
+  while [ "$attempt" -le "$max" ]; do
+    if out=$("$@" 2>"$GH_RETRY_ERR"); then
+      printf '%s' "$out"; return 0
+    else
+      # capture INSIDE else: after `fi` the exit status is fi's own (0),
+      # which silently disabled fail-closed checks in an earlier revision.
+      rc=$?
+    fi
+    warn "WARN: attempt $attempt/$max failed (rc=$rc): $* — $(head -c 200 "$GH_RETRY_ERR" 2>/dev/null)"
+    attempt=$((attempt+1)); sleep 2
+  done
+  return "$rc"
+}
+
+anchor_value() {
+  sed -n 's/^termuxChromiumVersion *= *"\([0-9][0-9.]*\)".*/\1/p' "$ANCHOR" | head -n1
+}
+
+live_value() {
+  sed -n 's/^TERMUX_PKG_VERSION="\{0,1\}\([^"#[:space:]]*\)"\{0,1\}.*/\1/p' "${LIVE_RECIPE:-/tmp/build.sh}" | head -n1
+}
+
+# true if $1 < $2 by dot-numeric ordering (locale-pinned: sort -V must not be
+# affected by runner locale)
+version_lt() {
+  [ "$(printf '%s\n%s\n' "$1" "$2" | LC_ALL=C sort -V | head -n1)" = "$1" ] && [ "$1" != "$2" ]
+}
+
+# sha256 of the anchor file blob at a given ref (content-addressed skip:
+# a PR whose anchor blob already equals main's blob is already landed — F-13).
+# Only a 40-hex sha is accepted: a `null`/error body must not become a
+# comparable value (two failed reads reading as "equal" would skip merges).
+anchor_blob_sha() {
+  # -X GET is REQUIRED: gh flips to POST when -f is passed, and POST
+  # /repos/*/contents/* is not this call (live-verified 404 class, 09-29).
+  local sha
+  sha=$(gh_retry 3 -- gh api "repos/${REPO}/contents/${ANCHOR}" -X GET -f ref="$1" --jq .sha 2>/dev/null) || return 1
+  printf '%s' "${sha:-}" | grep -qE '^[0-9a-f]{40}$' && printf '%s' "$sha"
+}
+
+ESCALATION_WRITE_FAILED=0
+
+escalate() {
+  local pr="$1" reasons="$2"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "PR #$pr DECLINED verdict (dry-run: no PR writes): $reasons"
+    return 0
+  fi
+  local rc=0
+  # Label FIRST and always: it is the durable escalation signal the heartbeat
+  # keys on; comment dedup must never starve it.
+  if ! gh_retry 3 -- gh pr edit "$pr" --add-label needs-human; then
+    log "ERROR: could not apply needs-human label to PR #$pr — escalation is NOT visible"
+    rc=1
+  fi
+  local existing
+  existing=$(gh_retry 2 -- gh pr view "$pr" --json comments \
+    --jq '[.comments[].body | contains("'"$ESCALATION_MARKER"'")] | any' 2>/dev/null || echo false)
+  if [ "$existing" = "true" ]; then
+    log "PR #$pr already has an escalation comment; skipping duplicate (label still enforced)"
+  elif ! gh_retry 3 -- gh pr comment "$pr" --body "**$ESCALATION_MARKER** — auto-merge gate declined this PR. Reasons: $reasons.
+
+Leaving this PR open for maintainer decision. Checks applied: same-repo bot identity, branch pattern, single-file diff, live-recipe match, forward bump, 4-segment version shape. See port/auto_merge_upstream.sh. Run: ${RUN_URL}"; then
+    log "ERROR: escalation comment failed for PR #$pr (label attempted separately)"
+    rc=1
+  fi
+  [ "$rc" = "0" ] || ESCALATION_WRITE_FAILED=1
+  log "PR #$pr ESCALATED to human: $reasons"
+  return 0
+}
+
+accept_merge() {
+  local pr="$1" current="$2" proposed="$3" headsha="$4" head_ref="$5" nplus="$6" nminus="$7"
+  if [ "$DRY_RUN" = "true" ]; then
+    log "PR #$pr ACCEPT verdict (dry-run: not merging)"
+    return 0
+  fi
+  local gate_hash live_note
+  gate_hash=$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1 || echo unknown)
+  if [ -n "$TERMUX_PACKAGES_SHA" ]; then
+    live_note="live=${live}@termux-packages=${TERMUX_PACKAGES_SHA}"
+  else
+    live_note="live=${live}@termux-packages=UNKNOWN"
+  fi
+  # --match-head-commit pins the MERGE; the post-evaluation head re-read in
+  # the loop above pinned the EVALUATION to the same sha.  Together:
+  # eval-vs-merge is sha-atomic.
+  local audit="AUTO-MERGE audit tuple (F-01/F-04 FIX-1): head_sha=${headsha} head_ref=${head_ref} anchor=${current}->${proposed} diff=+${nplus}/-${nminus} ${live_note} gate_sha256=${gate_hash} run=${RUN_URL}"
+  if ! gh_retry 1 -- gh pr merge "$pr" --merge \
+      --subject "Merge pull request #${pr} from ${head_ref} (auto-merge gate)" \
+      --body "$audit" \
+      --match-head-commit "$headsha"; then
+    escalate "$pr" "merge-command-failed (head likely changed since evaluation)"
+    return 1
+  fi
+  log "PR #$pr MERGED (anchor $current -> $proposed @ $headsha)"
+  # TRUTH STATE FIRST (10-02 review): a successful `gh pr merge` has already
+  # changed main.  MERGED/MERGED_VERSION must record that immediately — NOT
+  # gated on post-verification, which reports on what we OBSERVED, not on
+  # whether the merge happened.  The old order produced false
+  # `merged=false` outputs for a merge that HAD landed (workflow would then
+  # skip the mandatory build of the new main).  Verification failure is
+  # carried separately in POST_MERGE_VERIFY_FAILED (gate still exits nonzero).
+  MERGED=1
+  MERGED_VERSION="$proposed"
+  # Verify what LANDED against the branch ref — never the mutable PR object's
+  # merge_commit_sha (panel evidence: PR #3's merge_commit_sha is orphaned).
+  # EVERY element is required (fail-closed): main branch SHA (40 hex), the
+  # contents API read, a decodable content field, a parsed anchor, and
+  # anchor == proposed.  The old `[ -n "$new_anchor" ] && ...` form passed on
+  # an EMPTY read (API/parse failure read as verification success).
+  local main_sha anchor_b64 decoded new_anchor
+  main_sha=$(gh_retry 3 -- gh api "repos/${REPO}/branches/main" --jq .commit.sha) || main_sha=""
+  # --method GET is REQUIRED (gh flips to POST when -f is passed; the POST
+  # contents route is create-file — 403 for our token, live 09-29).
+  anchor_b64=$(gh_retry 3 -- gh api "repos/${REPO}/contents/${ANCHOR}" \
+      --method GET -f ref=main --jq .content) || anchor_b64=""
+  new_anchor=""
+  if [ -n "$anchor_b64" ] && [ "$anchor_b64" != "null" ]; then
+    decoded=$(printf '%s' "$anchor_b64" | tr -d '\n' | base64 -d 2>/dev/null) \
+      && new_anchor=$(printf '%s\n' "$decoded" \
+          | sed -n 's/^termuxChromiumVersion *= *"\([0-9][0-9.]*\)".*/\1/p' | head -n1)
+  fi
+  if ! printf '%s' "$main_sha" | grep -qE '^[0-9a-f]{40}$'; then
+    log "ERROR: post-merge verify FAILED — main branch SHA unreadable/invalid ('${main_sha:-empty}')"
+    POST_MERGE_VERIFY_FAILED=1
+    return 0
+  fi
+  if [ -z "$new_anchor" ]; then
+    log "ERROR: post-merge verify FAILED — anchor on main unreadable (contents read/decode/parse failed), expected '$proposed' (main sha $main_sha)"
+    POST_MERGE_VERIFY_FAILED=1
+    return 0
+  fi
+  if [ "$new_anchor" != "$proposed" ]; then
+    log "ERROR: post-merge verify FAILED — main anchor '$new_anchor' != expected '$proposed' (main sha $main_sha)"
+    POST_MERGE_VERIFY_FAILED=1
+    return 0
+  fi
+  log "post-merge verify OK: main=${main_sha} anchor=${new_anchor}"
+  # Accept comment AFTER verified merge: convenience copy only; the merge
+  # commit message on main is the audit record (C-1).  Skipped when
+  # verification failed — the accept claim must be verified, while the
+  # merged=true OUTPUT stays truthful about the landed merge.
+  if ! gh_retry 2 -- gh pr comment "$pr" --body "AUTO-MERGE-ACCEPT — merged per exception-only policy (single-file anchor bump $current -> $proposed, ${live_note}). Audit record: merge commit message on main. Build runs via workflow_call(force=true). Run: ${RUN_URL}"; then
+    log "WARN: accept comment failed (merge succeeded; audit record is the merge commit)"
+  fi
+  return 0
+}
+
+MERGED=0
+MERGED_VERSION=""
+POST_MERGE_VERIFY_FAILED=0
+live="$(live_value)"
+if [ -z "$live" ]; then
+  log "ERROR: cannot parse TERMUX_PKG_VERSION from live recipe (shape change?)"
+  exit 2
+fi
+log "live Termux chromium = $live @ termux-packages=${TERMUX_PACKAGES_SHA:-UNKNOWN}"
+
+if [ -n "$PR_NUMBER" ]; then
+  candidates="$PR_NUMBER"
+else
+  if ! candidates=$(gh_retry 4 -- gh pr list --state open --json number,headRefName \
+    --jq '.[] | select(.headRefName | test("^renovate/termux-chromium-upstream-")) | .number | tostring'); then
+    log "ERROR: candidate listing failed after retries — refusing to report 'no candidates' (F-10)"
+    exit 3
+  fi
+fi
+if [ -z "$candidates" ]; then
+  log "no candidate PRs; nothing to do"
+  echo "merged=false" >> "${GITHUB_OUTPUT:-/dev/null}"
+  exit 0
+fi
+
+current="$(anchor_value)"
+[ -n "$current" ] || { log "ERROR: anchor file unreadable/malformed: $ANCHOR"; exit 2; }
+log "anchor = $current"
+
+main_blob=$(anchor_blob_sha main) || true
+if [ -z "$main_blob" ]; then
+  log "ERROR: cannot read main anchor blob via contents API (fail closed)"
+  exit 3
+fi
+
+for pr in $candidates; do
+  # Single round-trip for all identity/atomicity facts (F-01/F-04).
+  # author_association is captured for diagnostics only; it is not stable for
+  # GITHUB_TOKEN-created same-repo PRs and therefore is not an authority bit.
+  read -r head_ref headsha head_full base_full actor_login actor_type assoc <<EOF2
+$(gh_retry 3 -- gh api "repos/${REPO}/pulls/${pr}" --jq '[.head.ref, .head.sha, .head.repo.full_name, .base.repo.full_name, .user.login, .user.type, .author_association] | join(" ")')
+EOF2
+  if [ -z "${head_ref:-}" ] || [ -z "${headsha:-}" ]; then
+    log "ERROR: PR #$pr metadata read failed after retries (not treating as no-candidate)"
+    escalate "$pr" "pr-metadata-unreadable (API failure — NOT a policy decline; investigate)"
+    continue
+  fi
+
+  reasons=()
+
+  [[ "$head_ref" =~ ^renovate/termux-chromium-upstream- ]] || reasons+=("branch-not-renovate-pattern:$head_ref")
+
+  # Identity: exact repository-owned Actions bot + same-repo head/base.
+  # author_association is informational only: live GITHUB_TOKEN-created PRs
+  # have appeared as NONE/CONTRIBUTOR.  The exact diff/live-version/head-SHA
+  # checks below still make this fail closed.
+  [ "$head_full" = "$REPO" ] || reasons+=("head-repo-not-same-repo:$head_full")
+  [ "$base_full" = "$REPO" ] || reasons+=("base-repo-unexpected:$base_full")
+  if [ "$actor_login" != "github-actions[bot]" ] || [ "$actor_type" != "Bot" ]; then
+    reasons+=("pr-author-not-trusted:${actor_login:-missing}/${actor_type:-missing}")
+  fi
+  log "PR #$pr identity: actor=${actor_login:-missing}/${actor_type:-missing} association=${assoc:-missing} (association informational only)"
+
+  # Content-addressed already-landed skip (F-13): head anchor blob identical
+  # to main's => merging would be a no-op with a lying audit record.
+  if [ ${#reasons[@]} -eq 0 ]; then
+    head_blob=$(anchor_blob_sha "$headsha")
+    if [ -n "$head_blob" ] && [ "$head_blob" = "$main_blob" ]; then
+      log "PR #$pr skipped: anchor blob already landed on main (no-op merge refused)"
+      continue
+    fi
+  fi
+
+  files=$(gh_retry 3 -- gh pr view "$pr" --json files --jq '[.files[].path] | join(",")') \
+    || { log "ERROR: PR #$pr files read failed after retries"; escalate "$pr" "files-read-failed (API failure — investigate)"; continue; }
+  [ "$files" = "$ANCHOR" ] || reasons+=("unexpected-files:$files")
+
+  # One diff fetch for this PR; the bump must be exactly one + / one -
+  # anchor line (column-0).  A multi-line diff would make the parsed proposal
+  # diverge from the final file state (multi-value assignment smuggling).
+  diff=$(gh_retry 3 -- gh pr diff "$pr") \
+    || { log "ERROR: PR #$pr diff read failed after retries"; escalate "$pr" "diff-read-failed (API failure — investigate)"; continue; }
+  nplus=$(printf '%s\n' "$diff" | grep -c '^+termuxChromiumVersion' || true)
+  nminus=$(printf '%s\n' "$diff" | grep -c '^-termuxChromiumVersion' || true)
+  { [ "$nplus" = "1" ] && [ "$nminus" = "1" ]; } || reasons+=("diff-shape-not-single-bump:+$nplus/-$nminus")
+
+  proposed=$(printf '%s\n' "$diff" | sed -n 's/^+termuxChromiumVersion *= *"\([0-9][0-9.]*\)".*/\1/p' | head -n1)
+  if [ -z "$proposed" ]; then
+    reasons+=("proposed-version-unparsable")
+  else
+    [ "$proposed" = "$live" ] || reasons+=("proposed-$proposed-differs-from-live-$live")
+    version_lt "$current" "$proposed" || reasons+=("not-a-forward-bump:$current->$proposed")
+    [[ "$proposed" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || reasons+=("bad-chromium-version-shape:$proposed")
+  fi
+
+  # Post-evaluation re-read: the head GitHub evaluated must be the head
+  # GitHub merges (F-01).  Any drift between the first read and here => abort;
+  # the next watcher cycle re-evaluates the new head cleanly.  Combined with
+  # --match-head-commit (atomically verified by GitHub at merge time), no
+  # read sits between this re-read and the merge.
+  if [ ${#reasons[@]} -eq 0 ]; then
+    headsha2=$(gh_retry 2 -- gh api "repos/${REPO}/pulls/${pr}" --jq .head.sha) || headsha2=""
+    if [ "$headsha2" != "$headsha" ]; then
+      escalate "$pr" "head-changed-during-evaluation ($headsha -> ${headsha2:-unreadable}) — will re-evaluate next cycle"
+      continue
+    fi
+  fi
+
+  if [ "${#reasons[@]}" -gt 0 ]; then
+    escalate "$pr" "$(IFS='; '; echo "${reasons[*]}")"
+  else
+    accept_merge "$pr" "$current" "$proposed" "$headsha" "$head_ref" "$nplus" "$nminus" || true
+    # Post-merge verification failed => the state of main is NOT confirmed.
+    # Stop merging further candidates (merged=true already reflects the
+    # landed merge; the gate exits nonzero and the heartbeat sees the run as
+    # failed — while build-after-merge still fires via if: always()).
+    if [ "$POST_MERGE_VERIFY_FAILED" = "1" ]; then
+      log "ERROR: halting candidate loop after post-merge verify failure (PR #$pr merged but main state unverified)"
+      break
+    fi
+    # Re-anchor loop state after a successful merge: the local checkout is a
+    # stale snapshot, so refresh main-side facts for subsequent candidates
+    # (kills the stale-`current` multi-merge window, F-13).
+    if [ "$MERGED" = "1" ]; then
+      current="$MERGED_VERSION"
+      main_blob=$(anchor_blob_sha main) || main_blob="$main_blob"
+    fi
+  fi
+done
+
+echo "merged=$([ "$MERGED" = "1" ] && echo true || echo false)" >> "${GITHUB_OUTPUT:-/dev/null}"
+# merged_pr_version is only truthful for a version that actually merged (F-13).
+echo "merged_pr_version=${MERGED_VERSION}" >> "${GITHUB_OUTPUT:-/dev/null}"
+
+if [ "$POST_MERGE_VERIFY_FAILED" = "1" ]; then
+  log "ERROR: a merge landed on main but post-merge verification FAILED — merged=true stands (main WAS changed); the workflow must still build the landed version; investigate why main's anchor read did not confirm"
+  exit 5
+fi
+
+if [ "$ESCALATION_WRITE_FAILED" = "1" ]; then
+  log "ERROR: one or more escalation writes failed — exiting nonzero so the heartbeat sees a failed gate run (F-06)"
+  exit 4
+fi
+exit 0
