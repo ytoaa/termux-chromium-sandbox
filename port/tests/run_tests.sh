@@ -69,6 +69,19 @@ python3 port/prepare_recipe.py prepare --termux-dir "$TREP2" >/dev/null 2>&1
 bash -n "$TREP2/x11-packages/chromium-sandboxed/build.sh" \
   && pass "[10] generated recipe parses" || fail "[10] recipe syntax broken"
 
+# [11] regression (run #7): generated recipe must KEEP upstream post_get_source
+# body (cr-patches loop) — chaining, never shadowing.
+fresh; TREP3="$WORK/termux3"; mkdir -p "$TREP3/x11-packages/chromium"
+cp "$FIX/termux-build.sh" "$TREP3/x11-packages/chromium/build.sh"
+touch "$TREP3/build-package.sh"; chmod +x "$TREP3/build-package.sh"
+python3 port/prepare_recipe.py prepare --termux-dir "$TREP3" >/dev/null 2>&1
+g="$TREP3/x11-packages/chromium-sandboxed/build.sh"
+grep -q 'termux_step_post_get_source_upstream()' "$g" \
+  && grep -q 'cr-patches' "$g" \
+  && [ "$(grep -c '^termux_step_post_get_source() {' "$g")" = "1" ] \
+  && pass "[11] upstream post_get_source chained, not shadowed" \
+  || fail "[11] clobber regression (upstream body lost or duplicate def)"
+
 # [9] tampered recipe (hook removed) -> audit must fail
 sed -i '/port hook (generated/,/port hook <<</d' "$TREP/x11-packages/chromium-sandboxed/build.sh"
 python3 port/prepare_recipe.py audit --termux-dir "$TREP" >/dev/null 2>&1 \
