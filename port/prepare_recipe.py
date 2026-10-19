@@ -67,9 +67,24 @@ def prepare(termux_dir: Path) -> dict:
             text = f.read_text()
             text = rewrite_identity(text)
             if HOOK_BEGIN not in text:
+                # Chain, NEVER clobber: if the recipe defines its own
+                # termux_step_post_get_source (chromium does — it applies
+                # chromium-host-tools/cr-patches!), rename it and call it
+                # first from our wrapper. A blindly appended duplicate would
+                # silently shadow it and drop every cr-patch (learned the
+                # hard way: v8 BUILD.gn assert fired, run #7).
+                if re.search(r"^termux_step_post_get_source\(\)\s*\{", text, re.M):
+                    text = re.sub(r"^termux_step_post_get_source\(\)\s*\{",
+                                  "termux_step_post_get_source_upstream() {",
+                                  text, count=1, flags=re.M)
+                    wrapper = HOOK.replace(
+                        "termux_step_post_get_source() {",
+                        "termux_step_post_get_source() {\n\ttermux_step_post_get_source_upstream")
+                else:
+                    wrapper = HOOK
                 if not text.endswith("\n"):
                     text += "\n"
-                text += HOOK
+                text += wrapper
             target.write_text(text)
             report["build.sh"] = sha(target)
         elif f.is_dir():
