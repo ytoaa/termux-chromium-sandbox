@@ -46,3 +46,15 @@ Chromium's Linux sandbox has three cooperating layers; we drop the middle one:
   inside the workflow_run chain before any merge authority.
 - No personal data, emails (noreply only), device identifiers in repo, logs,
   or commit metadata.
+
+## Device safety constraints (user-mandated, 2026-10-19)
+
+- The maintainer device's installed `chromium` package (155.0.8059.79), its
+  binaries, and the real profile at `~/.config/chromium` are OFF-LIMITS:
+  never delete, modify, replace, or `dpkg`-operate on them.
+- All runtime experiments MUST run with an isolated
+  `--user-data-dir=<workspace>/chromium-test-profile*` and may only delete
+  directories they created themselves under the workspace.
+- Sandbox-port builds ship as a SEPARATE package identity (not an overwrite
+  of Termux's `chromium`) so a test device can keep the stock browser intact;
+  the apt/version-lead scheme is re-derived to preserve this property.

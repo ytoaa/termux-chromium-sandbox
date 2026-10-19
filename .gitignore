@@ -3,3 +3,4 @@ poc/seccomp_probe
 *.deb
 evidence/
 __pycache__/
+chromium-test-profile*/
