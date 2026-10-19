@@ -46,6 +46,51 @@ termux_step_post_get_source() {{
 }}
 {HOOK_END}
 """
+
+TARBALL_REPO = "chromium-linux-tarballs/chromium-tarballs"
+
+def host_tools_version(termux_dir: Path) -> str | None:
+    f = termux_dir / "x11-packages" / "chromium-host-tools" / "build.sh"
+    if not f.is_file():
+        return None
+    m = re.search(r'^TERMUX_PKG_VERSION="?([0-9][0-9.]*)"?', f.read_text(), re.M)
+    return m.group(1) if m else None
+
+def fetch_tarball_sha256(version: str) -> str:
+    """sha256 from the release's .hashes asset (fail closed)."""
+    if not re.fullmatch(r"[0-9.]+", version):
+        raise RecipeError(f"bad version string for fetch: {version!r}")
+    url = (f"https://github.com/{TARBALL_REPO}/releases/download/"
+           f"{version}/chromium-{version}-linux.tar.xz.hashes")
+    r = subprocess.run(["curl", "-fsSL", "--max-time", "60", url],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RecipeError(f"cannot fetch tarball hashes for {version}: {r.stderr[:200]}")
+    m = re.search(r"([0-9a-f]{64})\s+chromium-%s-linux\.tar\.xz" % re.escape(version), r.stdout)
+    if not m:
+        raise RecipeError(f"sha256 for {version} not found in hashes asset")
+    return m.group(1)
+
+def align_versions(text: str, termux_dir: Path) -> tuple[str, list]:
+    """Upstream drift guard: the recipe's own post_get_source compares our
+    TERMUX_PKG_VERSION against chromium-host-tools/build.sh and termux_error_exit
+    on mismatch. Upstream master can carry a transient window where host-tools
+    moved ahead (observed 10-16: host .84 vs chromium .79 -> run #8 death).
+    We align the CLONE to host-tools, taking TERMUX_PKG_SHA256 from the release
+    .hashes asset. Only when that version's tarball exists (fail closed)."""
+    notes = []
+    ht = host_tools_version(termux_dir)
+    if ht is None:
+        return text, notes
+    cur = re.search(r'^TERMUX_PKG_VERSION=([0-9][0-9.]*)', text, re.M).group(1)
+    if cur == ht:
+        return text, notes
+    sha = fetch_tarball_sha256(ht)
+    text = re.sub(r'^TERMUX_PKG_VERSION=[0-9][0-9.]*', f"TERMUX_PKG_VERSION={ht}", text, count=1, flags=re.M)
+    text = re.sub(r'^TERMUX_PKG_SHA256=[0-9a-f]+', f"TERMUX_PKG_SHA256={sha}", text, count=1, flags=re.M)
+    notes.append(f"aligned clone {cur} -> host-tools {ht} (sha256 from release hashes)")
+    return text, notes
+
 def prepare(termux_dir: Path) -> dict:
     src_dir = termux_dir / PKG_SRC
     dst_dir = termux_dir / PKG_DST
@@ -66,6 +111,9 @@ def prepare(termux_dir: Path) -> dict:
         if f.name == "build.sh":
             text = f.read_text()
             text = rewrite_identity(text)
+            text, align_notes = align_versions(text, termux_dir)
+            for n in align_notes:
+                print("NOTE:", n)
             if HOOK_BEGIN not in text:
                 # Chain, NEVER clobber: if the recipe defines its own
                 # termux_step_post_get_source (chromium does — it applies
