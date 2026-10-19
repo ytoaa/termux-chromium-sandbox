@@ -1,0 +1,17 @@
+# Upstream Termux Chromium version — watched by Renovate (config: /renovate.json).
+#
+# Role: detection ledger + guarded auto-merge approval surface (workflow
+# promotion is pending the Phase 3 device gate; until then no watcher or
+# auto-merge workflow is active in this repository).
+#
+# When the live Termux recipe (x11-packages/chromium/build.sh) moves, Renovate
+# opens a same-repository PR updating only the value below. The (future)
+# workflow_run gate validates exact repository Actions-bot identity, same-repo
+# provenance, single-file/single-bump diff shape, the commit-pinned live
+# recipe, forward ordering, and head-SHA atomicity — the hardened pattern
+# from termux-firefox-sandbox post-incident. Declines are labeled needs-human
+# (exception-only maintainer decision).
+#
+# The build itself reads the live commit-pinned Termux recipe; this file is a
+# detection/approval anchor, not build input.
+termuxChromiumVersion = "155.0.8059.79"
