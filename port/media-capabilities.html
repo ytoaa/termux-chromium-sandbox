@@ -1,0 +1,12 @@
+<!doctype html><html><head><meta charset="utf-8"><title>codec-gate</title></head><body>
+<script>
+const codecs = ["video/mp4;codecs=avc1.42E01E","video/webm;codecs=vp9","video/webm;codecs=av01.0.05M.08","audio/mp4;codecs=mp4a.40.2","audio/ogg;codecs=opus"];
+const v = document.createElement("video");
+let out = [];
+for (const c of codecs) out.push(c + " => " + (v.canPlayType(c) || "no"));
+document.title = "GATE-CODECS";
+const pre = document.createElement("pre");
+pre.id = "codec-report";
+pre.textContent = "CHROMIUM_CODECS_BEGIN\n" + out.join("\n") + "\nCHROMIUM_CODECS_END";
+document.body.appendChild(pre);
+</script></body></html>
