@@ -61,6 +61,14 @@ python3 port/prepare_recipe.py prepare --termux-dir "$TREP" >/dev/null 2>&1 \
   && python3 port/prepare_recipe.py audit --termux-dir "$TREP" >/dev/null 2>&1 \
   && pass "[8] recipe prepare+audit" || fail "[8] recipe"
 
+# [10] generated recipe must be bash-parseable
+fresh; TREP2="$WORK/termux2"; mkdir -p "$TREP2/x11-packages/chromium"
+cp "$FIX/termux-build.sh" "$TREP2/x11-packages/chromium/build.sh"
+touch "$TREP2/build-package.sh"; chmod +x "$TREP2/build-package.sh"
+python3 port/prepare_recipe.py prepare --termux-dir "$TREP2" >/dev/null 2>&1
+bash -n "$TREP2/x11-packages/chromium-sandboxed/build.sh" \
+  && pass "[10] generated recipe parses" || fail "[10] recipe syntax broken"
+
 # [9] tampered recipe (hook removed) -> audit must fail
 sed -i '/port hook (generated/,/port hook <<</d' "$TREP/x11-packages/chromium-sandboxed/build.sh"
 python3 port/prepare_recipe.py audit --termux-dir "$TREP" >/dev/null 2>&1 \

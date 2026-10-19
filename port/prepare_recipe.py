@@ -30,8 +30,9 @@ def rewrite_identity(text: str) -> str:
     t = t.replace("lib/chromium", "lib/chromium-sandboxed")
     t = t.replace("bin/chromium-browser", "bin/chromium-sandboxed")
     t = t.replace('desktop="chromium.desktop"', 'desktop="chromium-sandboxed.desktop"')
-    # stock-conflict bits removed from the clone
-    t = re.sub(r"termux_step_post_make_install\(\) \{[^}]*\}\n", "termux_step_post_make_install() {\n\ttrue\n}\n", t)
+    # NOTE: termux_step_post_make_install (dummy-lib cleanup) is deliberately
+    # left intact: it removes files THIS clone's own build created in its own
+    # staging dir. It never touches the stock package.
     return t
 
 HOOK = f"""
