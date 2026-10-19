@@ -109,4 +109,15 @@ grep -q -- '--disable-seccomp-filter-sandbox' $be \
   && grep -q 'gpu-process' $be && grep -q 'utility' $be \
   && pass "[14] bpf_evidence encodes P2/P3 checks" || fail "[14] bpf_evidence contract"
 
+# [15] marathon: generated recipe must wire cc_wrapper=sccache (run #10 post-mortem)
+fresh; T15="$WORK/t15"; mkdir -p "$T15/x11-packages/chromium"
+cp "$FIX/termux-build.sh" "$T15/x11-packages/chromium/build.sh"
+touch "$T15/build-package.sh"; chmod +x "$T15/build-package.sh"
+python3 port/prepare_recipe.py prepare --termux-dir "$T15" >/dev/null 2>&1
+g15="$T15/x11-packages/chromium-sandboxed/build.sh"
+[ "$(grep -c 'cc_wrapper="sccache"' "$g15")" = "1" ]   && grep -q 'echo .cc_wrapper="sccache". >> $TERMUX_PKG_BUILDDIR/out/Release/args.gn' "$g15"   && python3 port/prepare_recipe.py audit --termux-dir "$T15" >/dev/null 2>&1   && pass "[15] cc_wrapper wired into args.gn (and audit enforces it)"   || fail "[15] sccache cc_wrapper wiring missing"
+
+# [16] ci.sh build must (re)export the sccache volume IN-STEP + early evidence gate
+grep -q 'TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume $d/.sccache:/home/builder/.cache/sccache"' port/ci.sh   && grep -q 'SCCACHE DEAD' port/ci.sh   && grep -q 'sleep 1800' port/ci.sh   && grep -q 'SCCACHE ALIVE' port/ci.sh   && pass "[16] in-step volume export + 30min evidence watchdog" || fail "[16] ci.sh marathon contract"
+
 exit $rc

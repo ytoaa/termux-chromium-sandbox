@@ -114,6 +114,23 @@ def exclude_sandbox_disable_patches(text: str) -> str:
     text = text.replace(needle, f"-name *.patch | grep -v {filters} | sort)")
     return text
 
+SCCACHE_CCW_MARKER = 'cc_wrapper="sccache"'
+
+def wire_sccache(text: str) -> str:
+    """Marathon fuel: chromium's build.sh calls gn gen WITHOUT cc_wrapper, so
+    sccache never intercepts a compile (run #10: 350min compiled, 206B cache —
+    verified by fetching the real args.gn block). Append the wrapper right
+    after the recipe seeds args.gn. Fail-closed: anchor drift raises."""
+    if SCCACHE_CCW_MARKER in text:
+        return text
+    anchor = 'cat $_common_args_file > $TERMUX_PKG_BUILDDIR/out/Release/args.gn'
+    if anchor not in text:
+        raise RecipeError("args.gn seeding line changed (no 'cat $_common_args_file'); review wire_sccache")
+    text = text.replace(anchor, anchor +
+        "\n\t# termux-chromium-sandbox-port: sccache interception (multi-cycle marathon cache)\n"
+        "\techo '" + SCCACHE_CCW_MARKER + "' >> $TERMUX_PKG_BUILDDIR/out/Release/args.gn", 1)
+    return text
+
 def prepare(termux_dir: Path) -> dict:
     src_dir = termux_dir / PKG_SRC
     dst_dir = termux_dir / PKG_DST
@@ -135,6 +152,7 @@ def prepare(termux_dir: Path) -> dict:
             text = f.read_text()
             text = rewrite_identity(text)
             text = exclude_sandbox_disable_patches(text)
+            text = wire_sccache(text)
             text, align_notes = align_versions(text, termux_dir)
             for n in align_notes:
                 print("NOTE:", n)
@@ -183,6 +201,7 @@ def audit(termux_dir: Path) -> None:
         (HOOK_BEGIN, "port hook present"),
         ("$TERMUX_PKG_BUILDER_DIR/termux-chromium-sandbox-port.py", "in-container transformer call"),
         ("--scan content,chrome", "anti-injection scan wired"),
+        (SCCACHE_CCW_MARKER, "sccache cc_wrapper wired into args.gn"),
     ):
         if needle not in text:
             raise RecipeError(f"audit fail: missing {label}")

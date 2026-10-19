@@ -65,18 +65,43 @@ DOCKERFILE
 build_chromium() {
   local d
   d="$(need_termux_dir "${1:?}")"
+  # GH steps do NOT share env: prepare-builder's TERMUX_DOCKER_RUN_EXTRA_ARGS
+  # died with its own step (run #10 post-mortem: build container had no sccache
+  # volume). Re-export HERE, in the same shell that starts run-docker.
+  mkdir -p "$d/.sccache"
+  export TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume $d/.sccache:/home/builder/.cache/sccache"
   (
     cd "$d"
     set -o pipefail
     echo "======================================"
     echo "Termux Chromium seccomp-only sandbox port build"
     echo "termux-packages HEAD: $(git -C . rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "sccache host dir: $d/.sccache"
     echo "======================================"
-    ./scripts/run-docker.sh env \
+    setsid bash -c './scripts/run-docker.sh env \
       SCCACHE_DIR=/home/builder/.cache/sccache \
       SCCACHE_CACHE_SIZE=6G \
-      ./build-package.sh -f -I -a aarch64 chromium-sandboxed \
-      2>&1 | tee chromium-build.log
+      ./build-package.sh -f -I -a aarch64 chromium-sandboxed 2>&1 | tee chromium-build.log' &
+    local bpid=$!
+    # Early evidence gate: after 30 min the sccache dir MUST have objects.
+    # Zero/near-zero means interception is dead (cc_wrapper/volume wiring) —
+    # abort at 30min with an actionable error instead of burning 350.
+    (
+      sleep 1800
+      n=$(find "$d/.sccache" -type f 2>/dev/null | wc -l)
+      if [ "$n" -lt 50 ]; then
+        echo "SCCACHE DEAD: $n cache files after 30min (expect thousands) — cc_wrapper wiring or volume mount broken. Aborting early."
+        kill -TERM -"$bpid" 2>/dev/null; sleep 5; kill -KILL -"$bpid" 2>/dev/null
+      else
+        echo "SCCACHE ALIVE: $n cache files at 30min — interception working."
+      fi
+    ) &
+    local wpid=$!
+    wait "$bpid"; local rc=$?
+    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+    n=$(find "$d/.sccache" -type f 2>/dev/null | wc -l)
+    echo "SCCACHE FILES: $n ($(du -sh "$d/.sccache" 2>/dev/null | cut -f1))"
+    exit $rc
   )
 }
 
