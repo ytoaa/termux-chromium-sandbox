@@ -165,3 +165,26 @@ Build strategy: follow the Firefox port — cloud GitHub Actions build of the
 Termux package with our transformer applied (device-side chromium builds are
 impractical); apt channel + version lead per the proven scheme, under the
 separate-package-identity constraint (stock chromium untouched).
+
+## Phase 1b — sandbox call-site map (R1+R2 sufficiency proof, 2026-10-19)
+
+Child-side sandbox installation is `Sandbox::Initialize(SandboxTypeFromCommandLine(...))`:
+
+| path | file | engage_namespace_sandbox | port coverage |
+|---|---|---|---|
+| renderer (from generic zygote) | content/renderer/renderer_main_platform_delegate_linux.cc:33-48 (EnableSandbox) | default **false** (sandbox_linux.h:104) | R2 untouched; installs BPF iff token absent → anti-injection scan is the load-bearing gate |
+| non-zygote services (gpu/utility family) | services/service_manager/.../service_executable_environment.cc:47 | explicit **true** | R2 Bionic-skip prevents EngageNamespaceSandbox CHECK death |
+| zygote itself (layer-1) | content/zygote/zygote_main_linux.cc (ZygoteMain/EnterLayerOneSandbox) | n/a | both use_* false → `CHECK(!using_layer1_sandbox)` pass — no change needed |
+| browser init | zygote_host_impl_linux.cc ZygoteHostImpl::Init | n/a | **R1** (Bionic no-FATAL) |
+
+`RendererMainPlatformDelegate::EnableSandbox` even self-verifies (`kSeccompBPF ⇒
+CHECK(seccomp_bpf_started())`, x86_64 adds fchmod-EPERM probe): if the stock
+token injection ever recurs, renderers would CRASH not silently pass — Phase 3
+device gate leans on this.
+
+### Build source strategy (Termux chromium)
+`TERMUX_PKG_SRCURL=https://github.com/chromium-linux-tarballs/chromium-tarballs/
+releases/download/<ver>/chromium-<ver>-linux.tar.xz` + pinned SHA256 →
+deterministic tarball flow, transformer applies post-extract, no depot checkout.
+`TERMUX_PKG_ON_DEVICE_BUILD_NOT_SUPPORTED=true` → cloud build mandatory (matches
+Firefox pattern).

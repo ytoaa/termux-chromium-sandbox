@@ -1,0 +1,55 @@
+# DRAFT — Phase 2a. NOT active (kept outside .github/workflows on purpose;
+# enable only after the gate-script review, per 2026-10 incident lessons).
+#
+# Mirrors termux-firefox-sandbox's build chain: commit-pinned termux-packages,
+# deterministic tarball source, docker builder, sccache, artifact upload.
+name: Build Termux Chromium Seccomp Sandbox Port (draft)
+
+on:
+  workflow_dispatch:
+    inputs:
+      termux_ref:
+        description: termux-packages ref to build
+        default: main
+      force:
+        description: Build even if versions already match
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Transformer self-test (fail closed)
+        run: bash port/ci.sh selftest
+      - name: Resolve termux-packages commit
+        env: { GITHUB_TOKEN: '${{ github.token }}' }
+        run: bash port/ci.sh resolve-ref '${{ inputs.termux_ref }}' > termux-commit.txt
+      - uses: actions/upload-artifact@v4
+        with: { name: termux-commit, path: termux-commit.txt }
+
+  build:
+    needs: gate
+    runs-on: ubuntu-26.04
+    timeout-minutes: 540
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: termux/termux-packages
+          path: termux-packages
+          ref: '${{ inputs.termux_ref }}'
+      - name: Fetch + extract chromium source (pinned tarball per recipe SHA256)
+        run: |
+          # Phase 2a finalizes: reuse termux get_package pipeline, then
+          # EXTRACT_SRCDIR=$PWD/chromium-src
+          echo "TODO(2a): wire termux_pkg_setup_build_env + tarball extract"
+          exit 1
+      - name: Apply sandbox port
+        run: bash port/ci.sh apply "$PWD/chromium-src"
+      # TODO(2a): prepare-builder (docker), zram, sccache, build-package.sh
+      # chromium, binary marker gate, apt publish (separate package identity).
