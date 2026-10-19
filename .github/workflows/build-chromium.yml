@@ -1,0 +1,104 @@
+# Cloud build of the seccomp-only sandbox port (Phase 2a).
+# Scope: build + gates + artifacts ONLY. No apt publish, no releases, no
+# merge authority (that surface arrives in Phase 2b behind its own review,
+# per the 2026-10 incident lessons).
+name: Build Termux Chromium Seccomp Sandbox Port
+
+on:
+  workflow_dispatch:
+    inputs:
+      termux_ref:
+        description: termux-packages ref to build
+        default: main
+      force:
+        description: Build even when versions already match (reserved)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  TERMUX_BUILDER_IMAGE_NAME: termux-chromium-builder:sccache
+
+jobs:
+  gate:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Transformer + recipe self-test (fail closed)
+        run: bash port/ci.sh selftest
+      - name: Resolve termux-packages ref to exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash port/ci.sh resolve-ref '${{ inputs.termux_ref }}' > termux-commit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate
+          path: |
+            termux-commit.txt
+            port/port.toml
+
+  build:
+    needs: gate
+    runs-on: ubuntu-26.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7
+      - name: Checkout termux-packages (ref from inputs; sha recorded for audit)
+        uses: actions/checkout@v7
+        with:
+          repository: termux/termux-packages
+          path: termux-packages
+          ref: ${{ inputs.termux_ref }}
+      - name: Record pins
+        run: |
+          echo "port_sha=$GITHUB_SHA" >> "$GITHUB_ENV"
+          echo "termux_sha=$(git -C termux-packages rev-parse HEAD)" >> "$GITHUB_ENV"
+          git -C termux-packages rev-parse HEAD > termux-pin.txt
+      - name: Prepare chromium-sandboxed recipe (identity + injected hook)
+        run: bash port/ci.sh recipe-prepare "$PWD/termux-packages"
+      - name: Restore sccache
+        uses: actions/cache/restore@v4
+        with:
+          path: termux-packages/.sccache
+          key: chromium-sccache-aarch64-${{ env.termux_sha }}
+          restore-keys: chromium-sccache-aarch64-
+      - name: Enable zram
+        uses: ./termux-packages/.github/actions/zram
+      - name: Prepare Termux builder (docker + sccache image)
+        run: bash port/ci.sh prepare-builder "$PWD/termux-packages"
+      - name: Build chromium-sandboxed (port hook runs at post_get_source)
+        run: bash port/ci.sh build "$PWD/termux-packages"
+      - name: Package gates (separate identity, port applied)
+        run: |
+          set -euo pipefail
+          deb=$(find termux-packages/output -name 'chromium-sandboxed_*_aarch64.deb' | head -1)
+          test -n "$deb" || { echo "deb missing"; exit 1; }
+          pkg=$(dpkg-deb -f "$deb" Package)
+          ver=$(dpkg-deb -f "$deb" Version)
+          [ "$pkg" = "chromium-sandboxed" ] || { echo "wrong package name: $pkg"; exit 1; }
+          echo "artifact: $pkg $ver"
+          # port-apply.log must show both rules applied/present
+          log=$(find termux-packages/build -name port-apply.log | head -1)
+          test -n "$log" || { echo "port-apply.log not found"; exit 1; }
+          grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q R1 || { echo "R1 not applied"; exit 1; }
+          grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q R2 || { echo "R2 not applied"; exit 1; }
+          echo "PORT GATES PASS: $pkg $ver"
+      - name: Save sccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: termux-packages/.sccache
+          key: chromium-sccache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
+      - name: Upload artifacts (debs + logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.run_id }}
+          path: |
+            termux-packages/output/chromium-sandboxed_*_aarch64.deb
+            termux-packages/chromium-build.log
+            termux-packages/build/**/port-apply.log
+            termux-pin.txt
+          if-no-files-found: warn

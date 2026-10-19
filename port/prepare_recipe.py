@@ -10,7 +10,7 @@ Modes:
 Exit non-zero on any contract violation (fail closed).
 """
 from __future__ import annotations
-import argparse, hashlib, re, subprocess, sys
+import argparse, hashlib, re, shutil, subprocess, sys
 from pathlib import Path
 
 PKG_SRC = "x11-packages/chromium"
@@ -37,16 +37,14 @@ def rewrite_identity(text: str) -> str:
 HOOK = f"""
 {HOOK_BEGIN}
 termux_step_post_get_source() {{
-\tPORT_REPO="${{TERMUX_CHROMIUM_PORT_REPO:?set by ci.sh}}"
-\tpython3 "$PORT_REPO/port/chromium_sandbox_port.py" apply \\
+\tpython3 "$TERMUX_PKG_BUILDER_DIR/termux-chromium-sandbox-port.py" apply \\
 \t\t--src "$TERMUX_PKG_SRCDIR" --scan content,chrome \\
-\t\t| tee "${{TERMUX_PKG_TMPDIR:-.}}/port-apply.log"
-\tc=$(grep -c "ALREADY_PRESENT\\|APPLIED" "${{TERMUX_PKG_TMPDIR:-.}}/port-apply.log" || true)
+\t\t| tee "$TERMUX_PKG_TMPDIR/port-apply.log"
+\tc=$(grep -c "ALREADY_PRESENT\\|APPLIED" "$TERMUX_PKG_TMPDIR/port-apply.log" || true)
 \t[ "$c" -ge 2 ] || {{ echo "port hook: fewer than 2 rules applied" >&2; exit 1; }}
 }}
 {HOOK_END}
 """
-
 def prepare(termux_dir: Path) -> dict:
     src_dir = termux_dir / PKG_SRC
     dst_dir = termux_dir / PKG_DST
@@ -54,7 +52,14 @@ def prepare(termux_dir: Path) -> dict:
         raise RecipeError(f"missing {src_dir}/build.sh")
     dst_dir.mkdir(parents=True, exist_ok=True)
     report = {}
-    # copy all recipe files except build.sh (rewritten) 
+    # Termux builder mounts termux-packages only: ship the transformer and
+    # the contract ledger inside the recipe (TERMUX_PKG_BUILDER_DIR) so the
+    # hook works in-container (firefox-proven pattern).
+    here = Path(__file__).resolve().parent
+    shutil.copy2(here / "chromium_sandbox_port.py", dst_dir / "termux-chromium-sandbox-port.py")
+    shutil.copy2(here / "port.toml", dst_dir / "termux-chromium-sandbox-port.toml")
+
+    # copy all recipe files except build.sh (rewritten)
     for f in sorted(src_dir.iterdir()):
         target = dst_dir / f.name
         if f.name == "build.sh":
@@ -85,6 +90,7 @@ def audit(termux_dir: Path) -> None:
         ("lib/chromium-sandboxed", "side-by-side lib dir"),
         ("bin/chromium-sandboxed", "distinct launcher"),
         (HOOK_BEGIN, "port hook present"),
+        ("$TERMUX_PKG_BUILDER_DIR/termux-chromium-sandbox-port.py", "in-container transformer call"),
         ("--scan content,chrome", "anti-injection scan wired"),
     ):
         if needle not in text:

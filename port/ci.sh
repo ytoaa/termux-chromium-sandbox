@@ -3,6 +3,8 @@
 # Draft: wired for gate/apply/verify; build steps finalize in Phase 2a review.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+: "${TERMUX_BUILDER_IMAGE_NAME:=termux-chromium-builder:sccache}"
+export TERMUX_BUILDER_IMAGE_NAME
 cmd=${1:-help}
 case "$cmd" in
   selftest)
@@ -24,6 +26,8 @@ case "$cmd" in
   recipe-audit)
     python3 "$here/prepare_recipe.py" audit --termux-dir "${2:?}"
     ;;
+  prepare-builder) [ -n "${2:-}" ] || { echo "usage: ci.sh prepare-builder <termux-packages>" >&2; exit 2; }; prepare_builder "$2" ;;
+  build) [ -n "${2:-}" ] || { echo "usage: ci.sh build <termux-packages>" >&2; exit 2; }; build_chromium "$2" ;;
   resolve-ref)    # $2 = termux-packages ref -> prints exact sha
     : "${GITHUB_TOKEN:?}"
     ref=${2:-main}
