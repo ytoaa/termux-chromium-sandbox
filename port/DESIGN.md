@@ -188,3 +188,22 @@ releases/download/<ver>/chromium-<ver>-linux.tar.xz` + pinned SHA256 →
 deterministic tarball flow, transformer applies post-extract, no depot checkout.
 `TERMUX_PKG_ON_DEVICE_BUILD_NOT_SUPPORTED=true` → cloud build mandatory (matches
 Firefox pattern).
+
+## Phase 2a decisions (round 5)
+
+- **Package identity**: clone recipe `x11-packages/chromium-sandboxed`
+  (distinct lib dir `$PREFIX/lib/chromium-sandboxed`, launcher
+  `bin/chromium-sandboxed`, desktop id `chromium-sandboxed.desktop`) →
+  stock `chromium` untouched, side-by-side installs; satisfies the
+  user-mandated off-limits constraint at packaging level, not just policy.
+- **Transformer injection**: `prepare_recipe.py` writes a marked
+  `termux_step_post_get_source()` hook that runs
+  `chromium_sandbox_port.py apply --scan content,chrome` and requires ≥2
+  APPLIED/ALREADY_PRESENT records (fail closed). Audit mode + tamper
+  detection covered by harness [8][9].
+- **CI gate model correction** (Firefox-pattern delta): official builds strip
+  DLOG strings, so the post-build binary-marker gate (firefox-style) is
+  REPLACED by (a) transformer verify (markers in patched source), (b)
+  prepare_recipe audit (hook + identity intact), (c) device gate measuring
+  per-process Seccomp_filters > baseline + renderer's own
+  CHECK(seccomp_bpf_started()) (crash-instead-of-silence property).

@@ -53,4 +53,17 @@ grep -qF 'Termux seccomp-only sandbox:' "$WORK/src/content/browser/zygote_host/z
   && grep -qF 'Termux seccomp-only port:' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
   && pass "[7] marker strings present" || fail "[7] markers"
 
+# [8] recipe prepare/audit on vendored build.sh (side-by-side identity + hook)
+TREP="$WORK/termux"; mkdir -p "$TREP/x11-packages/chromium"
+cp "$FIX/termux-build.sh" "$TREP/x11-packages/chromium/build.sh"
+touch "$TREP/build-package.sh"; chmod +x "$TREP/build-package.sh"
+python3 port/prepare_recipe.py prepare --termux-dir "$TREP" >/dev/null 2>&1 \
+  && python3 port/prepare_recipe.py audit --termux-dir "$TREP" >/dev/null 2>&1 \
+  && pass "[8] recipe prepare+audit" || fail "[8] recipe"
+
+# [9] tampered recipe (hook removed) -> audit must fail
+sed -i '/port hook (generated/,/port hook <<</d' "$TREP/x11-packages/chromium-sandboxed/build.sh"
+python3 port/prepare_recipe.py audit --termux-dir "$TREP" >/dev/null 2>&1 \
+  && fail "[9] tamper undetected" || pass "[9] recipe tamper detected"
+
 exit $rc

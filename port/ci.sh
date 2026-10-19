@@ -16,13 +16,21 @@ case "$cmd" in
     [ -d "${2:-}" ] || { echo "usage: ci.sh verify <src>" >&2; exit 2; }
     python3 "$here/chromium_sandbox_port.py" check --src "$2" --scan content,chrome
     ;;
+  recipe-prepare)   # $2 = termux-packages dir
+    [ -x "${2:-}/build-package.sh" ] || { echo "not a termux-packages dir: $2" >&2; exit 2; }
+    python3 "$here/prepare_recipe.py" prepare --termux-dir "$2"
+    python3 "$here/prepare_recipe.py" audit   --termux-dir "$2"
+    ;;
+  recipe-audit)
+    python3 "$here/prepare_recipe.py" audit --termux-dir "${2:?}"
+    ;;
   resolve-ref)    # $2 = termux-packages ref -> prints exact sha
     : "${GITHUB_TOKEN:?}"
     ref=${2:-main}
     gh api --method GET "repos/termux/termux-packages/commits/${ref}" --jq .sha
     ;;
   *)
-    echo "commands: selftest | apply <src> | verify <src> | resolve-ref [ref]" >&2
+    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | resolve-ref [ref]" >&2
     exit 2
     ;;
 esac

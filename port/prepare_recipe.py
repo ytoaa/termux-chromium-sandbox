@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Prepare a Termux recipe copy that (a) carries a SEPARATE package
+identity 'chromium-sandboxed' (hard constraint: never replaces stock
+'chromium') and (b) applies chromium_sandbox_port.py at
+termux_step_post_get_source, contract-checked.
+
+Modes:
+  prepare --termux-dir <termux-packages>   # idempotent in-place prep
+  audit  --termux-dir <termux-dir>         # verify state, no writes
+Exit non-zero on any contract violation (fail closed).
+"""
+from __future__ import annotations
+import argparse, hashlib, re, subprocess, sys
+from pathlib import Path
+
+PKG_SRC = "x11-packages/chromium"
+PKG_DST = "x11-packages/chromium-sandboxed"
+HOOK_BEGIN = "# >>> termux-chromium-sandbox port hook (generated; do not edit) >>>"
+HOOK_END   = "# <<< termux-chromium-sandbox port hook <<<"
+
+class RecipeError(RuntimeError):
+    pass
+
+def sha(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+def rewrite_identity(text: str) -> str:
+    # side-by-side identity: distinct lib dir + launcher name
+    t = text
+    t = t.replace("lib/chromium", "lib/chromium-sandboxed")
+    t = t.replace("bin/chromium-browser", "bin/chromium-sandboxed")
+    t = t.replace('desktop="chromium.desktop"', 'desktop="chromium-sandboxed.desktop"')
+    # stock-conflict bits removed from the clone
+    t = re.sub(r"termux_step_post_make_install\(\) \{[^}]*\}\n", "termux_step_post_make_install() {\n\ttrue\n}\n", t)
+    return t
+
+HOOK = f"""
+{HOOK_BEGIN}
+termux_step_post_get_source() {{
+\tPORT_REPO="${{TERMUX_CHROMIUM_PORT_REPO:?set by ci.sh}}"
+\tpython3 "$PORT_REPO/port/chromium_sandbox_port.py" apply \\
+\t\t--src "$TERMUX_PKG_SRCDIR" --scan content,chrome \\
+\t\t| tee "${{TERMUX_PKG_TMPDIR:-.}}/port-apply.log"
+\tc=$(grep -c "ALREADY_PRESENT\\|APPLIED" "${{TERMUX_PKG_TMPDIR:-.}}/port-apply.log" || true)
+\t[ "$c" -ge 2 ] || {{ echo "port hook: fewer than 2 rules applied" >&2; exit 1; }}
+}}
+{HOOK_END}
+"""
+
+def prepare(termux_dir: Path) -> dict:
+    src_dir = termux_dir / PKG_SRC
+    dst_dir = termux_dir / PKG_DST
+    if not (src_dir / "build.sh").is_file():
+        raise RecipeError(f"missing {src_dir}/build.sh")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    report = {}
+    # copy all recipe files except build.sh (rewritten) 
+    for f in sorted(src_dir.iterdir()):
+        target = dst_dir / f.name
+        if f.name == "build.sh":
+            text = f.read_text()
+            text = rewrite_identity(text)
+            if HOOK_BEGIN not in text:
+                if not text.endswith("\n"):
+                    text += "\n"
+                text += HOOK
+            target.write_text(text)
+            report["build.sh"] = sha(target)
+        else:
+            if target.is_file() and sha(target) == sha(f):
+                continue
+            target.write_bytes(f.read_bytes())
+            report[f.name] = sha(target)
+    # marker: package identity
+    if "chromium-sandboxed" not in (dst_dir / "build.sh").read_text():
+        raise RecipeError("identity rewrite failed: no chromium-sandboxed token")
+    return report
+
+def audit(termux_dir: Path) -> None:
+    bs = (termux_dir / PKG_DST / "build.sh")
+    if not bs.is_file():
+        raise RecipeError("recipe clone not prepared (run prepare first)")
+    text = bs.read_text()
+    for needle, label in (
+        ("lib/chromium-sandboxed", "side-by-side lib dir"),
+        ("bin/chromium-sandboxed", "distinct launcher"),
+        (HOOK_BEGIN, "port hook present"),
+        ("--scan content,chrome", "anti-injection scan wired"),
+    ):
+        if needle not in text:
+            raise RecipeError(f"audit fail: missing {label}")
+    if re.search(r"\blib/chromium\b(?!-sandboxed)", text):
+        raise RecipeError("audit fail: residual stock lib/chromium path")
+    print("[AUDIT OK] chromium-sandboxed recipe contract holds")
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("command", choices=["prepare", "audit"])
+    ap.add_argument("--termux-dir", required=True)
+    a = ap.parse_args()
+    d = Path(a.termux_dir)
+    if a.command == "prepare":
+        rep = prepare(d)
+        for k, v in sorted(rep.items()):
+            print(f"sha256 {k}: {v}")
+    else:
+        audit(d)
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RecipeError as e:
+        print(f"[RECIPE ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
