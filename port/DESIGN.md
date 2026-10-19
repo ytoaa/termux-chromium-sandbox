@@ -58,3 +58,34 @@ Chromium's Linux sandbox has three cooperating layers; we drop the middle one:
 - Sandbox-port builds ship as a SEPARATE package identity (not an overwrite
   of Termux's `chromium`) so a test device can keep the stock browser intact;
   the apt/version-lead scheme is re-derived to preserve this property.
+
+## Phase 0.2 findings — installed chromium 155.0.8059.79 runtime reality (2026-10-19)
+
+Empirical (isolated profiles only; stock profile/package untouched):
+
+1. Launched WITHOUT `--no-sandbox` (headless=new and windowed), browser runs
+   fine, no "No usable sandbox" FATAL, no sandbox errors in logs.
+2. Process filter census (`/proc/PID/status`, execve-verified): every chrome
+   process shows `Seccomp: 2 / Seccomp_filters: 1` — the ONE filter is the
+   Android app baseline (a plain Termux bash shows the identical values).
+   => ZERO Chromium BPF filters installed anywhere. Renderer/GPU/utility all
+   unsandboxed by Chromium.
+3. Zygote child argv carries a real `--no-sandbox` token (headless confirmed
+   by raw argv dump; windowed substring evidence was inconclusive — revisit).
+4. `ZygoteHostImpl::Init` (content/browser/zygote_host/zygote_host_impl_linux.cc:102-157)
+   should `LOG(FATAL) "No usable sandbox!"` when userns is unavailable AND no
+   setuid helper exists — yet it early-returns, which per L103 requires
+   `--no-sandbox` present on the in-memory browser command line, while the
+   browser's own /proc argv LACKS it. An injector modifies the browser
+   command line at startup before zygote init. **Open: locate injector** —
+   candidates: headless startup path; windowed-mode full-argv A/B pending.
+
+## Phase 0 clone(2) namespace map (this device, Android 17 / 6.1 GKI)
+
+| flag | result |
+|---|---|
+| CLONE_NEWUSER | EINVAL (matches unshare CLI; Chromium's own probe returns false) |
+| CLONE_NEWPID / NEWNET / NEWNS / NEWIPC / NEWUTS | EPERM |
+
+Evidence scripts: poc/seccomp_probe.c, poc/clone_ns_probe.c (clone_ns_probe
+to be committed). Logs: chromium-sandbox-poc/test[A-N]*.{log,txt} (local).

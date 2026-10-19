@@ -1,6 +1,8 @@
 poc/seccomp_probe
+poc/clone_ns_probe
 *.o
 *.deb
 evidence/
 __pycache__/
 chromium-test-profile*/
+chromium-probe-profile*/
