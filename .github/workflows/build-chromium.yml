@@ -9,7 +9,7 @@ on:
     inputs:
       termux_ref:
         description: termux-packages ref to build
-        default: main
+        default: master
       force:
         description: Build even when versions already match (reserved)
         type: boolean
