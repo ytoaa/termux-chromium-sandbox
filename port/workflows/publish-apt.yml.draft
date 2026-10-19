@@ -1,0 +1,48 @@
+# DRAFT — Phase 2c. NOT active until (a) first green gated build, (b) device
+# gate PASS per port/REGRESSION.md recorded in port.toml. Promotion requires
+# an explicit reviewed commit moving this into .github/workflows/.
+#
+# Cumulative apt channel on gh-pages (firefox-lesson: ALWAYS seed the pool
+# from the published branch before regenerating indices, or a fresh build
+# silently drops every previously published deb).
+name: Publish apt channel (draft)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: build run id to take the deb from
+        required: true
+      confirm:
+        description: must equal device-gate-passed
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-26.04
+    if: ${{ github.event.inputs.confirm == 'device-gate-passed' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch build artifacts
+        run: |
+          gh run download '${{ github.event.inputs.run_id }}' -D "$RUNNER_TEMP/dl"
+          find "$RUNNER_TEMP/dl" -name 'chromium-sandboxed_*_aarch64.deb' | head -1 | grep . || {
+            echo "no deb in that run"; exit 1; }
+        env: { GH_TOKEN: '${{ github.token }}' }
+      - name: Seed cumulative pool from published gh-pages (critical)
+        run: |
+          mkdir -p "$RUNNER_TEMP/aptrepo"
+          cd "$RUNNER_TEMP/aptrepo"
+          git init -q -b gh-pages
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
+          git fetch -q origin gh-pages && git checkout -q FETCH_HEAD || mkdir -p pool dists
+          cd "$OLDPWD"
+      - name: Index (idempotent full regeneration)
+        run: |
+          deb=$(find "$RUNNER_TEMP/dl" -name 'chromium-sandboxed_*_aarch64.deb' | head -1)
+          bash port/publish_apt.sh index "$deb" "$RUNNER_TEMP/aptrepo" stable aarch64
+      - name: Publish (replaces dists+pool at branch root)
+        run: bash port/publish_apt.sh publish "$RUNNER_TEMP/aptrepo" gh-pages
