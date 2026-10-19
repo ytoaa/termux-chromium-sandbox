@@ -1,7 +1,7 @@
-# Contract ledger — template (Phase 0). No validated build exists yet.
+# Contract ledger — Phase 1 (transformer live; no built candidate yet).
 [port]
-version = "0.0.1"
-phase = "feasibility"          # feasibility | porting | gated-build | validated
+version = "0.1.0"
+phase = "porting"              # feasibility | porting | gated-build | validated
 last_validated_port = ""
 last_validated_chromium = ""
 policy_mode = "fail-closed"
@@ -9,14 +9,41 @@ policy_mode = "fail-closed"
 [termux]
 package = "x11-packages/chromium"
 prefix_placeholder = "@TERMUX_PREFIX@"
+# Separate package identity constraint (user-mandated): the ported deb must
+# NOT replace or overwrite stock 'chromium' install; naming finalized in
+# Phase 2 (e.g. chromium + our own apt component vs distinct name).
 
 [sandbox]
-mode = "seccomp-only"          # namespaces are kernel-blocked on Android
+mode = "seccomp-only"          # namespaces kernel-blocked (CLONE_NEWUSER=EINVAL)
 namespace_layer = "disabled"
 setuid_sandbox = "forbidden"
 require_bpf_policy = true
+bionic_guard = "defined(__BIONIC__)"   # all port branches compile-guarded
+
+[rules]                        # chromium_sandbox_port.py contract registry
+[rules.r1]
+name = "seccomp-only usable mode (Bionic)"
+file = "content/browser/zygote_host/zygote_host_impl_linux.cc"
+marker = "Termux seccomp-only sandbox:"
+[rules.r2]
+name = "skip namespace engage (Bionic)"
+file = "sandbox/policy/linux/sandbox_linux.cc"
+marker = "Termux seccomp-only port:"
+
+[gates]
+# Future candidate gates (firefox-pattern): source verify + binary markers +
+# on-device level checks. Binary markers are checked inside the built
+# chrome/libfrontend bits after packaging.
+binary_markers = [
+  "Termux seccomp-only sandbox:",
+  "Termux seccomp-only port:",
+]
+required_media_codecs = ["h264", "vp9", "av1", "aac", "opus"]
+require_bpf_per_process = true   # /proc Seccomp_filters must exceed Android baseline
+device_gate = "pending Phase 3"
 
 [forbidden]                    # verifier refuses these (fail-closed)
 - "any Content/GPU/utility MAY_CONNECT-style widening without a contract entry"
 - "prctl/umask-style blanket syscall exceptions 'seen in logs'"
 - "namespace or setuid fallback switches shipped in releases"
+- "unconditional --no-sandbox appends (anti-injection scan, run_tests [6])"
