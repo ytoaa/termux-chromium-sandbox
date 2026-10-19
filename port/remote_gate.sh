@@ -16,6 +16,14 @@ export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/data/data
 [ -f "$RG_KEY" ] || { echo "no key at $RG_KEY"; exit 2; }
 $SSH true || { echo "remote unreachable"; exit 2; }
 
+snapshot() { # on-demand Termux-internal (X11) screen grab, e.g. live chromium GUI
+  local tag=${1:-now}
+  local out=$root/../gate-out/snap-$(date -u +%Y%m%dT%H%M%S)-$tag.png
+  mkdir -p "$root/../gate-out"
+  $SSH 'export DISPLAY=:0; import -window root ~/chromium-gate/snap.png 2>/dev/null'     && $RCP $RG_USER@$RG_HOST:~/chromium-gate/snap.png "$out" && echo "SNAPSHOT $out" || { echo "snapshot failed (X11 session down?)"; return 1; }
+}
+[ "${1:-}" = snapshot ] && { shift; snapshot "${1:-now}"; exit $?; }
+
 for run in "$@"; do
   echo "===== RUN $run ====="
   OUT=$root/../gate-out/$run; rm -rf "$OUT"; mkdir -p "$OUT"
