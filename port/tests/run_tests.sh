@@ -82,6 +82,14 @@ grep -q 'termux_step_post_get_source_upstream()' "$g" \
   && pass "[11] upstream post_get_source chained, not shadowed" \
   || fail "[11] clobber regression (upstream body lost or duplicate def)"
 
+# [12] sandbox-disable patches must be excluded from the cr-patches loop
+fresh2="$WORK/t12"; mkdir -p "$fresh2/x11-packages/chromium"
+cp "$FIX/termux-build.sh" "$fresh2/x11-packages/chromium/build.sh"
+touch "$fresh2/build-package.sh"; chmod +x "$fresh2/build-package.sh"
+python3 port/prepare_recipe.py prepare --termux-dir "$fresh2" >/dev/null 2>&1
+grep -q "grep -v -e '1001-chromium-disable-sandbox' -e '1004-chromium-headless-disable-sandbox-by-default'" "$fresh2/x11-packages/chromium-sandboxed/build.sh" \
+  && pass "[12] sandbox-disable patches excluded" || fail "[12] exclusion missing"
+
 # [9] tampered recipe (hook removed) -> audit must fail
 sed -i '/port hook (generated/,/port hook <<</d' "$TREP/x11-packages/chromium-sandboxed/build.sh"
 python3 port/prepare_recipe.py audit --termux-dir "$TREP" >/dev/null 2>&1 \

@@ -91,6 +91,29 @@ def align_versions(text: str, termux_dir: Path) -> tuple[str, list]:
     notes.append(f"aligned clone {cur} -> host-tools {ht} (sha256 from release hashes)")
     return text, notes
 
+
+SANDBOX_DISABLE_PATCHES = (
+    "1001-chromium-disable-sandbox",
+    "1004-chromium-headless-disable-sandbox-by-default",
+)
+
+def exclude_sandbox_disable_patches(text: str) -> str:
+    """THE off-switch removal: termux's cr-patches 1001/1004 inject
+    AppendSwitch(kNoSandbox) into chrome/shell PreSandboxStartup under
+    #ifdef __TERMUX__ (plus hide the bad-flags warnings). Our port's whole
+    purpose is the OPPOSITE; skip exactly those patches in the recipe's
+    cr-patches loop. The anti-injection scan in the transformer remains the
+    verification gate: if upstream renames/reshuffles these patches, the
+    scan catches the surviving injection and the build dies (fail closed)."""
+    needle = "-name *.patch | sort)"
+    if needle not in text:
+        raise RecipeError("cr-patches loop shape changed (no '| sort)'); review exclude_sandbox_disable_patches")
+    if any(p in text for p in SANDBOX_DISABLE_PATCHES):
+        return text  # already excluded
+    filters = " ".join(f"-e '{p}'" for p in SANDBOX_DISABLE_PATCHES)
+    text = text.replace(needle, f"-name *.patch | grep -v {filters} | sort)")
+    return text
+
 def prepare(termux_dir: Path) -> dict:
     src_dir = termux_dir / PKG_SRC
     dst_dir = termux_dir / PKG_DST
@@ -111,6 +134,7 @@ def prepare(termux_dir: Path) -> dict:
         if f.name == "build.sh":
             text = f.read_text()
             text = rewrite_identity(text)
+            text = exclude_sandbox_disable_patches(text)
             text, align_notes = align_versions(text, termux_dir)
             for n in align_notes:
                 print("NOTE:", n)
@@ -162,6 +186,9 @@ def audit(termux_dir: Path) -> None:
     ):
         if needle not in text:
             raise RecipeError(f"audit fail: missing {label}")
+    if "grep -v" not in text or "1001-chromium-disable-sandbox" not in text \
+       or "1004-chromium-headless-disable-sandbox-by-default" not in text:
+        raise RecipeError("audit fail: sandbox-disable patch exclusion missing")
     if re.search(r"\blib/chromium\b(?!-sandboxed)", text):
         raise RecipeError("audit fail: residual stock lib/chromium path")
     print("[AUDIT OK] chromium-sandboxed recipe contract holds")
