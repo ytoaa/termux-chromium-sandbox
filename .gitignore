@@ -1,0 +1,5 @@
+poc/seccomp_probe
+*.o
+*.deb
+evidence/
+__pycache__/

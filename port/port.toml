@@ -1,0 +1,22 @@
+# Contract ledger — template (Phase 0). No validated build exists yet.
+[port]
+version = "0.0.1"
+phase = "feasibility"          # feasibility | porting | gated-build | validated
+last_validated_port = ""
+last_validated_chromium = ""
+policy_mode = "fail-closed"
+
+[termux]
+package = "x11-packages/chromium"
+prefix_placeholder = "@TERMUX_PREFIX@"
+
+[sandbox]
+mode = "seccomp-only"          # namespaces are kernel-blocked on Android
+namespace_layer = "disabled"
+setuid_sandbox = "forbidden"
+require_bpf_policy = true
+
+[forbidden]                    # verifier refuses these (fail-closed)
+- "any Content/GPU/utility MAY_CONNECT-style widening without a contract entry"
+- "prctl/umask-style blanket syscall exceptions 'seen in logs'"
+- "namespace or setuid fallback switches shipped in releases"
