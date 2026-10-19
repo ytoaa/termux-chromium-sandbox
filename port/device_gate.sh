@@ -35,12 +35,21 @@ sample() { # $1=binary path, $2=label  → prints "type filters" lines
 run_probe() { # $1=binary $2=label  (headless=new keeps gpu/utility/renderer alive)
   local bin=$1 label=$2 udd="$WS/udd-$2"
   rm -rf "$udd"
-  (timeout 30 "$bin" --headless=new --user-data-dir="$udd" --no-first-run \
+  # setsid + process-group kill: NEVER pkill -f (our own cmdline contains
+  # the pattern and pkill would SIGTERM the gate itself).
+  setsid "$bin" --headless=new --user-data-dir="$udd" --no-first-run \
       --disable-dev-shm-usage --remote-debugging-port=0 \
-      "file://$here/media-capabilities.html" >"$WS/run-$2.log" 2>&1 &)
+      "file://$here/media-capabilities.html" >"$WS/run-$2.log" 2>&1 &
+  local gpid=$!
+  # watchdog: hard-kill the group after 60s no matter what
+  ( sleep 60; kill -KILL -"$gpid" 2>/dev/null ) & local wpid=$!
   sleep 12
   sample "$bin" "$label"
-  pkill -f "user-data-dir=$udd" 2>/dev/null
+  kill -TERM -"$gpid" 2>/dev/null
+  sleep 2
+  kill -KILL -"$gpid" 2>/dev/null
+  kill "$wpid" 2>/dev/null
+  wait "$wpid" 2>/dev/null
 }
 
 echo "=== A) BASELINE (stock chrome, read-only, isolated profile) ==="
