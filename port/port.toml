@@ -41,6 +41,10 @@ binary_markers = [
 required_media_codecs = ["h264", "vp9", "av1", "aac", "opus"]
 require_bpf_per_process = true   # /proc Seccomp_filters must exceed Android baseline
 device_gate = "pending Phase 3"
+bpf_evidence_script = "port/bpf_evidence.sh"
+bpf_evidence_phases = ["P0-marker","P0-tripwire","P2-census","P2-broker","P2b-causality","P3-types"]
+broker_socket_inode_proof = true
+causality_control = "--disable-seccomp-filter-sandbox"
 
 [forbidden]                    # verifier refuses these (fail-closed)
 - "any Content/GPU/utility MAY_CONNECT-style widening without a contract entry"

@@ -95,4 +95,18 @@ sed -i '/port hook (generated/,/port hook <<</d' "$TREP/x11-packages/chromium-sa
 python3 port/prepare_recipe.py audit --termux-dir "$TREP" >/dev/null 2>&1 \
   && fail "[9] tamper undetected" || pass "[9] recipe tamper detected"
 
+# [13] Phase 2/3 gate: bpf_evidence.sh selftest (fake /proc fixtures)
+out=$(bash port/bpf_evidence.sh selftest 2>&1); got=$?
+[ $got -eq 0 ] && echo "$out" | grep -q '\[selftest\] PASS' \
+  && pass "[13] bpf_evidence selftest" || { fail "[13] bpf_evidence selftest"; echo "$out"; }
+
+# [14] bpf_evidence content contract: Phase 2/3 requirements must be encoded
+be=port/bpf_evidence.sh
+grep -q -- '--disable-seccomp-filter-sandbox' $be \
+  && grep -q 'broker' $be \
+  && grep -q 'No usable sandbox' $be \
+  && grep -q -- '--no-sandbox' $be \
+  && grep -q 'gpu-process' $be && grep -q 'utility' $be \
+  && pass "[14] bpf_evidence encodes P2/P3 checks" || fail "[14] bpf_evidence contract"
+
 exit $rc

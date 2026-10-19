@@ -40,6 +40,32 @@ A renderer crash loop here = policy too strict for Bionic → capture
 `--enable-logging=stderr --v=1` and the SIGSYS si_code/syscall; fix the
 exact BPF contract. **Never bulk-allow syscalls seen in logs** (fail-closed).
 
+## 2b. Renderer BPF 활성화 입증 — `port/bpf_evidence.sh <chrome-bin> --ws DIR`
+Phase-2 gate, offline-selftested (`selftest` subcommand, fake /proc fixtures).
+Checks (all fatal unless marked WARN/INFO):
+- **P0 marker**: `grep -a "Termux seccomp-only"` on the binary — proves R1/R2 were compiled in (guards against a build that silently skipped the port hook).
+- **P0 tripwire**: runtime `--no-sandbox` in the browser cmdline = FAIL. This is the exact signature termux cr-patches 1001/1004 injected; catching it on-device closes the loop with the CI anti-injection scan.
+- **P2 census**: renderer `Seccomp_filters>=2` AND `Seccomp==2` AND `NoNewPrivs==1`; zygote process must exist (PPid-chain renderer→zygote).
+- **P2 broker**: shared socket-pair inode between a zygote fd table and a renderer fd table ⇒ sandbox IPC broker live (kernel-level evidence, not just counters).
+- **P2b causality control**: rerun with `--disable-seccomp-filter-sandbox`; renderer filter count MUST drop ⇒ the 2nd filter is demonstrably Chromium's own BPF, not the Android baseline.
+
+**Failure diagnostics (priority order, encoded in script output):**
+1. port-apply.log R1/R2 APPLIED markers (build side)
+2. P0 marker string (link side)
+3. zygote absent + `--no-zygote` in cmdline → shell_main_delegate PreSandboxStartup path
+4. `No usable sandbox` in run log → ZygoteHostImpl::Init R1 not compiled
+5. renderer filters==1 with marker present → R2 / EngageNamespaceSandbox path in sandbox_linux.cc
+6. SIGSYS boot-loop → renderer EnableSandbox self-CHECK vs missing BPF (expected crash-not-stealth behavior)
+
+## 2c. GPU·Utility·Network 확대 (Phase 3)
+Same census table, per-type expectations (from `census-ported.txt`):
+- `gpu-process >= 2` — **recommended** (WARN, not fatal: swiftshader/headless paths may legally fork gpu before filter engagement)
+- `utility >= 2` — informational; upstream Linux network sandbox is opt-in, so `utility` (network service) at Android baseline 1 is NOT a port defect
+- any new `Seccomp_filters` regression vs device_gate §2 table = investigate before §3
+
+Extra Bionic-compat patches are added ONLY if a specific type shows the R1-style
+LOG(FATAL) or SIGSYS boot-loop in its run log — one type at a time, A/B per §6.
+
 ## 3. Codec capability
 media-capabilities.html via `--virtual-time-budget --dump-dom`:
 H.264, VP9, AV1, AAC, Opus all `probably` (5/5).
