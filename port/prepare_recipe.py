@@ -41,8 +41,11 @@ termux_step_post_get_source() {{
 \tpython3 "$TERMUX_PKG_BUILDER_DIR/termux-chromium-sandbox-port.py" apply \\
 \t\t--src "$TERMUX_PKG_SRCDIR" --scan content,chrome \\
 \t\t| tee "$TERMUX_PKG_TMPDIR/port-apply.log"
+\t\t# mirror into BUILDER_DIR (repo tree) so the CI host can grep it —
+\t\t# TMPDIR lives under the container home which is not mounted back.
+\t\tcp "$TERMUX_PKG_TMPDIR/port-apply.log" "$TERMUX_PKG_BUILDER_DIR/port-apply.log" 2>/dev/null || true
 \tc=$(grep -c "ALREADY_PRESENT\\|APPLIED" "$TERMUX_PKG_TMPDIR/port-apply.log" || true)
-\t[ "$c" -ge 2 ] || {{ echo "port hook: fewer than 2 rules applied" >&2; exit 1; }}
+\t[ "$c" -ge 3 ] || {{ echo "port hook: fewer than 3 rules applied" >&2; exit 1; }}
 }}
 {HOOK_END}
 """
