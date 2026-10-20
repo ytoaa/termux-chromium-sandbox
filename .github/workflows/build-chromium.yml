@@ -82,8 +82,8 @@ jobs:
           [ "$pkg" = "chromium-sandboxed" ] || { echo "wrong package name: $pkg"; exit 1; }
           echo "artifact: $pkg $ver"
           # port-apply.log must show both rules applied/present
-          log=$(find termux-packages -name port-apply.log 2>/dev/null | head -1 || true)
-          test -n "$log" || { echo "port-apply.log not found"; exit 1; }
+          log=$(find termux-packages -name 'port-apply*.log' 2>/dev/null | head -1 || true)
+          test -n "$log" || { echo "port-apply*.log not found"; exit 1; }
           grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q R1 || { echo "R1 not applied"; exit 1; }
           grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q R2 || { echo "R2 not applied"; exit 1; }
           grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q R3 || { echo "R3 not applied"; exit 1; }
@@ -104,6 +104,7 @@ jobs:
           path: |
             termux-packages/output/chromium-sandboxed_*_aarch64.deb
             termux-packages/chromium-build.log
-            termux-packages/**/port-apply.log
+            termux-packages/port-apply-chromium.log
+            termux-packages/**/port-apply-chromium.log
             termux-pin.txt
           if-no-files-found: warn
