@@ -211,13 +211,12 @@ class Port:
     R5_OLD = '''namespace sandbox {'''
 
     R5_NEW = '''#if defined(__BIONIC__)
-namespace partition_alloc::internal {
-class StackTopRegistry {
- public:
-  static StackTopRegistry& Get();
-  void* GetCurrentThreadStackTop() const;
-};
-}  // namespace partition_alloc::internal
+namespace base::debug {
+uintptr_t GetStackEnd();
+}  // namespace base::debug
+namespace partition_alloc::internal::base::debug {
+uintptr_t GetStackEnd();
+}  // namespace partition_alloc::internal::base::debug
 #endif
 
 // ''' + R5_MARKER + ''' (file-scope decl; warm call in StartSeccompBPF)
@@ -229,10 +228,18 @@ namespace sandbox {'''
     R5B_NEW = '''  CHECK(!seccomp_bpf_started_);
   CHECK(pre_initialized_);
 #if defined(__BIONIC__)
-  // Warm the TID-keyed stack-top cache before the BPF denies /proc; bionic
-  // pthread_getattr_np aborts when it cannot read /proc/self/maps.
-  (void)::partition_alloc::internal::StackTopRegistry::Get()
-            .GetCurrentThreadStackTop();
+  // Warm base::debug::internal::GetStackEnd() on the MAIN thread before the
+  // BPF denies /proc: on bionic the glibc __libc_stack_end fast path is
+  // compiled out, and pthread_getattr_np(main) LOG(FATAL)s when it cannot
+  // read /proc/self/maps (upstream comment at base/debug/stack_trace.cc:228
+  // documents the maps read; the renderer killed itself here post-activation
+  // in device-gate rounds 3-4). The static-once cache is then inherited by
+  // forked children; all later callers take the cached hit. [[gnu::used]]
+  // prevents the optimizer from deleting the "unused" prewarm call.
+  [[gnu::used]] const uintptr_t warmed_a = ::base::debug::GetStackEnd();
+  [[gnu::used]] const uintptr_t warmed_b =
+      ::partition_alloc::internal::base::debug::GetStackEnd();
+  (void)(warmed_a + warmed_b);
 #endif'''
 
     def apply(self) -> None:

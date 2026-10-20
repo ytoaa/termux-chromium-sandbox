@@ -149,8 +149,8 @@ echo "$out" | grep -q 'APPLIED.*R4' \
 fresh
 out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
 echo "$out" | grep -q 'APPLIED.*R5' \
-  && grep -q 'StackTopRegistry::Get' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
+  && grep -q 'GetStackEnd()' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
   && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
-  && pass "[20] R5 prewarm applied+verified" || fail "[20] R5 prewarm"
+  && pass "[20] R5/R6 GetStackEnd prewarm applied+verified" || fail "[20] R5/R6 prewarm"
 
 exit $rc
