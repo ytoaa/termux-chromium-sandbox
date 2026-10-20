@@ -91,14 +91,18 @@ build_chromium() {
       n=$(find "$d/.sccache" -type f 2>/dev/null | wc -l)
       if [ "$n" -lt 50 ]; then
         echo "SCCACHE DEAD: $n cache files after 30min (expect thousands) — cc_wrapper wiring or volume mount broken. Aborting early."
-        kill -TERM -"$bpid" 2>/dev/null; sleep 5; kill -KILL -"$bpid" 2>/dev/null
+        kill -TERM -"$bpid" 2>/dev/null || true; sleep 5; kill -KILL -"$bpid" 2>/dev/null || true
       else
         echo "SCCACHE ALIVE: $n cache files at 30min — interception working."
       fi
     ) &
     local wpid=$!
     wait "$bpid"; local rc=$?
-    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+    # run #11 post-mortem: the watchdog had exited at T+30min; under the global
+    # set -e a kill/wait on that reaped pid returned 1 and aborted the step
+    # 0.3s after "build done" — a false failure on a perfectly good package.
+    kill "$wpid" 2>/dev/null || true
+    wait "$wpid" 2>/dev/null || true
     n=$(find "$d/.sccache" -type f 2>/dev/null | wc -l)
     echo "SCCACHE FILES: $n ($(du -sh "$d/.sccache" 2>/dev/null | cut -f1))"
     exit $rc

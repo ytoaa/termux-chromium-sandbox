@@ -120,4 +120,10 @@ g15="$T15/x11-packages/chromium-sandboxed/build.sh"
 # [16] ci.sh build must (re)export the sccache volume IN-STEP + early evidence gate
 grep -q 'TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume $d/.sccache:/home/builder/.cache/sccache"' port/ci.sh   && grep -q 'SCCACHE DEAD' port/ci.sh   && grep -q 'sleep 1800' port/ci.sh   && grep -q 'SCCACHE ALIVE' port/ci.sh   && pass "[16] in-step volume export + 30min evidence watchdog" || fail "[16] ci.sh marathon contract"
 
+# [17] run #11 false-failure regression: reaped-watchdog kill/wait must be || true
+grep -q 'kill "$wpid" 2>/dev/null || true' port/ci.sh \
+  && grep -q 'wait "$wpid" 2>/dev/null || true' port/ci.sh \
+  && grep -q 'kill -KILL -"$bpid" 2>/dev/null || true' port/ci.sh \
+  && pass "[17] set -e false-failure guarded" || fail "[17] unguarded kill/wait under set -e"
+
 exit $rc
