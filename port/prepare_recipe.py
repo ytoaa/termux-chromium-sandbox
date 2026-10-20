@@ -46,7 +46,7 @@ termux_step_post_get_source() {{
 \t\tcp "$TERMUX_PKG_TMPDIR/port-apply.log" "$TERMUX_PKG_BUILDER_DIR/port-apply.log" 2>/dev/null || true
 \t\t# BUILDER_DIR at hook time is the container-local recipe copy (.termux-build),
 \t\t# NOT the mounted repo — also drop it at the mounted repo root for CI host gates.
-\t\tcp "$TERMUX_PKG_TMPDIR/port-apply.log" /home/builder/termux-packages/port-apply-chromium.log 2>/dev/null || true
+\t\tcat "$TERMUX_PKG_TMPDIR/port-apply.log" > /home/builder/termux-packages/port-apply-chromium.log 2>/dev/null || true
 \tc=$(grep -c "ALREADY_PRESENT\\|APPLIED" "$TERMUX_PKG_TMPDIR/port-apply.log" || true)
 \t[ "$c" -ge 5 ] || {{ echo "port hook: fewer than 5 rules applied" >&2; exit 1; }}
 }}
