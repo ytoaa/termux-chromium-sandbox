@@ -205,30 +205,46 @@ class Port:
     # after "Activated seccomp-bpf" with no message (desktop survives because
     # glibc degrades gracefully and PA even has a __libc_stack_end fallback;
     # bionic has none). Prewarm the current thread BEFORE the filter engages.
+    # R5 (device-gate round 3, abort() backtrace forensics): PartitionAlloc's
+    # StackTopRegistry lazily calls pthread_getattr_np on first use per thread
+    # (flat_map keyed by TID - a zygote prewarm cannot help forked children,
+    # which have fresh TIDs). Post-filter, /proc is unreadable and BIONIC
+    # pthread_getattr_np LOG(FATAL)s internally: the renderer aborts right
+    # after "Activated seccomp-bpf" with no message (desktop survives because
+    # glibc degrades gracefully and PA even has a __libc_stack_end fallback;
+    # bionic has none). Prewarm the current thread BEFORE the filter engages.
+    # NOTE(run #16): the forward declaration must live at FILE SCOPE (C++
+    # forbids namespace definitions inside functions) and under the REAL
+    # partition_alloc::internal namespace so it links against PA's symbol.
     R5_OLD = '''bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
                                    PreSandboxHook hook,
                                    const Options& options) {
   CHECK(!seccomp_bpf_started_);
   CHECK(pre_initialized_);'''
 
-    R5_NEW = '''bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
+    R5_NEW = '''#if defined(__BIONIC__)
+namespace partition_alloc::internal {
+class StackTopRegistry {
+ public:
+  static StackTopRegistry& Get();
+  void* GetCurrentThreadStackTop() const;
+};
+}  // namespace partition_alloc::internal
+#endif
+
+bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
                                    PreSandboxHook hook,
                                    const Options& options) {
   CHECK(!seccomp_bpf_started_);
   CHECK(pre_initialized_);
 #if defined(__BIONIC__)
-  namespace pa_pre {
-  class StackTopRegistry {
-   public:
-    static StackTopRegistry& Get();
-    void* GetCurrentThreadStackTop() const;
-  };
-  }  // namespace pa_pre
   // ''' + R5_MARKER + ''' warm the TID-keyed stack-top cache before the
   // BPF denies /proc; bionic pthread_getattr_np aborts when it cannot read
   // /proc/self/maps for a main thread.
-  (void)pa_pre::StackTopRegistry::Get().GetCurrentThreadStackTop();
+  (void)partition_alloc::internal::StackTopRegistry::Get()
+            .GetCurrentThreadStackTop();
 #endif'''
+
 
     def apply(self) -> None:
         self.replace_once(self.ZYGOTE_HOST, "R1 seccomp-only usable mode (Bionic)",
