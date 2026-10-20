@@ -205,22 +205,10 @@ class Port:
     # after "Activated seccomp-bpf" with no message (desktop survives because
     # glibc degrades gracefully and PA even has a __libc_stack_end fallback;
     # bionic has none). Prewarm the current thread BEFORE the filter engages.
-    # R5 (device-gate round 3, abort() backtrace forensics): PartitionAlloc's
-    # StackTopRegistry lazily calls pthread_getattr_np on first use per thread
-    # (flat_map keyed by TID - a zygote prewarm cannot help forked children,
-    # which have fresh TIDs). Post-filter, /proc is unreadable and BIONIC
-    # pthread_getattr_np LOG(FATAL)s internally: the renderer aborts right
-    # after "Activated seccomp-bpf" with no message (desktop survives because
-    # glibc degrades gracefully and PA even has a __libc_stack_end fallback;
-    # bionic has none). Prewarm the current thread BEFORE the filter engages.
-    # NOTE(run #16): the forward declaration must live at FILE SCOPE (C++
-    # forbids namespace definitions inside functions) and under the REAL
-    # partition_alloc::internal namespace so it links against PA's symbol.
-    R5_OLD = '''bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
-                                   PreSandboxHook hook,
-                                   const Options& options) {
-  CHECK(!seccomp_bpf_started_);
-  CHECK(pre_initialized_);'''
+    # NOTE(run #16/#17): forward decls must sit at TRUE file scope - namespace
+    # declarations nest, so an insertion inside `namespace sandbox { ... }`
+    # mangles as sandbox::policy::partition_alloc::... and fails to link.
+    R5_OLD = '''namespace sandbox {'''
 
     R5_NEW = '''#if defined(__BIONIC__)
 namespace partition_alloc::internal {
@@ -232,19 +220,20 @@ class StackTopRegistry {
 }  // namespace partition_alloc::internal
 #endif
 
-bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
-                                   PreSandboxHook hook,
-                                   const Options& options) {
-  CHECK(!seccomp_bpf_started_);
+// ''' + R5_MARKER + ''' (file-scope decl; warm call in StartSeccompBPF)
+namespace sandbox {'''
+
+    R5B_OLD = '''  CHECK(!seccomp_bpf_started_);
+  CHECK(pre_initialized_);'''
+
+    R5B_NEW = '''  CHECK(!seccomp_bpf_started_);
   CHECK(pre_initialized_);
 #if defined(__BIONIC__)
-  // ''' + R5_MARKER + ''' warm the TID-keyed stack-top cache before the
-  // BPF denies /proc; bionic pthread_getattr_np aborts when it cannot read
-  // /proc/self/maps for a main thread.
-  (void)partition_alloc::internal::StackTopRegistry::Get()
+  // Warm the TID-keyed stack-top cache before the BPF denies /proc; bionic
+  // pthread_getattr_np aborts when it cannot read /proc/self/maps.
+  (void)::partition_alloc::internal::StackTopRegistry::Get()
             .GetCurrentThreadStackTop();
 #endif'''
-
 
     def apply(self) -> None:
         self.replace_once(self.ZYGOTE_HOST, "R1 seccomp-only usable mode (Bionic)",
@@ -255,8 +244,10 @@ bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
                           self.R3_OLD, self.R3_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R4 zygote passthrough (Bionic)",
                           self.R4_OLD, self.R4_NEW)
-        self.replace_once(self.SANDBOX_LINUX, "R5 stack-top prewarm (Bionic)",
+        self.replace_once(self.SANDBOX_LINUX, "R5 stack-top decl (Bionic)",
                           self.R5_OLD, self.R5_NEW)
+        self.replace_once(self.SANDBOX_LINUX, "R5 stack-top prewarm call (Bionic)",
+                          self.R5B_OLD, self.R5B_NEW)
 
     # ---------- verifier (fail-closed gates) ----------
     def verify(self) -> None:

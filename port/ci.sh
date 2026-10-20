@@ -78,7 +78,10 @@ build_chromium() {
     echo "termux-packages HEAD: $(git -C . rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "sccache host dir: $d/.sccache"
     echo "======================================"
-    setsid bash -c './scripts/run-docker.sh env \
+    # run #17: pipefail must be set INSIDE the bash -c (the subshell option
+    # does not propagate) - otherwise tee's exit 0 masks ninja failures and
+    # the build step falsely reports success.
+    setsid bash -c 'set -o pipefail; ./scripts/run-docker.sh env \
       SCCACHE_DIR=/home/builder/.cache/sccache \
       SCCACHE_CACHE_SIZE=6G \
       ./build-package.sh -f -I -a aarch64 chromium-sandboxed 2>&1 | tee chromium-build.log' &
