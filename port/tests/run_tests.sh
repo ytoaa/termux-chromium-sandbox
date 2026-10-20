@@ -145,4 +145,12 @@ echo "$out" | grep -q 'APPLIED.*R4' \
   && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
   && pass "[19] R4 zygote passthrough applied+verified" || fail "[19] R4 zygote passthrough"
 
+# [20] R5 stack-top prewarm (round-3 abort forensics: bionic pthread_getattr_np FATAL post-filter)
+fresh
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+echo "$out" | grep -q 'APPLIED.*R5' \
+  && grep -q 'StackTopRegistry::Get' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
+  && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
+  && pass "[20] R5 prewarm applied+verified" || fail "[20] R5 prewarm"
+
 exit $rc

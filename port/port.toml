@@ -37,6 +37,10 @@ marker = "Termux seccomp-only bionic-prctl:"
 name = "zygote passthrough (Bionic)"
 file = "sandbox/policy/linux/sandbox_linux.cc"
 marker = "Termux seccomp-only zygote passthrough:"
+[rules.r5]
+name = "stack-top prewarm (Bionic)"
+file = "sandbox/policy/linux/sandbox_linux.cc"
+marker = "Termux seccomp-only stack-top prewarm:"
 
 [gates]
 # Future candidate gates (firefox-pattern): source verify + binary markers +

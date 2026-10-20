@@ -88,6 +88,7 @@ jobs:
           grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q R2 || { echo "R2 not applied"; exit 1; }
           grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q R3 || { echo "R3 not applied"; exit 1; }
           grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q R4 || { echo "R4 not applied"; exit 1; }
+          grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q R5 || { echo "R5 not applied"; exit 1; }
           echo "PORT GATES PASS: $pkg $ver"
       - name: Save sccache
         if: always()

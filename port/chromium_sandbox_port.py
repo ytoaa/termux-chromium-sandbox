@@ -37,6 +37,7 @@ R1_MARKER = "Termux seccomp-only sandbox:"
 R2_MARKER = "Termux seccomp-only port:"
 R3_MARKER = "Termux seccomp-only bionic-prctl:"
 R4_MARKER = "Termux seccomp-only zygote passthrough:"
+R5_MARKER = "Termux seccomp-only stack-top prewarm:"
 
 
 class PortError(RuntimeError):
@@ -196,6 +197,39 @@ class Port:
     return true;
   }
 #endif'''
+    # R5 (device-gate round 3, abort() backtrace forensics): PartitionAlloc's
+    # StackTopRegistry lazily calls pthread_getattr_np on first use per thread
+    # (flat_map keyed by TID - a zygote prewarm cannot help forked children,
+    # which have fresh TIDs). Post-filter, /proc is unreadable and BIONIC
+    # pthread_getattr_np LOG(FATAL)s internally: the renderer aborts right
+    # after "Activated seccomp-bpf" with no message (desktop survives because
+    # glibc degrades gracefully and PA even has a __libc_stack_end fallback;
+    # bionic has none). Prewarm the current thread BEFORE the filter engages.
+    R5_OLD = """bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
+                                   PreSandboxHook hook,
+                                   const Options& options) {
+  CHECK(!seccomp_bpf_started_);
+  CHECK(pre_initialized_);"""
+
+    R5_NEW = """bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
+                                   PreSandboxHook hook,
+                                   const Options& options) {
+  CHECK(!seccomp_bpf_started_);
+  CHECK(pre_initialized_);
+#if defined(__BIONIC__)
+  namespace pa_pre {
+  class StackTopRegistry {
+   public:
+    static StackTopRegistry& Get();
+    void* GetCurrentThreadStackTop() const;
+  };
+  }  // namespace pa_pre
+  // ''' + R5_MARKER + ''' warm the TID-keyed stack-top cache before the
+  // BPF denies /proc; bionic pthread_getattr_np aborts when it cannot read
+  // /proc/self/maps for a main thread.
+  (void)pa_pre::StackTopRegistry::Get().GetCurrentThreadStackTop();
+#endif"""
+
     def apply(self) -> None:
         self.replace_once(self.ZYGOTE_HOST, "R1 seccomp-only usable mode (Bionic)",
                           self.R1_OLD, self.R1_NEW)
@@ -205,6 +239,8 @@ class Port:
                           self.R3_OLD, self.R3_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R4 zygote passthrough (Bionic)",
                           self.R4_OLD, self.R4_NEW)
+        self.replace_once(self.SANDBOX_LINUX, "R5 stack-top prewarm (Bionic)",
+                          self.R5_OLD, self.R5_NEW)
 
     # ---------- verifier (fail-closed gates) ----------
     def verify(self) -> None:
@@ -214,6 +250,7 @@ class Port:
             (self.SANDBOX_LINUX, R2_MARKER, "R2"),
             (self.SYSCALL_RESTRICT, R3_MARKER, "R3"),
             (self.SANDBOX_LINUX, R4_MARKER, "R4"),
+            (self.SANDBOX_LINUX, R5_MARKER, "R5"),
         ):
             text = self.p(rel).read_text()
             n = text.count(marker)
