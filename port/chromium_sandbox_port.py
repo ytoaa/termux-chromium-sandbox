@@ -36,6 +36,7 @@ from pathlib import Path
 R1_MARKER = "Termux seccomp-only sandbox:"
 R2_MARKER = "Termux seccomp-only port:"
 R3_MARKER = "Termux seccomp-only bionic-prctl:"
+R4_MARKER = "Termux seccomp-only zygote passthrough:"
 
 
 class PortError(RuntimeError):
@@ -160,6 +161,41 @@ class Port:
               , 58   /* PR_SECCOMP_CACHE_FLUSH (bionic seccomp cache) */
 #endif"""
 
+    # R4 (device-gate round 2): the zygote installs a permissive-until-relaxed
+    # BPF that is inherited by every forked child and can never be removed.
+    # bionic issues prctl/set_tid_address in the clone-child path before the
+    # broker relaxes it: strace shows the whole renderer dying simultaneously
+    # with si_code=SYS_SECCOMP si_syscall=__NR_set_tid_address (glibc desktop
+    # never calls it there, hence no upstream coverage). The zygote is a
+    # launcher, not a security boundary — pass it through (same precedent as
+    # IsUnsandboxedSandboxType returning true without installing). Child
+    # processes still install their own policies via StartSeccompBPF.
+    R4_OLD = '''  if (IsUnsandboxedSandboxType(sandbox_type) ||
+      !SandboxSeccompBPF::IsSeccompBPFDesired() ||
+      !SandboxSeccompBPF::SupportsSandbox()) {
+    return true;
+  }'''
+
+    R4_NEW = '''  if (IsUnsandboxedSandboxType(sandbox_type) ||
+      !SandboxSeccompBPF::IsSeccompBPFDesired() ||
+      !SandboxSeccompBPF::SupportsSandbox()) {
+    return true;
+  }
+
+#if defined(__BIONIC__)
+  // ''' + R4_MARKER + ''' Android/Termux: do not install a BPF in
+  // the zygote itself. bionic's clone-child setup (set_tid_address) trips the
+  // inherited zygote filter and RET_KILLs every renderer before its ping.
+  // Launcher stays on the Android platform baseline filter; each child type
+  // still installs its own policy below — that is where this port's
+  // enforcement lives.
+  if (sandbox_type == sandbox::mojom::Sandbox::kZygote) {
+    LOG(WARNING) << "''' + R4_MARKER + ''' no BPF in zygote; "
+                 << "child policies enforce the sandbox.";
+    seccomp_bpf_started_ = true;
+    return true;
+  }
+#endif'''
     def apply(self) -> None:
         self.replace_once(self.ZYGOTE_HOST, "R1 seccomp-only usable mode (Bionic)",
                           self.R1_OLD, self.R1_NEW)
@@ -167,6 +203,8 @@ class Port:
                           self.R2_OLD, self.R2_NEW)
         self.replace_once(self.SYSCALL_RESTRICT, "R3 bionic prctl options (arm64-Android)",
                           self.R3_OLD, self.R3_NEW)
+        self.replace_once(self.SANDBOX_LINUX, "R4 zygote passthrough (Bionic)",
+                          self.R4_OLD, self.R4_NEW)
 
     # ---------- verifier (fail-closed gates) ----------
     def verify(self) -> None:
@@ -175,6 +213,7 @@ class Port:
             (self.ZYGOTE_HOST, R1_MARKER, "R1"),
             (self.SANDBOX_LINUX, R2_MARKER, "R2"),
             (self.SYSCALL_RESTRICT, R3_MARKER, "R3"),
+            (self.SANDBOX_LINUX, R4_MARKER, "R4"),
         ):
             text = self.p(rel).read_text()
             n = text.count(marker)

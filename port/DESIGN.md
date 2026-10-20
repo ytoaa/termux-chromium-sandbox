@@ -283,3 +283,18 @@ DLOG(FATAL) not compiled fatal in release; libc logs and proceeds).
 Measurement: kernel 4.19 testbed does not export Seccomp_filters in
 /proc/pid/status — gates use renderer-presence + zero-CRASHING proxy there;
 authoritative filter census stays on the main device (kernel >= 6.1).
+
+## Device-gate round 2 (run #12 deb): zygote inherited filter kills renderer
+With R3, CRASHING-prctl is gone but renderers still never ping ("Did not
+receive ping from zygote child"). strace (installed on main device) shows the
+whole renderer family dying simultaneously:
+    SIGSYS {si_code=SYS_SECCOMP, si_errno=EPERM, si_syscall=__NR_set_tid_address}
+seccomp filters are inherited across fork and can never be removed; bionic's
+clone-child setup calls set_tid_address before the broker relaxes the zygote
+filter — a syscall pattern glibc desktop never exhibits, hence zero upstream
+coverage. Fix R4: on __BIONIC__ pass the ZYGOTE type through StartSeccompBPF
+(same precedent as IsUnsandboxedSandboxType: return true without installing).
+The zygote is a launcher, not a security boundary; child types (renderer/
+gpu/utility) still install their own policies — where this port's enforcement
+lives. bpf_evidence still requires the zygote to exist; renderer census >=2
+remains the authoritative gate on the main device.

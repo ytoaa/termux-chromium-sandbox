@@ -45,7 +45,7 @@ termux_step_post_get_source() {{
 \t\t# TMPDIR lives under the container home which is not mounted back.
 \t\tcp "$TERMUX_PKG_TMPDIR/port-apply.log" "$TERMUX_PKG_BUILDER_DIR/port-apply.log" 2>/dev/null || true
 \tc=$(grep -c "ALREADY_PRESENT\\|APPLIED" "$TERMUX_PKG_TMPDIR/port-apply.log" || true)
-\t[ "$c" -ge 3 ] || {{ echo "port hook: fewer than 3 rules applied" >&2; exit 1; }}
+\t[ "$c" -ge 4 ] || {{ echo "port hook: fewer than 4 rules applied" >&2; exit 1; }}
 }}
 {HOOK_END}
 """

@@ -136,4 +136,13 @@ echo "$out" | grep -q 'APPLIED.*R3' \
   && grep -q '#if defined(__BIONIC__)' "$WORK/src/sandbox/linux/seccomp-bpf-helpers/syscall_parameters_restrictions.cc" \
   && pass "[18] R3 bionic prctl applied+idempotent+guarded" || fail "[18] R3 bionic prctl"
 
+# [19] R4 zygote passthrough (device-gate round-2: set_tid_address SYS_SECCOMP kill)
+fresh
+out=$(python3 $PORT apply --src "$W/src" 2>/dev/null); out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+echo "$out" | grep -q 'APPLIED.*R4' \
+  && grep -q 'kZygote' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
+  && grep -q '#if defined(__BIONIC__)' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
+  && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
+  && pass "[19] R4 zygote passthrough applied+verified" || fail "[19] R4 zygote passthrough"
+
 exit $rc
