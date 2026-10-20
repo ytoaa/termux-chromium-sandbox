@@ -35,6 +35,7 @@ from pathlib import Path
 
 R1_MARKER = "Termux seccomp-only sandbox:"
 R2_MARKER = "Termux seccomp-only port:"
+R3_MARKER = "Termux seccomp-only bionic-prctl:"
 
 
 class PortError(RuntimeError):
@@ -94,6 +95,7 @@ class Port:
     # ---------- rules ----------
     ZYGOTE_HOST = "content/browser/zygote_host/zygote_host_impl_linux.cc"
     SANDBOX_LINUX = "sandbox/policy/linux/sandbox_linux.cc"
+    SYSCALL_RESTRICT = "sandbox/linux/seccomp-bpf-helpers/syscall_parameters_restrictions.cc"
 
     R1_OLD = '''LOG(FATAL)
         << "No usable sandbox! If you are running on Ubuntu 23.10+ or another "
@@ -131,11 +133,40 @@ class Port:
     ''' + R2_OLD + '''
 #endif'''
 
+    # R3 (Phase 3, device gate round 1): RestrictPrctl() allow-lists the
+    # arm64-Android prctl options only under BUILDFLAG(IS_ANDROID). Termux
+    # builds chromium with os=linux (IS_ANDROID=false) yet runs on Android/
+    # arm64, where bionic/zygote child setup issues prctl(PR_PAC_RESET_KEYS)
+    # (0x36) - unlisted -> CrashSIGSYSPrctl -> boot-loop of every sandboxed
+    # process (observed identically on kernel 6.1 main device and 4.19
+    # test device; the exact class of failure termux cr-patch 1001 "solved"
+    # by killing the whole sandbox). Extend the list under __BIONIC__ only.
+    R3_OLD = """      .Cases({PR_GET_NAME, PR_SET_NAME, PR_GET_DUMPABLE, PR_SET_DUMPABLE"""
+
+    R3_NEW = """      .Cases({PR_GET_NAME, PR_SET_NAME, PR_GET_DUMPABLE, PR_SET_DUMPABLE
+#if defined(__BIONIC__)
+              // """ + R3_MARKER + """ android-prctl options survive the
+              // os=linux build tag: bionic clone/fork child setup resets PAC
+              // keys and Android userspace probes MTE/SVE/seccomp-cache.
+              // Without these, CrashSIGSYSPrctl boot-loops every process
+              // that engages the seccomp-only sandbox.
+              , 54   /* PR_PAC_RESET_KEYS */
+              , 55   /* PR_PAC_GET_ENABLED_KEYS */
+              , 56   /* PR_GET_TAGGED_ADDR_CTRL */
+              , 44   /* PR_SET_THP_DISABLE */
+              , 41   /* PR_SET_TIMERSLACK_PID (android-3.14) */
+              , 43   /* PR_SET_TIMERSLACK_PID (android-3.18) */
+              , 127  /* PR_SET_TIMERSLACK_PID (android-4.1+) */
+              , 58   /* PR_SECCOMP_CACHE_FLUSH (bionic seccomp cache) */
+#endif"""
+
     def apply(self) -> None:
         self.replace_once(self.ZYGOTE_HOST, "R1 seccomp-only usable mode (Bionic)",
                           self.R1_OLD, self.R1_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R2 skip namespace engage (Bionic)",
                           self.R2_OLD, self.R2_NEW)
+        self.replace_once(self.SYSCALL_RESTRICT, "R3 bionic prctl options (arm64-Android)",
+                          self.R3_OLD, self.R3_NEW)
 
     # ---------- verifier (fail-closed gates) ----------
     def verify(self) -> None:
@@ -143,6 +174,7 @@ class Port:
         for rel, marker, label in (
             (self.ZYGOTE_HOST, R1_MARKER, "R1"),
             (self.SANDBOX_LINUX, R2_MARKER, "R2"),
+            (self.SYSCALL_RESTRICT, R3_MARKER, "R3"),
         ):
             text = self.p(rel).read_text()
             n = text.count(marker)

@@ -38,7 +38,7 @@ for run in "$@"; do
   $RCP "$DEB" $RG_USER@$RG_HOST:~/chromium-gate/run/
   DEBN=$(basename "$DEB")
   echo "--- real install validation (clean testbed only) ---"
-  $SSH "cd ~/chromium-gate/run && dpkg -i $DEBN 2>&1 | tail -3; dpkg -l chromium-sandboxed 2>/dev/null | tail -1" | tee "$OUT/install.log"
+  $SSH "cd ~/chromium-gate/run && dpkg -i $DEBN 2>&1 | tail -3; apt-get -f install -y 2>&1 | tail -2; dpkg -l chromium-sandboxed 2>/dev/null | tail -1" | tee "$OUT/install.log"
   echo "--- device_gate (extract-run census + codecs) ---"
   $SSH "cd ~/chromium-gate && ./device_gate.sh run/$DEBN /data/data/com.termux/files/usr/bin/dpkg 2>&1" | tee "$OUT/device_gate.log"
   dg=$?

@@ -29,6 +29,10 @@ marker = "Termux seccomp-only sandbox:"
 name = "skip namespace engage (Bionic)"
 file = "sandbox/policy/linux/sandbox_linux.cc"
 marker = "Termux seccomp-only port:"
+[rules.r3]
+name = "bionic prctl options (arm64-Android)"
+file = "sandbox/linux/seccomp-bpf-helpers/syscall_parameters_restrictions.cc"
+marker = "Termux seccomp-only bionic-prctl:"
 
 [gates]
 # Future candidate gates (firefox-pattern): source verify + binary markers +

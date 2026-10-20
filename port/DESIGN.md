@@ -266,3 +266,20 @@ Port response (fail-closed layers):
   remote_gate.sh installs, gates, then dpkg -r to keep it clean.
 - Gate scripts are synced to ~/chromium-gate on the remote; bpf_evidence
   selftest already PASSes on-device.
+
+## Mystery #2 solved (run #11 device-gate round 1) — the prctl wall
+First-port deb on both devices (main kernel 6.1 + S20 FE 4.19): zygote alive
+(R1/R2 healthy!) but every sandboxed child boot-loops:
+    sigsys_handlers.cc:**CRASHING**:seccomp-bpf failure in syscall nr=0xa7 arg1=0x36
+= prctl(PR_PAC_RESET_KEYS). RestrictPrctl() (syscall_parameters_restrictions.cc)
+allow-lists arm64-Android prctl options only under BUILDFLAG(IS_ANDROID); Termux
+builds os=linux (IS_ANDROID=false) yet runs on Android/arm64, where bionic's
+clone/fork child setup resets PAC keys. This is the real class of problem
+cr-patch 1001 "fixed" by disabling the entire sandbox.
+Fix: R3 — __BIONIC__-guarded extension of the Cases allow-list (PAC 54/55/56,
+THP 44, TIMERSLACK_PID 41/43/127, SECCOMP_CACHE_FLUSH 58). trap.cc:106
+existing-handler noise and /proc/self/stat EPERM are non-fatal (upstream
+DLOG(FATAL) not compiled fatal in release; libc logs and proceeds).
+Measurement: kernel 4.19 testbed does not export Seccomp_filters in
+/proc/pid/status — gates use renderer-presence + zero-CRASHING proxy there;
+authoritative filter census stays on the main device (kernel >= 6.1).

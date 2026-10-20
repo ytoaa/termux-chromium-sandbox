@@ -126,4 +126,14 @@ grep -q 'kill "$wpid" 2>/dev/null || true' port/ci.sh \
   && grep -q 'kill -KILL -"$bpid" 2>/dev/null || true' port/ci.sh \
   && pass "[17] set -e false-failure guarded" || fail "[17] unguarded kill/wait under set -e"
 
+# [18] R3 bionic prctl allowlist (device-gate round-1 postmortem)
+fresh
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+echo "$out" | grep -q 'APPLIED.*R3' \
+  && out=$(python3 $PORT apply --src "$WORK/src" 2>&1) \
+  && echo "$out" | grep -q 'ALREADY_PRESENT.*R3' \
+  && grep -q 'PR_PAC_RESET_KEYS' "$WORK/src/sandbox/linux/seccomp-bpf-helpers/syscall_parameters_restrictions.cc" \
+  && grep -q '#if defined(__BIONIC__)' "$WORK/src/sandbox/linux/seccomp-bpf-helpers/syscall_parameters_restrictions.cc" \
+  && pass "[18] R3 bionic prctl applied+idempotent+guarded" || fail "[18] R3 bionic prctl"
+
 exit $rc
