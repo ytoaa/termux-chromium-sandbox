@@ -189,7 +189,7 @@ class Port:
   // Launcher stays on the Android platform baseline filter; each child type
   // still installs its own policy below — that is where this port's
   // enforcement lives.
-  if (sandbox_type == sandbox::mojom::Sandbox::kZygote) {
+  if (sandbox_type == sandbox::mojom::Sandbox::kZygoteIntermediateSandbox) {
     LOG(WARNING) << "''' + R4_MARKER + ''' no BPF in zygote; "
                  << "child policies enforce the sandbox.";
     seccomp_bpf_started_ = true;
