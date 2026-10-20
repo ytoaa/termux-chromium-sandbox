@@ -298,3 +298,24 @@ The zygote is a launcher, not a security boundary; child types (renderer/
 gpu/utility) still install their own policies — where this port's enforcement
 lives. bpf_evidence still requires the zygote to exist; renderer census >=2
 remains the authoritative gate on the main device.
+
+## Device-gate round 3 (run #14 deb): the silent post-activation abort
+Ported X11 run: renderer printed "Activated seccomp-bpf sandbox for process
+type: renderer" then died silently in a boot loop (214 activations, no stderr,
+no logcat abort message, no crashpad dump — crashpad snapshots also fail on
+this build: 'tag not found'). --no-sandbox renders the page perfectly (all 5
+codecs "probably") -> crash is purely BPF-policy interaction.
+Forensics chain: LD_PRELOAD abort() PLT-hook + backtrace_symbols_fd captured
+91 IDENTICAL stacks: chrome(GetStackTop wrapper) -> pthread_getattr_np@plt ->
+bionic abort. llvm-objdump at the exact file offsets (0xb94e304/0xb94a364)
+matched partition_alloc/stack/stack.cc GetStackTop(). Root cause: PA's
+StackTopRegistry lazily calls pthread_getattr_np per TID; post-filter /proc is
+unopenable and BIONIC pthread_getattr_np LOG(FATAL)s internally. glibc instead
+degrades gracefully (and PA even has a __libc_stack_end fallback for glibc) —
+bionic has neither, so desktop chrome never hit this. The registry is keyed by
+TID, and forked children have fresh TIDs -> a zygote prewarm cannot work.
+Fix R5: at the top of StartSeccompBPF under __BIONIC__, call
+StackTopRegistry::Get().GetCurrentThreadStackTop() (forward-declared) so the
+cache is warm before the filter engages, in every sandboxed process type.
+Probe lesson: headless=new NEVER works on termux chromium (stock included) —
+device gates must use --ozone-platform=x11 + console-log capture.
