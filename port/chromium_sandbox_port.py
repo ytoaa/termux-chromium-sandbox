@@ -205,13 +205,13 @@ class Port:
     # after "Activated seccomp-bpf" with no message (desktop survives because
     # glibc degrades gracefully and PA even has a __libc_stack_end fallback;
     # bionic has none). Prewarm the current thread BEFORE the filter engages.
-    R5_OLD = """bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
+    R5_OLD = '''bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
                                    PreSandboxHook hook,
                                    const Options& options) {
   CHECK(!seccomp_bpf_started_);
-  CHECK(pre_initialized_);"""
+  CHECK(pre_initialized_);'''
 
-    R5_NEW = """bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
+    R5_NEW = '''bool SandboxLinux::StartSeccompBPF(sandbox::mojom::Sandbox sandbox_type,
                                    PreSandboxHook hook,
                                    const Options& options) {
   CHECK(!seccomp_bpf_started_);
@@ -228,7 +228,7 @@ class Port:
   // BPF denies /proc; bionic pthread_getattr_np aborts when it cannot read
   // /proc/self/maps for a main thread.
   (void)pa_pre::StackTopRegistry::Get().GetCurrentThreadStackTop();
-#endif"""
+#endif'''
 
     def apply(self) -> None:
         self.replace_once(self.ZYGOTE_HOST, "R1 seccomp-only usable mode (Bionic)",
