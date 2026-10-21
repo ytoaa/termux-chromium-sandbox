@@ -384,3 +384,19 @@ The gate now correlates the browser's own VERBOSE activation lines
 ("[pid:tid:...] Activated seccomp-bpf ... renderer") with /proc/<pid>/status,
 and falls back to "any live child with >=2 filters".
 
+## Device-gate round 8 (run #25 deb): shield shipped, launcher-clobber bug
+The deb carried libtermux-gnp-fix.so (5000B) and the gate passed on the
+PACKAGED artifact (renderer activations 6, codecs 5/5, 7 live children with
+filters=2, X11 DEVICE GATE: PASS) - but packaging had a real bug:
+bin/chromium-sandboxed is a symlink to chromium-launcher.sh, and the shield
+hook wrote the wrapper with 'cat > $symlink', which FOLLOWS the link and
+overwrote the launcher itself. The 305-byte "launcher" then exec'd
+$P/chromium-launcher.sh - i.e. itself - an infinite exec loop for anyone
+installing the package.
+Fix: the wrapper lives in its own file (chromium-shield-wrapper.sh), the bin
+symlink is removed and repointed at the wrapper, the real launcher is left
+untouched, and the hook fails closed if the launcher ever contains the shield
+line. CI package gates now assert: shield .so present, wrapper present,
+launcher NOT clobbered, wrapper execs the real launcher. Harness 27/27.
+Lesson: never 'cat >' a path that may be a symlink - resolve it first.
+

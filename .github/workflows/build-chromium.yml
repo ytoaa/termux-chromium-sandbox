@@ -95,6 +95,19 @@ jobs:
           else
             echo "WARN: port-apply mirror absent; relying on hook-side counter (fail-closed at source)"
           fi
+          # bionic shield packaging gates (run #25 lesson: 'cat > symlink'
+          # clobbered the launcher, which then exec'd itself)
+          dpkg-deb -c "$deb" | grep -q 'lib/chromium-sandboxed/libtermux-gnp-fix.so' \
+            || { echo "shield .so missing from deb"; exit 1; }
+          dpkg-deb -c "$deb" | grep -q 'lib/chromium-sandboxed/chromium-shield-wrapper.sh' \
+            || { echo "shield wrapper missing from deb"; exit 1; }
+          tmpd=$(mktemp -d); dpkg-deb -x "$deb" "$tmpd"
+          lp="$tmpd/data/data/com.termux/files/usr/lib/chromium-sandboxed/chromium-launcher.sh"
+          grep -q 'libtermux-gnp-fix.so' "$lp" \
+            && { echo "launcher clobbered (recursion risk)"; rm -rf "$tmpd"; exit 1; }
+          grep -q 'chromium-launcher.sh' "$tmpd/data/data/com.termux/files/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh" \
+            || { echo "wrapper does not exec the real launcher"; rm -rf "$tmpd"; exit 1; }
+          rm -rf "$tmpd"
           echo "PORT GATES PASS: $pkg $ver"
       - name: Save sccache
         if: always()

@@ -212,4 +212,18 @@ sed -i '/termux_step_post_make_install_upstream/d' "$g25"
 python3 port/prepare_recipe.py audit --termux-dir "$T25" >/dev/null 2>&1 \
   && fail "[26] shield clobber undetected" || pass "[26] shield clobber detected"
 
+# [27] run #25 regression: wrapper must live in its own file and bin/ must be
+#      repointed at it; the real launcher must never receive the shield line
+fresh; T27="$WORK/t27"; mkdir -p "$T27/x11-packages/chromium"
+cp "$FIX/termux-build.sh" "$T27/x11-packages/chromium/build.sh"
+touch "$T27/build-package.sh"; chmod +x "$T27/build-package.sh"
+python3 port/prepare_recipe.py prepare --termux-dir "$T27" >/dev/null 2>&1
+g27="$T27/x11-packages/chromium-sandboxed/build.sh"
+grep -q 'local _wrap="\$_p/chromium-shield-wrapper.sh"' "$g27" \
+  && grep -q 'rm -f "\$TERMUX_PREFIX/bin/chromium-sandboxed"' "$g27" \
+  && grep -q 'ln -sfr "\$_wrap"' "$g27" \
+  && grep -q 'clobbered' "$g27" \
+  && pass "[27] wrapper is a separate file, bin repointed, recursion guard" \
+  || fail "[27] launcher clobber regression"
+
 exit $rc

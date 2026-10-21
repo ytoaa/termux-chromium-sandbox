@@ -139,8 +139,45 @@ def wire_sccache(text: str) -> str:
 
 SHIELD_BEGIN = '# >>> termux-chromium-sandbox-port: bionic shield hook >>>'
 SHIELD_END = '# <<< termux-chromium-sandbox-port: bionic shield hook <<<'
-SHIELD_HOOK = '\n# >>> termux-chromium-sandbox-port: bionic shield hook >>>\ntermux_step_post_make_install() {\n\ttermux_step_post_make_install_upstream\n\n\t# Ship the pthread_getattr_np shield and route the launcher through it.\n\t# bionic reads /proc/self/maps for the MAIN thread and LOG(FATAL)s once the\n\t# seccomp BPF denies openat, so any main-thread call after "Activated\n\t# seccomp-bpf" kills the child. Rules R7/R8 fix the in-tree callers; this\n\t# shim covers every other caller (crash handlers, unwinders, future code).\n\tlocal _p="$TERMUX_PREFIX/lib/chromium-sandboxed"\n\tlocal _so="$_p/libtermux-gnp-fix.so"\n\t${CC:-clang} -O2 -shared -fPIC -o "$_so" "$TERMUX_PKG_BUILDER_DIR/gnp_shim.c"\n\tif [ -n "${STRIP:-}" ]; then "$STRIP" --strip-unneeded "$_so" 2>/dev/null || true; fi\n\tlocal _bin="$TERMUX_PREFIX/bin/chromium-sandboxed"\n\tif [ -e "$_bin" ] && ! grep -q \'libtermux-gnp-fix.so\' "$_bin" 2>/dev/null; then\n\t\tcat > "$_bin" <<\'SHIMWRAP\'\n#!/data/data/com.termux/files/usr/bin/bash\n# termux-chromium-sandbox-port: bionic pthread_getattr_np shield (port/DESIGN.md)\n_p="${PREFIX:-/data/data/com.termux/files/usr}/lib/chromium-sandboxed"\nexport LD_PRELOAD="$_p/libtermux-gnp-fix.so${LD_PRELOAD:+:$LD_PRELOAD}"\nexec "$_p/chromium-launcher.sh" "$@"\nSHIMWRAP\n\t\tchmod +x "$_bin"\n\tfi\n}\n# <<< termux-chromium-sandbox-port: bionic shield hook <<<\n'
+SHIELD_HOOK = r"""
+# >>> termux-chromium-sandbox-port: bionic shield hook >>>
+termux_step_post_make_install() {
+	termux_step_post_make_install_upstream
 
+	# Ship the pthread_getattr_np shield and route the launcher through it.
+	# bionic reads /proc/self/maps for the MAIN thread and LOG(FATAL)s once the
+	# seccomp BPF denies openat, so any main-thread call after "Activated
+	# seccomp-bpf" kills the child. Rules R7/R8 fix the in-tree callers; this
+	# shim covers every other caller (crash handlers, unwinders, future code).
+	local _p="$TERMUX_PREFIX/lib/chromium-sandboxed"
+	local _so="$_p/libtermux-gnp-fix.so"
+	${CC:-clang} -O2 -shared -fPIC -o "$_so" "$TERMUX_PKG_BUILDER_DIR/gnp_shim.c"
+	if [ -n "${STRIP:-}" ]; then "$STRIP" --strip-unneeded "$_so" 2>/dev/null || true; fi
+
+	# IMPORTANT (run #25 lesson): bin/chromium-sandboxed is a SYMLINK to
+	# chromium-launcher.sh, and 'cat > symlink' follows it - writing the
+	# wrapper there made the launcher exec itself. Keep the launcher intact and
+	# put the wrapper in its own file, then repoint the bin symlink at it.
+	local _wrap="$_p/chromium-shield-wrapper.sh"
+	cat > "$_wrap" <<'SHIMWRAP'
+#!/data/data/com.termux/files/usr/bin/bash
+# termux-chromium-sandbox-port: bionic pthread_getattr_np shield (port/DESIGN.md)
+_p="${PREFIX:-/data/data/com.termux/files/usr}/lib/chromium-sandboxed"
+export LD_PRELOAD="$_p/libtermux-gnp-fix.so${LD_PRELOAD:+:$LD_PRELOAD}"
+exec "$_p/chromium-launcher.sh" "$@"
+SHIMWRAP
+	chmod +x "$_wrap"
+	rm -f "$TERMUX_PREFIX/bin/chromium-sandboxed"
+	ln -sfr "$_wrap" "$TERMUX_PREFIX/bin/chromium-sandboxed"
+
+	# Fail closed if the real launcher was clobbered (recursion guard).
+	if grep -q 'libtermux-gnp-fix.so' "$_p/chromium-launcher.sh" 2>/dev/null; then
+		echo "port shield: launcher was clobbered (would exec itself)" >&2
+		exit 1
+	fi
+}
+# <<< termux-chromium-sandbox-port: bionic shield hook <<<
+"""
 
 def chain_shield_hook(text: str) -> str:
     """Ship the bionic pthread_getattr_np shield.
