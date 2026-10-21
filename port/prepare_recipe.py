@@ -48,7 +48,7 @@ termux_step_post_get_source() {{
 \t\t# NOT the mounted repo — also drop it at the mounted repo root for CI host gates.
 \t\tcat "$TERMUX_PKG_TMPDIR/port-apply.log" > /home/builder/termux-packages/port-apply-chromium.log 2>/dev/null || true
 \tc=$(grep -c "ALREADY_PRESENT\\|APPLIED" "$TERMUX_PKG_TMPDIR/port-apply.log" || true)
-\t[ "$c" -ge 5 ] || {{ echo "port hook: fewer than 5 rules applied" >&2; exit 1; }}
+\t[ "$c" -ge 7 ] || {{ echo "port hook: fewer than 7 rules applied" >&2; exit 1; }}
 }}
 {HOOK_END}
 """

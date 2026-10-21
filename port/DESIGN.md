@@ -319,3 +319,36 @@ StackTopRegistry::Get().GetCurrentThreadStackTop() (forward-declared) so the
 cache is warm before the filter engages, in every sandboxed process type.
 Probe lesson: headless=new NEVER works on termux chromium (stock included) —
 device gates must use --ozone-platform=x11 + console-log capture.
+
+## Device-gate round 6 (run #22 deb, R6 build): why the prewarm was dead code
+R6 prewarmed GetStackEnd and R7/R8 later exposed the real shape of the wall.
+Forensics with a pthread_getattr_np interposer (gnp shim, logs pid/tid and
+whether /proc/self/status is still readable):
+  - exactly 3 gnp call sites per process; 2 fire PRE-filter, 1 fires
+    POST-filter (filt=-1 => /proc unreadable) and is the SIGABRT killer;
+  - all calls are tid==pid => main thread, exactly the case upstream documents
+    ("Bionic reads proc/maps on every call ... when called from the main
+    thread", base/debug/stack_trace.cc:228);
+  - abort() PLT-hook backtrace: the fatal frame is a pthread_getattr_np caller
+    reached through a lazily-initialised singleton.
+Root cause of the dead prewarm: upstream gates the bionic main-thread cache
+behind BUILDFLAG(IS_ANDROID) (and PA_BUILDFLAG(IS_ANDROID) for the vendored
+copy). Termux builds chromium with os=linux, so `static uintptr_t
+main_stack_end` never existed -> GetStackEnd called pthread_getattr_np on every
+invocation and the R6 prewarm stored its value nowhere. R5 was dead for a
+different reason: StackTopRegistry::GetCurrentThreadStackTop() is a pure map
+lookup, it never computes a value.
+
+### Fix set (round 6)
+- R7: enable upstream's own bionic cache under __BIONIC__ in base/debug/
+  stack_trace.cc and the vendored PA copy (PA rule is optional-if-absent).
+- R8: partition_alloc stack.cc - capture the main pthread_t during static init,
+  cache the main thread's stack top, and export TermuxPrewarmStackTop() so
+  StartSeccompBPF can fill the cache before the BPF denies /proc.
+- Prewarm block (R5b/R6) now calls base::debug::GetStackEnd,
+  PA base::debug::GetStackEnd and partition_alloc::internal::
+  TermuxPrewarmStackTop, all [[gnu::used]].
+- Verifier: if the vendored PA subtree ships, its R7/R8 markers MUST be
+  present (silently skipping them would ship a build that still dies).
+Harness: 24/24. Ledger: port.toml [rules.r7]/[rules.r8].
+

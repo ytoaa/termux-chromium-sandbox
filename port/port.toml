@@ -41,6 +41,16 @@ marker = "Termux seccomp-only zygote passthrough:"
 name = "stack-top prewarm (Bionic)"
 file = "sandbox/policy/linux/sandbox_linux.cc"
 marker = "Termux seccomp-only stack-top prewarm:"
+[rules.r7]
+name = "bionic stack cache (base + PA copy)"
+file = "base/debug/stack_trace.cc"
+marker = "Termux seccomp-only bionic stack cache:"
+note = "os=linux builds on Android must keep upstream's bionic main-thread stack cache; otherwise GetStackEnd hits pthread_getattr_np post-BPF and bionic LOG(FATAL)s"
+[rules.r8]
+name = "bionic stack-top cache + prewarm entry (PA stack.cc)"
+file = "base/allocator/partition_allocator/src/partition_alloc/stack/stack.cc"
+marker = "Termux seccomp-only bionic stack-top:"
+note = "partition_alloc stack-top lookup calls pthread_getattr_np unconditionally; cache the main-thread value and fill it from StartSeccompBPF before the BPF denies /proc"
 
 [gates]
 # Future candidate gates (firefox-pattern): source verify + binary markers +

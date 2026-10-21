@@ -38,6 +38,8 @@ R2_MARKER = "Termux seccomp-only port:"
 R3_MARKER = "Termux seccomp-only bionic-prctl:"
 R4_MARKER = "Termux seccomp-only zygote passthrough:"
 R5_MARKER = "Termux seccomp-only stack-top prewarm:"
+R7_MARKER = "Termux seccomp-only bionic stack cache:"
+R8_MARKER = "Termux seccomp-only bionic stack-top:"
 
 
 class PortError(RuntimeError):
@@ -80,6 +82,14 @@ class Port:
         self.changes.append(Change(name, rel, status, detail))
         print(f"[{status:>15}] {name}: {detail}".rstrip())
 
+    def replace_optional(self, rel: str, name: str, old: str, new: str) -> None:
+        """Like replace_once but tolerates a missing file (vendored subtree
+        that this build may not ship). Present-but-drifted still fails closed."""
+        if not (self.root / rel).is_file():
+            self.record(name, rel, "SKIPPED", "file not present in this source tree")
+            return
+        self.replace_once(rel, name, old, new)
+
     def replace_once(self, rel: str, name: str, old: str, new: str) -> None:
         path = self.p(rel)
         self.remember_before(rel)
@@ -98,6 +108,11 @@ class Port:
     ZYGOTE_HOST = "content/browser/zygote_host/zygote_host_impl_linux.cc"
     SANDBOX_LINUX = "sandbox/policy/linux/sandbox_linux.cc"
     SYSCALL_RESTRICT = "sandbox/linux/seccomp-bpf-helpers/syscall_parameters_restrictions.cc"
+    STACK_TRACE = "base/debug/stack_trace.cc"
+    PA_STACK_TRACE = ("base/allocator/partition_allocator/src/partition_alloc/"
+                      "partition_alloc_base/debug/stack_trace.cc")
+    PA_STACK = ("base/allocator/partition_allocator/src/partition_alloc/"
+                "stack/stack.cc")
 
     R1_OLD = '''LOG(FATAL)
         << "No usable sandbox! If you are running on Ubuntu 23.10+ or another "
@@ -217,6 +232,9 @@ uintptr_t GetStackEnd();
 namespace partition_alloc::internal::base::debug {
 uintptr_t GetStackEnd();
 }  // namespace partition_alloc::internal::base::debug
+namespace partition_alloc::internal {
+void* TermuxPrewarmStackTop();
+}  // namespace partition_alloc::internal
 #endif
 
 // ''' + R5_MARKER + ''' (file-scope decl; warm call in StartSeccompBPF)
@@ -239,7 +257,112 @@ namespace sandbox {'''
   [[gnu::used]] const uintptr_t warmed_a = ::base::debug::GetStackEnd();
   [[gnu::used]] const uintptr_t warmed_b =
       ::partition_alloc::internal::base::debug::GetStackEnd();
+  // R8: fill partition_alloc's main-thread stack-top cache as well; without
+  // this the first lookup happens after the BPF denies /proc and bionic's
+  // pthread_getattr_np LOG(FATAL)s (SIGABRT boot loop).
+  [[gnu::used]] void* const warmed_c =
+      ::partition_alloc::internal::TermuxPrewarmStackTop();
   (void)(warmed_a + warmed_b);
+  (void)warmed_c;
+#endif'''
+
+    # R7 (device-gate round 5, the actual fix): R5/R6 prewarms were dead code
+    # because upstream gates the bionic main-thread cache behind
+    # BUILDFLAG(IS_ANDROID) - and termux builds chromium with os=linux, so the
+    # `static uintptr_t main_stack_end` never existed, and GetStackEnd called
+    # pthread_getattr_np on EVERY invocation. Post-BPF that is fatal: bionic's
+    # implementation reads /proc/self/maps (main thread) and LOG(FATAL)s ->
+    # SIGABRT (strace: 3 call sites, all tid==pid). Enable upstream's own
+    # bionic cache under __BIONIC__ so the prewarm in StartSeccompBPF (R6)
+    # actually stores a value that every later call reuses.
+    R7_OLD = '''#if BUILDFLAG(IS_ANDROID)
+  // Bionic reads proc/maps on every call to pthread_getattr_np() when called'''
+
+    R7_NEW = '''#if BUILDFLAG(IS_ANDROID) || defined(__BIONIC__)
+  // ''' + R7_MARKER + ''' os=linux on bionic: keep upstream's bionic
+  // main-thread cache compiled in, so the value prewarmed before the seccomp
+  // filter is installed is reused afterwards instead of hitting
+  // pthread_getattr_np (which reads /proc/self/maps and LOG(FATAL)s once the
+  // BPF denies openat).
+  // Bionic reads proc/maps on every call to pthread_getattr_np() when called'''
+
+    R7B_OLD = '''#if PA_BUILDFLAG(IS_ANDROID)
+  // Bionic reads proc/maps on every call to pthread_getattr_np() when called'''
+
+    R7B_NEW = '''#if PA_BUILDFLAG(IS_ANDROID) || defined(__BIONIC__)
+  // ''' + R7_MARKER + ''' partition_alloc copy of the same bionic cache
+  // (PA-Everywhere); see R7 above.
+  // Bionic reads proc/maps on every call to pthread_getattr_np() when called'''
+
+    # R8 (device-gate round 6): partition_alloc's per-thread stack-top lookup
+    # calls pthread_getattr_np unconditionally. On bionic that reads
+    # /proc/self/maps for the main thread and LOG(FATAL)s once the seccomp BPF
+    # denies openat (strace/gnp-shim: 3 gnp sites per process, 2 pre-filter
+    # (R6 prewarm) + 1 post-filter from this path -> SIGABRT boot loop).
+    # Cache the main thread value (constant for the process) and export a
+    # prewarm entry point so StartSeccompBPF can fill it before the filter
+    # engages. Non-main threads keep bionic's cheap pthread_t path.
+    R8A_OLD = '''void* GetStackTop() {
+  pthread_attr_t attr;
+  int error = pthread_getattr_np(pthread_self(), &attr);
+  if (!error) {
+    void* base;
+    size_t size;
+    error = pthread_attr_getstack(&attr, &base, &size);
+    PA_CHECK(!error);
+    pthread_attr_destroy(&attr);
+    return PA_UNSAFE_TODO(reinterpret_cast<uint8_t*>(base) + size);
+  }'''
+
+    R8A_NEW = '''void* GetStackTop() {
+#if defined(__BIONIC__)
+  // ''' + R8_MARKER + ''' cache the main thread's stack top: it never
+  // changes, and bionic's pthread_getattr_np reads /proc/self/maps (main
+  // thread only) which the seccomp BPF denies after sandbox engagement.
+  static void* cached_main_top = nullptr;
+  const bool is_main_thread =
+      pthread_equal(pthread_self(), g_termux_main_thread) != 0;
+  if (is_main_thread && cached_main_top)
+    return cached_main_top;
+#endif
+  pthread_attr_t attr;
+  int error = pthread_getattr_np(pthread_self(), &attr);
+  if (!error) {
+    void* base;
+    size_t size;
+    error = pthread_attr_getstack(&attr, &base, &size);
+    PA_CHECK(!error);
+    pthread_attr_destroy(&attr);
+#if defined(__BIONIC__)
+    if (is_main_thread)
+      cached_main_top = PA_UNSAFE_TODO(reinterpret_cast<uint8_t*>(base) + size);
+#endif
+    return PA_UNSAFE_TODO(reinterpret_cast<uint8_t*>(base) + size);
+  }'''
+
+    R8B_OLD = '''#else  // PA_BUILDFLAG(IS_WIN)
+#error "Unsupported GetStackTop"
+#endif  // PA_BUILDFLAG(IS_WIN)'''
+
+    R8B_NEW = '''#else  // PA_BUILDFLAG(IS_WIN)
+#error "Unsupported GetStackTop"
+#endif  // PA_BUILDFLAG(IS_WIN)
+
+#if defined(__BIONIC__)
+// ''' + R8_MARKER + ''' prewarm entry point (called from
+// SandboxLinux::StartSeccompBPF before the BPF is installed).
+void* TermuxPrewarmStackTop() {
+  return GetStackTop();
+}
+#endif  // defined(__BIONIC__)'''
+
+    R8C_OLD = '''namespace partition_alloc::internal {'''
+
+    R8C_NEW = '''namespace partition_alloc::internal {
+#if defined(__BIONIC__)
+// ''' + R8_MARKER + ''' captured during static init, i.e. on the main
+// thread before any sandbox exists; used to recognise main-thread callers.
+const pthread_t g_termux_main_thread = pthread_self();
 #endif'''
 
     def apply(self) -> None:
@@ -255,6 +378,16 @@ namespace sandbox {'''
                           self.R5_OLD, self.R5_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R5 stack-top prewarm call (Bionic)",
                           self.R5B_OLD, self.R5B_NEW)
+        self.replace_once(self.STACK_TRACE, "R7 bionic stack cache (base)",
+                          self.R7_OLD, self.R7_NEW)
+        self.replace_optional(self.PA_STACK_TRACE, "R7 bionic stack cache (PA copy)",
+                              self.R7B_OLD, self.R7B_NEW)
+        self.replace_optional(self.PA_STACK, "R8 main-thread capture (PA stack.cc)",
+                              self.R8C_OLD, self.R8C_NEW)
+        self.replace_optional(self.PA_STACK, "R8 bionic stack-top cache (PA stack.cc)",
+                              self.R8A_OLD, self.R8A_NEW)
+        self.replace_optional(self.PA_STACK, "R8 prewarm entry point (PA stack.cc)",
+                              self.R8B_OLD, self.R8B_NEW)
 
     # ---------- verifier (fail-closed gates) ----------
     def verify(self) -> None:
@@ -265,6 +398,7 @@ namespace sandbox {'''
             (self.SYSCALL_RESTRICT, R3_MARKER, "R3"),
             (self.SANDBOX_LINUX, R4_MARKER, "R4"),
             (self.SANDBOX_LINUX, R5_MARKER, "R5"),
+            (self.STACK_TRACE, R7_MARKER, "R7"),
         ):
             text = self.p(rel).read_text()
             n = text.count(marker)
@@ -277,6 +411,20 @@ namespace sandbox {'''
         if "#if defined(__BIONIC__)" not in text or "#else" not in text:
             raise PortError("verifier: R2 guard structure missing")
         print(f"[     VERIFIED] R2 preprocessor guard structure intact")
+        # Gate 3: vendored PA patches must be present WHENEVER the subtree is
+        # shipped (silently skipping them would ship a build that still calls
+        # pthread_getattr_np after the filter - the exact boot-loop we fix).
+        for rel, marker, label in (
+            (self.PA_STACK_TRACE, R7_MARKER, "R7 (PA copy)"),
+            (self.PA_STACK, R8_MARKER, "R8 (PA stack.cc)"),
+        ):
+            if (self.root / rel).is_file():
+                n = self.p(rel).read_text().count(marker)
+                if n < 1:
+                    raise PortError(f"verifier: {label} marker absent from {rel}")
+                print(f"[     VERIFIED] {label} marker in {rel} ({n}x)")
+            else:
+                print(f"[     VERIFIED] {label} n/a (vendored tree absent)")
 
     # ---------- anti-injection scan ----------
     def anti_injection_scan(self, dirs: list[str]) -> None:

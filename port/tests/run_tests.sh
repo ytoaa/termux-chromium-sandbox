@@ -153,4 +153,40 @@ echo "$out" | grep -q 'APPLIED.*R5' \
   && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
   && pass "[20] R5/R6 GetStackEnd prewarm applied+verified" || fail "[20] R5/R6 prewarm"
 
+# [21] R7 bionic stack cache (round-5: IS_ANDROID-gated cache absent on os=linux)
+fresh
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+echo "$out" | grep -q 'APPLIED.*R7 bionic stack cache (base)' \
+  && grep -q '#if BUILDFLAG(IS_ANDROID) || defined(__BIONIC__)' "$WORK/src/base/debug/stack_trace.cc" \
+  && grep -q '#if PA_BUILDFLAG(IS_ANDROID) || defined(__BIONIC__)' "$WORK/src/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/debug/stack_trace.cc" \
+  && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
+  && pass "[21] R7 bionic stack cache applied+verified" || fail "[21] R7 bionic stack cache"
+
+# [22] optional-file tolerance: PA copy absent must SKIP, not fail
+fresh; rm -f "$WORK/src/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/debug/stack_trace.cc"
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+[ $got -eq 0 ] && echo "$out" | grep -q 'SKIPPED.*PA copy' \
+  && pass "[22] missing vendored PA file -> SKIPPED (not fatal)" || { fail "[22] optional-file handling"; echo "$out" | tail -3; }
+
+# [23] R8 bionic stack-top cache + prewarm export (round-6: 3rd gnp site)
+fresh
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+ST="$WORK/src/base/allocator/partition_allocator/src/partition_alloc/stack/stack.cc"
+echo "$out" | grep -q 'APPLIED.*R8 bionic stack-top cache' \
+  && grep -q 'g_termux_main_thread' "$ST" \
+  && grep -q 'void\* TermuxPrewarmStackTop()' "$ST" \
+  && grep -q 'TermuxPrewarmStackTop' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
+  && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
+  && pass "[23] R8 stack-top cache + prewarm wired" || fail "[23] R8 stack-top cache"
+
+# [24] R8 must fail closed if the PA stack.cc is present but unpatched
+fresh; ST2="$WORK/src/base/allocator/partition_allocator/src/partition_alloc/stack/stack.cc"
+python3 - <<'PY' >/dev/null 2>&1
+import pathlib,re
+p=pathlib.Path("$ST2")
+p.write_text(re.sub(r"#if defined\(__BIONIC__\)\n  // Termux seccomp-only bionic stack-top:.*?#endif\n", "", p.read_text(), flags=re.S))
+PY
+python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
+  && fail "[24] unpatched PA stack.cc passed verify" || pass "[24] unpatched PA stack.cc rejected"
+
 exit $rc

@@ -1,0 +1,8 @@
+<!doctype html><html><head><meta charset="utf-8"><title>codec-gate</title></head><body>
+<script>
+const codecs=["video/mp4;codecs=avc1.42E01E","video/webm;codecs=vp9","video/webm;codecs=av01.0.05M.08","audio/mp4;codecs=mp4a.40.2","audio/ogg;codecs=opus"];
+const v=document.createElement("video");
+console.log("CHROMIUM_CODECS_BEGIN");
+for(const c of codecs) console.log(c+" => "+(v.canPlayType(c)||"no"));
+console.log("CHROMIUM_CODECS_END");
+</script></body></html>
