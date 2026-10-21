@@ -189,4 +189,27 @@ PY
 python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
   && fail "[24] unpatched PA stack.cc passed verify" || pass "[24] unpatched PA stack.cc rejected"
 
+# [25] bionic shield: recipe must chain post_make_install, build+install the shim,
+#      and route bin/chromium-sandboxed through LD_PRELOAD (round-7 breakthrough)
+fresh; T25="$WORK/t25"; mkdir -p "$T25/x11-packages/chromium"
+cp "$FIX/termux-build.sh" "$T25/x11-packages/chromium/build.sh"
+touch "$T25/build-package.sh"; chmod +x "$T25/build-package.sh"
+python3 port/prepare_recipe.py prepare --termux-dir "$T25" >/dev/null 2>&1
+g25="$T25/x11-packages/chromium-sandboxed/build.sh"
+[ "$(grep -c '^termux_step_post_make_install() {' "$g25")" = "1" ] \
+  && grep -q 'termux_step_post_make_install_upstream' "$g25" \
+  && grep -q 'libtermux-gnp-fix.so' "$g25" \
+  && grep -q 'gnp_shim.c' "$g25" \
+  && grep -q 'LD_PRELOAD' "$g25" \
+  && [ -f "$T25/x11-packages/chromium-sandboxed/gnp_shim.c" ] \
+  && bash -n "$g25" \
+  && python3 port/prepare_recipe.py audit --termux-dir "$T25" >/dev/null 2>&1 \
+  && pass "[25] bionic shield chained+shipped" || fail "[25] bionic shield"
+
+# [26] shield regression: clobbering post_make_install (no upstream call) must be caught
+sed -i 's/^\tterux_step_post_make_install_upstream$/\t:/; s/^\tterux_step_post_make_install_upstream$/\t:/' "$g25" 2>/dev/null
+sed -i '/termux_step_post_make_install_upstream/d' "$g25"
+python3 port/prepare_recipe.py audit --termux-dir "$T25" >/dev/null 2>&1 \
+  && fail "[26] shield clobber undetected" || pass "[26] shield clobber detected"
+
 exit $rc

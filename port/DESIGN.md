@@ -352,3 +352,35 @@ lookup, it never computes a value.
   present (silently skipping them would ship a build that still dies).
 Harness: 24/24. Ledger: port.toml [rules.r7]/[rules.r8].
 
+## Device-gate round 7 (run #23 deb): BREAKTHROUGH - shield closes the wall
+R7+R8 did land in the compiled paths (verified in the build log: the exact
+patched files were compiled) and they did remove the old post-filter call site
+(gnp interposer: site moved 0xb94e308 -> 0xb94e540), but ONE caller remained:
+the abort backtrace still ran through the same stack-walk family, now reached
+from the crash-handler side. Root fact: bionic's pthread_getattr_np(main) is
+fatal whenever /proc is unreadable, so *any* caller kills the child - chasing
+callers is whack-a-mole and upstream may add more.
+
+### Fix: caller-agnostic bionic shield (port/gnp_shim.c)
+Capture the main thread's pthread_attr_t in a library constructor (before any
+sandbox exists) and serve that snapshot to every main-thread caller; non-main
+threads fall through to real bionic (no /proc involved). The main thread's
+stack bounds are constant for the process lifetime, so the snapshot is exact.
+Shipped as $PREFIX/lib/chromium-sandboxed/libtermux-gnp-fix.so and loaded by
+bin/chromium-sandboxed via LD_PRELOAD (children inherit it).
+
+### Proof (main device, kernel 6.1, real deb, X11)
+  renderer activation pids: 31001 31040 31041 31081 31183
+  codecs: 5/5 "probably" (h264/vp9/av1/aac/opus), 0 unsupported
+  census: 6 live children with Seccomp_filters=2 (Android baseline is 1)
+  X11 DEVICE GATE: PASS
+This is the first PASS in the whole project: renderers now survive BPF
+engagement AND render, with Chromium's own filter installed per process.
+
+### Gate hardening learned here
+zygote children are forked WITHOUT exec, so /proc/pid/cmdline stays
+"--type=zygote" and /proc/pid/comm is "chrome" - neither identifies a renderer.
+The gate now correlates the browser's own VERBOSE activation lines
+("[pid:tid:...] Activated seccomp-bpf ... renderer") with /proc/<pid>/status,
+and falls back to "any live child with >=2 filters".
+

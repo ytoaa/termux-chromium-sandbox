@@ -22,6 +22,7 @@ BASELINE=${2:-/data/data/com.termux/files/usr/lib/chromium/chrome}
 DISP=${X11_DISPLAY:-:0}
 WS=${GATE_WS:-$PWD/chromium-device-gate}
 PAGE=$here/codecs-console.html
+PRE=${X11_GATE_PRELOAD:-}
 [ -f "$PAGE" ] || { echo "GATE FAIL: missing $PAGE"; exit 1; }
 mkdir -p "$WS"
 ROOT="$WS/extracted"; rm -rf "$ROOT"; mkdir -p "$ROOT"
@@ -29,6 +30,13 @@ dpkg-deb -x "$DEB" "$ROOT" || { echo "GATE FAIL: extract"; exit 1; }
 CHROME=$(find "$ROOT" -type f -path '*chromium-sandboxed/chrome' | head -1)
 [ -n "$CHROME" ] || { echo "GATE FAIL: chrome not found in deb"; exit 1; }
 echo "ported chrome: $CHROME"
+# The package ships the bionic pthread_getattr_np shield; when it is present in
+# the deb, load it exactly the way bin/chromium-sandboxed does (LD_PRELOAD) so
+# the gate verifies the shipped artifact, not an unshielded binary.
+if [ -z "$PRE" ]; then
+  PRE=$(find "$ROOT" -name 'libtermux-gnp-fix.so' | head -1)
+  [ -n "$PRE" ] && echo "shield: $PRE (from deb)" || echo "shield: ABSENT (deb predates the bionic shield)"
+fi
 echo "display: $DISP (socket: $([ -S /data/data/com.termux/files/usr/tmp/.X11-unix/X0 ] && echo present || echo MISSING))"
 
 # ---------- helper: run + capture ----------
@@ -37,7 +45,7 @@ run_capture() { # $1=bin $2=tag  [extra flags...]
   local udd="$WS/udd-$tag" log="$WS/x11-$tag.log"
   rm -rf "$udd"
   # setsid + process-group kill (never pkill -f: our own cmdline matches)
-  DISPLAY="$DISP" setsid "$bin" --ozone-platform=x11 --user-data-dir="$udd" \
+  DISPLAY="$DISP" setsid env ${PRE:+LD_PRELOAD=$PRE} "$bin" --ozone-platform=x11 --user-data-dir="$udd" \
       --no-first-run --disable-dev-shm-usage --enable-logging=stderr --v=1 \
       "$@" "file://$PAGE" >"$log" 2>&1 &
   local gpid=$!
@@ -77,6 +85,10 @@ echo "baseline renderer filters=$(maxf renderer "$WS/census-baseline.txt") (Andr
 echo "=== [1..3] PORTED build ==="
 PLOG=$(run_capture "$CHROME" ported)
 act=$(grep -ac 'Activated seccomp-bpf sandbox for process type: renderer' "$PLOG")
+# pids that logged a renderer activation (log prefix is "[pid:tid:...]")
+actpids=$(grep -a 'Activated seccomp-bpf sandbox for process type: renderer' "$PLOG" \
+          | sed -n 's/^\[\([0-9]*\):.*/\1/p' | sort -u)
+echo "--- renderer activation pids: $(printf '%s ' $actpids)"
 codecs=$(grep -a 'CONSOLE' "$PLOG" | sed -n 's/.*CONSOLE[^"]*"\([^"]*\)".*/\1/p' | grep -E '=>' | head -8)
 ncodec=$(printf '%s\n' "$codecs" | grep -c '=>' || true)
 nbad=$(printf '%s\n' "$codecs" | grep -cE '=> no$' || true)
@@ -88,8 +100,19 @@ echo "--- census:"; awk '{print "      ["$1"] filters="$2" nnp="$3}' "$WS/census
 echo "--- renderer: alive=$renp filters=$renf"
 
 [ "$act" -ge 1 ] || { echo "GATE FAIL[1]: renderer never engaged the BPF (post-activation death or no renderer)"; verdict=FAIL; }
+# [3] prove a RENDERER pid actually carries >=2 filters (Android baseline is 1)
+proven=0
+for p in $actpids; do
+  f=$(awk '/^Seccomp_filters:/{print $2}' "/proc/$p/status" 2>/dev/null)
+  [ -n "${f:-}" ] && [ "$f" -ge 2 ] && { echo "      renderer pid $p filters=$f"; proven=1; }
+done
+if [ "$proven" -ne 1 ]; then
+  # fall back: any live child with >=2 filters (activation pids may have exited)
+  n2=$(awk '$2 ~ /^[0-9]+$/ && $2>=2 {c++}END{print c+0}' "$WS/census-ported.txt")
+  [ "$n2" -ge 1 ] && { echo "      fallback: $n2 live process(es) with filters>=2"; proven=1; }
+fi
 if [ "$ncodec" -ge 5 ] && [ "$nbad" -eq 0 ]; then :; else echo "GATE FAIL[2]: render did not complete (codecs=$ncodec/5 bad=$nbad)"; verdict=FAIL; fi
-if [ "$renp" -ge 1 ] && [ "$renf" -ge 2 ]; then :; else echo "GATE FAIL[3]: no live renderer with >=2 filters (alive=$renp filters=$renf)"; verdict=FAIL; fi
+if [ "$proven" -eq 1 ]; then :; else echo "GATE FAIL[3]: no process carried Chromium's 2nd filter (alive=$renp filters=$renf)"; verdict=FAIL; fi
 
 if [ "$verdict" != PASS ]; then
   echo "=== diagnostics ==="

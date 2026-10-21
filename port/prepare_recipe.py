@@ -137,6 +137,32 @@ def wire_sccache(text: str) -> str:
         "\techo '" + SCCACHE_CCW_MARKER + "' >> $TERMUX_PKG_BUILDDIR/out/Release/args.gn", 1)
     return text
 
+SHIELD_BEGIN = '# >>> termux-chromium-sandbox-port: bionic shield hook >>>'
+SHIELD_END = '# <<< termux-chromium-sandbox-port: bionic shield hook <<<'
+SHIELD_HOOK = '\n# >>> termux-chromium-sandbox-port: bionic shield hook >>>\ntermux_step_post_make_install() {\n\ttermux_step_post_make_install_upstream\n\n\t# Ship the pthread_getattr_np shield and route the launcher through it.\n\t# bionic reads /proc/self/maps for the MAIN thread and LOG(FATAL)s once the\n\t# seccomp BPF denies openat, so any main-thread call after "Activated\n\t# seccomp-bpf" kills the child. Rules R7/R8 fix the in-tree callers; this\n\t# shim covers every other caller (crash handlers, unwinders, future code).\n\tlocal _p="$TERMUX_PREFIX/lib/chromium-sandboxed"\n\tlocal _so="$_p/libtermux-gnp-fix.so"\n\t${CC:-clang} -O2 -shared -fPIC -o "$_so" "$TERMUX_PKG_BUILDER_DIR/gnp_shim.c"\n\tif [ -n "${STRIP:-}" ]; then "$STRIP" --strip-unneeded "$_so" 2>/dev/null || true; fi\n\tlocal _bin="$TERMUX_PREFIX/bin/chromium-sandboxed"\n\tif [ -e "$_bin" ] && ! grep -q \'libtermux-gnp-fix.so\' "$_bin" 2>/dev/null; then\n\t\tcat > "$_bin" <<\'SHIMWRAP\'\n#!/data/data/com.termux/files/usr/bin/bash\n# termux-chromium-sandbox-port: bionic pthread_getattr_np shield (port/DESIGN.md)\n_p="${PREFIX:-/data/data/com.termux/files/usr}/lib/chromium-sandboxed"\nexport LD_PRELOAD="$_p/libtermux-gnp-fix.so${LD_PRELOAD:+:$LD_PRELOAD}"\nexec "$_p/chromium-launcher.sh" "$@"\nSHIMWRAP\n\t\tchmod +x "$_bin"\n\tfi\n}\n# <<< termux-chromium-sandbox-port: bionic shield hook <<<\n'
+
+
+def chain_shield_hook(text: str) -> str:
+    """Ship the bionic pthread_getattr_np shield.
+
+    Chain, NEVER clobber (run #7 lesson): the chromium recipe already defines
+    termux_step_post_make_install (it removes dummy .a/.so files), so rename it
+    and call it first from our wrapper.
+    """
+    if SHIELD_BEGIN in text:
+        return text
+    if re.search(r"^termux_step_post_make_install\(\)\s*\{", text, re.M):
+        text = re.sub(r"^termux_step_post_make_install\(\)\s*\{",
+                      "termux_step_post_make_install_upstream() {",
+                      text, count=1, flags=re.M)
+        hook = SHIELD_HOOK
+    else:
+        hook = SHIELD_HOOK.replace("\n\ttermux_step_post_make_install_upstream\n", "\n")
+    if not text.endswith("\n"):
+        text += "\n"
+    return text + hook
+
+
 def prepare(termux_dir: Path) -> dict:
     src_dir = termux_dir / PKG_SRC
     dst_dir = termux_dir / PKG_DST
@@ -150,6 +176,7 @@ def prepare(termux_dir: Path) -> dict:
     here = Path(__file__).resolve().parent
     shutil.copy2(here / "chromium_sandbox_port.py", dst_dir / "termux-chromium-sandbox-port.py")
     shutil.copy2(here / "port.toml", dst_dir / "termux-chromium-sandbox-port.toml")
+    shutil.copy2(here / "gnp_shim.c", dst_dir / "gnp_shim.c")
 
     # copy all recipe files except build.sh (rewritten)
     for f in sorted(src_dir.iterdir()):
@@ -159,6 +186,7 @@ def prepare(termux_dir: Path) -> dict:
             text = rewrite_identity(text)
             text = exclude_sandbox_disable_patches(text)
             text = wire_sccache(text)
+            text = chain_shield_hook(text)
             text, align_notes = align_versions(text, termux_dir)
             for n in align_notes:
                 print("NOTE:", n)
@@ -208,6 +236,9 @@ def audit(termux_dir: Path) -> None:
         ("$TERMUX_PKG_BUILDER_DIR/termux-chromium-sandbox-port.py", "in-container transformer call"),
         ("--scan content,chrome", "anti-injection scan wired"),
         (SCCACHE_CCW_MARKER, "sccache cc_wrapper wired into args.gn"),
+        (SHIELD_BEGIN, "bionic shield hook present"),
+        ("libtermux-gnp-fix.so", "pthread_getattr_np shield install"),
+        ("termux_step_post_make_install_upstream", "shield chain calls upstream hook"),
     ):
         if needle not in text:
             raise RecipeError(f"audit fail: missing {label}")
@@ -216,6 +247,8 @@ def audit(termux_dir: Path) -> None:
         raise RecipeError("audit fail: sandbox-disable patch exclusion missing")
     if re.search(r"\blib/chromium\b(?!-sandboxed)", text):
         raise RecipeError("audit fail: residual stock lib/chromium path")
+    if not (termux_dir / PKG_DST / "gnp_shim.c").is_file():
+        raise RecipeError("audit fail: gnp_shim.c not shipped in the recipe dir")
     print("[AUDIT OK] chromium-sandboxed recipe contract holds")
 
 def main() -> int:
