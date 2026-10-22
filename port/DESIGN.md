@@ -400,3 +400,38 @@ line. CI package gates now assert: shield .so present, wrapper present,
 launcher NOT clobbered, wrapper execs the real launcher. Harness 27/27.
 Lesson: never 'cat >' a path that may be a symlink - resolve it first.
 
+## Device-gate round 9 (run #28 deb): FULLY GREEN — first validated candidate
+CI run #28 (commit 239ea89, the run-#26 SIGPIPE+pipefail gate fix) is the
+first end-to-end green pipeline: transformer self-test + build + ALL package
+gates + artifact upload. Harvested deb 155.0.8059.84
+(sha256 4e7dce5226d0576bb33bcb774a3d2816b433aae2fd81faf694725d500dbe820a) and
+re-ran the authoritative X11 device gate on the MAIN device (kernel 6.1):
+
+  baseline (stock chrome) renderer filters=0   (apples-to-apples control ok)
+  renderer activation pids: 19076 19088 19089 19144 19179 19201  (6)
+  codecs: 5/5 "probably" (h264/vp9/av1/aac/opus), 0 unsupported
+  census: 7 live children Seccomp_filters=2 nnp=1 (zygote-forked, exec-less
+          cmdline still --type=zygote; fallback [3] path per round-7 hardening)
+  X11 DEVICE GATE: PASS  (shield LD_PRELOADed from the deb, as shipped)
+
+Packaging verified from the deb itself (round-8 fix holds):
+  bin/chromium-sandboxed -> lib/chromium-sandboxed/chromium-shield-wrapper.sh
+  wrapper (305B) execs chromium-launcher.sh (1379B, untouched, 0 LD_PRELOAD
+  lines); libtermux-gnp-fix.so (5000B) present. No self-exec loop possible.
+
+port.toml: phase=validated, last_validated_port=0.1.0,
+last_validated_chromium=155.0.8059.84, device_gate PASS recorded.
+
+Ops lessons this round:
+- fetch_artifact.sh died on a relative out-dir (subshell cd + relative
+  $out/deb.sha256). Fixed by absolutizing $out right after mkdir; the
+  "next:" hint now names x11_gate.sh (headless never works on termux).
+- gh CLI hangs forever with no DBUS_SESSION_BUS_ADDRESS (keyring lookup on a
+  dead bus, no timeout). Live bus address is readable from
+  /proc/<gnome-keyring-daemon-pid>/environ. Consider a gh fallback that
+  errors instead of hanging (check GH_TOKEN first).
+
+Next (Phase 2): apt channel via gh-pages + package-version lead so
+'pkg upgrade' cannot resurrect the sandbox-off stock build as the default
+entry point; separate-identity naming already holds (chromium-sandboxed).
+

@@ -10,6 +10,14 @@ and invites a PR. This project is that attempt.
 
 ## Status
 
+- **Phase 3 — device regression gate: PASS** (2026-10-22, main device: Android
+  17 / kernel 6.1 GKI / aarch64, run #28 deb `155.0.8059.84`, sha256
+  `4e7dce52…dbe820a`): fully-green gated build (self-test + build + all
+  package gates), then X11 DEVICE GATE PASS on the packaged artifact — 6
+  renderer seccomp-bpf activations, codecs 5/5 (h264/vp9/av1/aac/opus), 7 live
+  children with `Seccomp_filters=2` + `NoNewPrivs=1` (stock baseline 0–1).
+  Chromium's own BPF policy is installed per-process. See `port/DESIGN.md`
+  round 7 (the bionic `pthread_getattr_np` shield) and round 9.
 - **Phase 0 — feasibility: PASS** (2026-10-19, device: Android 17 / kernel 6.1 GKI / aarch64)
   - `poc/seccomp_probe.c`: a plain Termux process CAN install its own
     seccomp-bpf filter (`prctl PR_SET_SECCOMP` → `PR_GET_SECCOMP=2`), ALLOW
