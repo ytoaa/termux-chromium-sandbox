@@ -674,3 +674,37 @@ Verdict: Round 12 PASS on all enumerated gates except two recorded
 NOT_VERIFIED items (HTTP large-file download path; zombie-state field) and
 LMK visibility (non-root: NOT_VERIFIED). No regressions vs A condition or
 vs #28/#29/#31 signatures. Baselines untouched; promotion still pending.
+
+## Round 12.1 — residual verification closure (2026-04-24, #31 deb, no rebuild)
+
+1) Monitored-window reconciliation: D60 per-pid "44 min" was a metric error
+   (i-index assumed 60s; real cadence ~63s). True coverage: unmonitored gap
+   at launch 38s (covered by first mon-D rows at 05:24:53) + tail 55s
+   (browser alive at TERM: log 'Handling shutdown for signal 15' 06:24:56).
+   Effective continuity: full 60.0-min run, sampling continuity 58.5 min,
+   endpoints attested. The "44 min" claim is corrected here.
+2) Low-RMS triage (49 samples): 27 audible; 21 samples = zero-stream minutes
+   (media tab genuinely absent — churn-close/injector-120s scheduling
+   artifact, workload design, not output faults); 1 sample i=28 (sink RUNNING
+   + owner, rms 0) = clip-end/teardown boundary (i=26/27 audible 2892/2940,
+   i=29 stream already gone). No true output failure observed in-window.
+3) Browser download manager (CDP Page.setDownloadBehavior -> navigate to
+   http 13MB file, isolated dirs, per-condition server health 200):
+   A and D both DL_MGR_RESULT OK, size 13631488, SHA256 MATCH to source.
+4) Zombie state (monitor_state.sh, State column, 5s cadence, teardown
+   covered): state==Z rows 0 in both conditions; 13/14 vanished (reaped)
+   rows — all ended processes fully removed from /proc post-TERM.
+5) LMK: non-root logcat (system + events) visibility 0 lines -> remains
+   NOT_VERIFIED; absence of observation is NOT claimed as absence of LMK.
+   Product-side corroboration (not proof): no mid-run unexpected exits,
+   residuals 0 in every phase.
+
+Tooling bugs found+fixed in closure (measurement only): PREFIX derived via
+dirname-chain instead of suffix-strip (chrome never launched first tries);
+stop-file truncation vs rm -f (monitors exited instantly); CDP ready-wait
+added; orphan print NameError; harness-timeout pipe output loss -> detached
+runs. pkill/self-match discipline upheld via script-file cleanup.
+
+Round 12.1 verdict: items 1-4 CLOSED PASS, item 5 NOT_VERIFIED (structural,
+non-root). NOT_VERIFIED ledger shrinks to: LMK visibility only. Promotion
+recommendation updated in final report; nothing promoted here.
