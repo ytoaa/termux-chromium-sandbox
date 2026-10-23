@@ -291,7 +291,7 @@ SB="$STUB/files/usr/lib/chromium-sandboxed"; mkdir -p "$SB"
 # extract the wrapper body from the generated recipe heredoc
 sed -n '/cat > "\$_wrap" <<.SHIMWRAP./,/^SHIMWRAP$/p' "$G32" | sed '1d;$d' > "$SB/chromium-shield-wrapper.sh"
 chmod +x "$SB/chromium-shield-wrapper.sh"
-printf '#!/data/data/com.termux/files/usr/bin/bash\necho "PULSE=[$PULSE_SERVER] LD=[${LD_PRELOAD%%:*}]"\n' > "$SB/chromium-launcher.sh"
+printf '#!/usr/bin/env bash\necho "PULSE=[$PULSE_SERVER] LD=[${LD_PRELOAD%%:*}]"\n' > "$SB/chromium-launcher.sh"
 chmod +x "$SB/chromium-launcher.sh"
 printf "void _termux_stub(void){}\n" | clang -shared -x c - -o "$SB/libtermux-gnp-fix.so" 2>/dev/null || cp "$(command -v bash)" "$SB/libtermux-gnp-fix.so"
 W="$SB/chromium-shield-wrapper.sh"; XP="${PREFIX:-/data/data/com.termux/files/usr}"
