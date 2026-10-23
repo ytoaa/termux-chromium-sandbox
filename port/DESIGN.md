@@ -479,3 +479,30 @@ AddPulseAudioFilePermissions) — awaiting approval; seccomp policy untouched.
 Verdict: R9a candidate = PASS against the approved battery. Promotion to validated,
 default-on of NetworkServiceSandbox, apt publishing: NOT done, separate approvals
 required. run #28 stays the validated baseline.
+
+## Round 10 addendum — R9b reviewer revision & R9a #29 record (2026-10-23)
+
+R9a run #29 (candidate 156.0.8078.47): device battery PASS — restarts 16->0,
+CRASHING 32->0, network utility filters=2/nnp=1 at activation instant (kernel 6.1,
+pid<->sub mapping), audible audio under B (rms 2591 main / 4150 testbed), testbed
+install/purge clean, no new traps. This record is informational: run #28 remains
+the validated baseline; promotion to validated, NetworkServiceSandbox default-on
+and apt publishing all require SEPARATE approvals (none granted).
+
+R9b (reviewer corrections accepted, still zero code/policy changes): the earlier
+"broker permission gap" attribution is WITHDRAWN — observed EPERM(1) matches
+base-policy Error(EPERM) classes (fchmod/fchown are not broker commands; broker
+denies with EACCES), and the PULSE_RUNTIME_PATH probe was an invalid control (it
+moves socket discovery too). Corrected A/B with an extended tracer (lstat/fstatat/
+statx/fchown/fchmodat/openat/syscall) proved a zero-policy fix: with
+PULSE_SERVER=unix:<real $PREFIX/tmp/pulse/native> the sandboxed AudioService
+connects (ret=0), cookie opens via the existing broker grant, no secure-dir
+sequence runs at all, sink-input RUNNING + monitor rms 1936 AUDIBLE, and the
+unsandboxed control is equivalent. v3 proposal = launcher-level env export
+(prepare_recipe.py data change only; respects user PULSE_SERVER; no-op when no
+socket). Priority-2 (minimal broker StatOnlyWithIntermediateDirs) and priority-3
+(extra bionic patches) are unnecessary unless v1 regresses; the exact broker-vs-BPF
+attribution of the ORIGINAL default-discovery failure stays open (tracer filter
+blind spot on non-'pulse' component paths like $PREFIX/tmp itself) — observable
+without builds via filter extension only. Forbidden measures (blanket fchmod,
+$PREFIX RWCR, disabling seccomp) were never applied.
