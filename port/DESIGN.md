@@ -538,3 +538,32 @@ last-words capture per utility pid) to find the silent death mechanism.
 CI build: NOT dispatched (approval §4 conditions require the pre-validation to
 pass; it did not). No new policy allowances were added anywhere. run #28 stays
 the validated baseline.
+
+## Round 11 addendum — v4 FINAL: no utility death existed (three measurement artifacts corrected)
+
+The "silent death" was an artifact of (1) zygote-forked utilities keep
+cmdline --type=zygote (exec-less) so the cmdline scan was blind — ptrace
+spy proved ACT'd utilities alive; (2) parecord windows all sat AFTER the
+12s clip ended (t30 vs end@16-17s) — re-measured in-window: testbed
+rms=2905 AUDIBLE, main rms=2589 AUDIBLE with AudioServiceSandbox ON
+(wrapper PULSE_SERVER), sink-input RUNNING, PLAY+ENDED, CRASHING 0, PA
+context-refused 0 (the 'refused=41' was dbus-bus noise on a loose grep);
+(3) broker exit(0)/EOF lines = zygote warm-up fork(_exit(0) by design)
+and session-teardown lifecycle, not a broker pathology (single broker fork
+observed per utility: FORKED parent->child; client EOF only at close).
+
+§5 gate status (candidate 156 + wrapper, run #29 binary + injected wrapper):
+- AudioServiceSandbox ON, both devices: utility ALIVE 30s+ (spy/ACT census),
+  0 unexpected restarts, sink RUNNING, in-window monitor rms>150 (2905 TB /
+  2589 main), AAC PLAYING->ENDED, YouTube T1..T5 (D), IDB/LS.
+- D (audio+network) main: network.mojom.NetworkService ACT-at
+  Seccomp_filters=2 nnp=1 preserved; eight zygote-child utilities recorded
+  filters=2 nnp=1 at activation instant; CRASHING 0, 'restarting service' 0.
+- Controls: sandbox OFF healthy; PULSE_SERVER- OFF reproduces refused/
+  secure-dir loop (wrapper is the fix); instrumentation did not alter
+  outcomes (J vs G3 same shape).
+
+CI build: still NOT dispatched — awaiting approval (single build, ref
+64e02760...). Nothing promoted; run #28 remains baseline; no policy or
+broker/allow-list widening anywhere. Evidence: gate-out/r9/{v4*,R9B_FINDINGS.md,
+shield-wrapper-r9b.sh, spy, ipc_diag2.*, exec_catch.*} + device logs.
