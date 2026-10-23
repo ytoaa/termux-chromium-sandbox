@@ -75,7 +75,11 @@ broker_socket_inode_proof = true
 causality_control = "--disable-seccomp-filter-sandbox"
 
 [forbidden]                    # verifier refuses these (fail-closed)
-- "any Content/GPU/utility MAY_CONNECT-style widening without a contract entry"
-- "prctl/umask-style blanket syscall exceptions 'seen in logs'"
-- "namespace or setuid fallback switches shipped in releases"
-- "unconditional --no-sandbox appends (anti-injection scan, run_tests [6])"
+# This file MUST stay valid TOML: run_tests [31] parses it with tomllib and
+# the CI self-test gates the build on it. Items live in a list, not bullets.
+items = [
+  "any Content/GPU/utility MAY_CONNECT-style widening without a contract entry",
+  "prctl/umask-style blanket syscall exceptions 'seen in logs'",
+  "namespace or setuid fallback switches shipped in releases",
+  "unconditional --no-sandbox appends (anti-injection scan, run_tests [6])",
+]

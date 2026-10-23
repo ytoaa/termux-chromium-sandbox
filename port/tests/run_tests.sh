@@ -260,4 +260,9 @@ setfn=$(awk '/RestrictSetSockoptForNetworkService\(\)/,/^}/' "$F" | grep -c '__B
   && pass "[30] R9a scope: 1 pair, get-side only, no SO_PROTOCOL/set drift" \
   || fail "[30] R9a scope drift (dom=$n_dom mark=$n_mark set-bionic=$setfn)"
 
+# [31] ledger contract: port.toml must be valid TOML (parser verification)
+python3 -c "import tomllib,sys; d=tomllib.load(open('port/port.toml','rb')); sys.exit(0 if all(k in d.get('rules',{}) for k in ('r1','r2','r3','r4','r5','r7','r8','r9a')) and 'items' in d.get('forbidden',{}) else 1)" \
+  && pass "[31] port.toml parses (tomllib) + rules r1-r9a + forbidden.items present" \
+  || fail "[31] port.toml invalid TOML / contract keys missing"
+
 exit $rc
