@@ -435,3 +435,47 @@ Next (Phase 2): apt channel via gh-pages + package-version lead so
 'pkg upgrade' cannot resurrect the sandbox-off stock build as the default
 entry point; separate-identity naming already holds (chromium-sandboxed).
 
+
+## Round 10 — R9a candidate (run #29): network service sandboxing works (2026-10-23)
+
+Approved scope executed exactly: one (SOL_SOCKET, SO_DOMAIN) getsockopt pair under
+__BIONIC__ inside RestrictGetSockoptForNetworkService() (bpf_network_policy_linux.cc),
+verifier gate + rule-counter 7->8 + workflow R9a grep + harness [28]-[30];
+[forbidden] converted to valid TOML with tomllib parser gate [31] (commits c715866
+security-policy / f2fec44 docs-verification).
+
+run #29: self-test PASS; build SUCCEEDED but took 5h09m — the sccache had partially
+expired (warm baseline #28 was 59m; job cap is 350m — future dispatches should
+either keep the cache warm (periodic rebuild cadence < 7d) or budget cold runs).
+IMPORTANT: the workflow resolves termux-packages via a floating master ref and
+upstream bumped Chromium 155 -> **156.0.8078.47**, so the candidate is a different
+Chromium than the run #28 baseline. R9a anchors survived the bump (build applied
+them), but production validations must pin the termux-packages sha — recorded as a
+known drift risk.
+
+Behavioural battery (candidate 156+R9a, main extract-only + testbed dpkg install):
+- NetworkServiceSandbox ON: restarts 16->0, CRASHING 32->0, utility ACTs 18->2;
+  milestones equal to baseline-A (YouTube iframe timeline T1..T5, AAC done, IDB/LS).
+- Kernel 6.1 census with PID<->role mapping: sub=network.mojom.NetworkService
+  recorded Seccomp_filters=2 NoNewPrivs=1 AT activation instant (4.19 testbed:
+  seccomp=2 nnp=1, no filter export — main census is authoritative).
+- PulseAudio under B: sink-input RUNNING <Chromium>, monitor rms 2591 (main) /
+  4150 (testbed) — first SILENT reading was a 0% sink-volume environment drift,
+  restored to base 100% (not a regression).
+- Testbed dpkg install -> ii -> B battery -> purge: 0 package residuals
+  (empty lib/chromium-sandboxed/extensions was runtime-created; removed).
+- No new syscall traps observed anywhere in the battery -> no list widening.
+
+R9b (diagnostics only, ZERO code/permission changes, per authorization): the audio
+utility DOES engage BPF (ACT log, zero CRASHING); silence stems from the AUDIO hook's
+broker file-permission set not covering Termux's deep XDG runtime layout — PA
+secure-dir verification -> broker EPERM -> libpulse falls back to compiled
+$PREFIX/var/run/pulse/native -> raw connect ENOENT -> refused -> silent + utility
+exit. PULSE_RUNTIME_PATH env probe still EPERMs (so it is directory-self +
+intermediate-component traversal, not a plain path miss). libpulse.so.0 loads fine
+(no dlopen warning). v3 fix proposal drafted (bionic branch in
+AddPulseAudioFilePermissions) — awaiting approval; seccomp policy untouched.
+
+Verdict: R9a candidate = PASS against the approved battery. Promotion to validated,
+default-on of NetworkServiceSandbox, apt publishing: NOT done, separate approvals
+required. run #28 stays the validated baseline.
