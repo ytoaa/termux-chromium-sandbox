@@ -506,3 +506,35 @@ attribution of the ORIGINAL default-discovery failure stays open (tracer filter
 blind spot on non-'pulse' component paths like $PREFIX/tmp itself) — observable
 without builds via filter extension only. Forbidden measures (blanket fchmod,
 $PREFIX RWCR, disabling seccomp) were never applied.
+
+## Round 11 (WIP) — R9b wrapper candidate: packaging proven, utility survival gate BLOCKED (pre-existing)
+
+Implemented (approved scope): guarded PULSE_SERVER export inside
+chromium-shield-wrapper.sh (prepare_recipe.py; original chromium-launcher.sh
+untouched; LD_PRELOAD path preserved; exec line unchanged; user PULSE_SERVER —
+including empty string — never overwritten; XDG absolute-path socket preferred,
+$PREFIX/tmp fallback, no-socket no-op; unix:<abs> form; quoting-safe; harness
+[32]-[34]: 10 new cases incl. behaviour matrix (7 scenarios) + widening-token
+guard; ledger [rules.r9b]; 42/42).
+
+Device pre-validation (testbed, extract-copy + one real dpkg install/purge):
+the wrapper does exactly its job — refused/secure-dir log lines go to 0 with
+AudioServiceSandbox ON (was refused=1-loop before). BUT the §5 survival gate
+(audio utility alive >=30s) FAILS: the sandboxed AudioService utility dies
+silently right after 'Activated seccomp-bpf ... utility' (no SIGSYS/CRASHING,
+no logs, no dumps) — IDENTICALLY on 155 (run #28 tree) and 156 (candidate #29
+tree), with or without LD_PRELOAD tracers, with or without PREFIX override,
+extract or installed. 155/156 audio hook+policy sources are byte-identical
+(diff clean) — this is a pre-existing sandboxed-AudioService problem, NOT a
+regression introduced by the candidate.
+
+SELF-CORRECTION (round-10/R9b findings): the earlier 'C-srv AUDIBLE rms 1936'
+success claim was BROWSER-SIDE FALLBACK audio, not the sandboxed utility — the
+same log's own 'audio-util-alive@14s: NO' was in plain sight. The wrapper is
+still necessary (kills the refused crash-loop) but NOT sufficient; next
+investigation = broker round-trip (sendmsg/poll hook + broker child census +
+last-words capture per utility pid) to find the silent death mechanism.
+
+CI build: NOT dispatched (approval §4 conditions require the pre-validation to
+pass; it did not). No new policy allowances were added anywhere. run #28 stays
+the validated baseline.

@@ -261,8 +261,66 @@ setfn=$(awk '/RestrictSetSockoptForNetworkService\(\)/,/^}/' "$F" | grep -c '__B
   || fail "[30] R9a scope drift (dom=$n_dom mark=$n_mark set-bionic=$setfn)"
 
 # [31] ledger contract: port.toml must be valid TOML (parser verification)
-python3 -c "import tomllib,sys; d=tomllib.load(open('port/port.toml','rb')); sys.exit(0 if all(k in d.get('rules',{}) for k in ('r1','r2','r3','r4','r5','r7','r8','r9a')) and 'items' in d.get('forbidden',{}) else 1)" \
+python3 -c "import tomllib,sys; d=tomllib.load(open('port/port.toml','rb')); sys.exit(0 if all(k in d.get('rules',{}) for k in ('r1','r2','r3','r4','r5','r7','r8','r9a','r9b')) and 'items' in d.get('forbidden',{}) else 1)" \
   && pass "[31] port.toml parses (tomllib) + rules r1-r9a + forbidden.items present" \
   || fail "[31] port.toml invalid TOML / contract keys missing"
+
+# [32] R9b wrapper rule: generated shield wrapper carries the guarded
+# PULSE_SERVER export (user-set incl. empty respected; -S socket checks;
+# unix: form; exec line & LD_PRELOAD path preserved; single wrapper).
+T32=$WORK/t32; rm -rf "$T32"; mkdir -p "$T32/x11-packages/chromium" "$T32/x11-packages/chromium-sandboxed"
+cp "$FIX/termux-build.sh" "$T32/x11-packages/chromium/build.sh"
+touch "$T32/build-package.sh"; chmod +x "$T32/build-package.sh"
+python3 port/prepare_recipe.py prepare --termux-dir "$T32" >/dev/null 2>&1
+G32="$T32/x11-packages/chromium-sandboxed/build.sh"
+grep -q 'Termux seccomp-only audio-pulse-server:' "$G32" \
+  && grep -q '\[ -z "${PULSE_SERVER+x}" \]' "$G32" \
+  && grep -q 'case "${XDG_RUNTIME_DIR:-}" in' "$G32" \
+  && grep -q '\[ -S "$XDG_RUNTIME_DIR/pulse/native" \]' "$G32" \
+  && grep -q 'tmp/pulse/native' "$G32" \
+  && grep -q 'export PULSE_SERVER="unix:$_pas"' "$G32" \
+  && [ "$(grep -c 'exec "$_p/chromium-launcher.sh" "$@"' "$G32")" -eq 1 ] \
+  && grep -q 'export LD_PRELOAD="$_p/libtermux-gnp-fix.so' "$G32" \
+  && pass "[32] R9b wrapper: guarded export + unix: + exec/LD_PRELOAD intact" \
+  || fail "[32] R9b wrapper markers"
+
+# [33] R9b behavioural: run the generated wrapper against a stub tree.
+mksock() { python3 -c "import socket,sys;s=socket.socket(socket.AF_UNIX);s.bind(sys.argv[1])" "$1"; }
+STUB=$WORK/stub; rm -rf "$STUB"
+SB="$STUB/files/usr/lib/chromium-sandboxed"; mkdir -p "$SB"
+# extract the wrapper body from the generated recipe heredoc
+sed -n '/cat > "\$_wrap" <<.SHIMWRAP./,/^SHIMWRAP$/p' "$G32" | sed '1d;$d' > "$SB/chromium-shield-wrapper.sh"
+chmod +x "$SB/chromium-shield-wrapper.sh"
+printf '#!/data/data/com.termux/files/usr/bin/bash\necho "PULSE=[$PULSE_SERVER] LD=[${LD_PRELOAD%%:*}]"\n' > "$SB/chromium-launcher.sh"
+chmod +x "$SB/chromium-launcher.sh"
+printf "void _termux_stub(void){}\n" | clang -shared -x c - -o "$SB/libtermux-gnp-fix.so" 2>/dev/null || cp "$(command -v bash)" "$SB/libtermux-gnp-fix.so"
+W="$SB/chromium-shield-wrapper.sh"; XP="${PREFIX:-/data/data/com.termux/files/usr}"
+o=$(PREFIX=$STUB/files/usr env -u PULSE_SERVER -u XDG_RUNTIME_DIR bash "$W" 2>&1)
+[ "$o" = "PULSE=[] LD=[$SB/libtermux-gnp-fix.so]" ] && pass "[33a] no socket -> no-op, LD_PRELOAD kept" || fail "[33a] $o"
+mkdir -p "$STUB/xdg/pulse" "$STUB/files/usr/tmp/pulse"
+mksock "$STUB/xdg/pulse/native"; mksock "$STUB/files/usr/tmp/pulse/native"
+o=$(PREFIX=$STUB/files/usr XDG_RUNTIME_DIR=$STUB/xdg env -u PULSE_SERVER bash "$W" 2>&1)
+[ "$o" = "PULSE=[unix:$STUB/xdg/pulse/native] LD=[$SB/libtermux-gnp-fix.so]" ] && pass "[33b] XDG socket preferred" || fail "[33b] $o"
+rm -f "$STUB/xdg/pulse/native"
+o=$(PREFIX=$STUB/files/usr XDG_RUNTIME_DIR=$STUB/xdg env -u PULSE_SERVER bash "$W" 2>&1)
+[ "$o" = "PULSE=[unix:$STUB/files/usr/tmp/pulse/native] LD=[$SB/libtermux-gnp-fix.so]" ] && pass "[33c] PREFIX tmp fallback" || fail "[33c] $o"
+o=$(PREFIX=$STUB/files/usr env -u PULSE_SERVER XDG_RUNTIME_DIR=$STUB/nonexistent bash "$W" 2>&1)
+[ "$o" = "PULSE=[unix:$STUB/files/usr/tmp/pulse/native] LD=[$SB/libtermux-gnp-fix.so]" ] && pass "[33d] missing XDG dir -> fallback" || fail "[33d] $o"
+o=$(PREFIX=$STUB/files/usr env PULSE_SERVER= XDG_RUNTIME_DIR=$STUB/xdg bash "$W" 2>&1)
+[ "$o" = "PULSE=[] LD=[$SB/libtermux-gnp-fix.so]" ] && pass "[33e] user empty PULSE_SERVER respected" || fail "[33e] $o"
+o=$(PREFIX=$STUB/files/usr env "PULSE_SERVER=tcp:1.2.3.4" bash "$W" 2>&1)
+[ "$o" = "PULSE=[tcp:1.2.3.4] LD=[$SB/libtermux-gnp-fix.so]" ] && pass "[33f] user PULSE_SERVER kept" || fail "[33f] $o"
+SP="$STUB/sp ace/pulse"; mkdir -p "$SP"; mksock "$SP/native"
+o=$(PREFIX=$STUB/files/usr env -u PULSE_SERVER XDG_RUNTIME_DIR="$STUB/sp ace" bash "$W" 2>&1)
+[ "$o" = "PULSE=[unix:$SP/native] LD=[$SB/libtermux-gnp-fix.so]" ] && pass "[33g] spaces in path (quoting)" || fail "[33g] $o"
+XDG_RUNTIME_DIR=$STUB/xdg PREFIX=$STUB/files/usr bash "$W" >/dev/null 2>&1 && [ -x "$SB/chromium-launcher.sh" ] \
+  && ! grep -q 'libtermux-gnp-fix.so' "$SB/chromium-launcher.sh" \
+  && pass "[33h] wrapper!=launcher (no recursion clobber)" || fail "[33h]"
+
+# [34] R9b security guard: wrapper block must never contain widening tokens.
+BODY=$(sed -n '/cat > "\$_wrap" <<.SHIMWRAP./,/^SHIMWRAP$/p' "$G32")
+! echo "$BODY" | grep -qE -- '--no-sandbox|--disable-seccomp-filter-sandbox|fchmod|ReadWriteCreateRecursive|setuid' \
+  && pass "[34] R9b wrapper: no forbidden widening tokens" \
+  || fail "[34] R9b forbidden token in wrapper"
 
 exit $rc

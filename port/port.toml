@@ -58,6 +58,12 @@ file = "sandbox/policy/linux/bpf_network_policy_linux.cc"
 marker = "Termux seccomp-only net-sockopt:"
 note = "R9a CANDIDATE only — run #28 stays the validated baseline (last_validated_*); NetworkServiceSandbox remains default-off (upstream Linux default) until the post-build B-battery passes and a separate promotion approval. Scope: one (SOL_SOCKET, SO_DOMAIN) get-pair; no setsockopt/SO_PROTOCOL."
 
+[rules.r9b]
+name = "PULSE_SERVER export in shield wrapper (packaging-level)"
+file = "port/prepare_recipe.py"
+marker = "Termux seccomp-only audio-pulse-server:"
+note = "Zero privilege widening — audio server-selection behavior only. No C/C++/BPF/broker/syscall changes; user PULSE_SERVER (incl. empty string) respected; no-socket is a no-op. Candidate: #28 baseline stays validated; default-on/promotion separate approvals."
+
 [gates]
 # Future candidate gates (firefox-pattern): source verify + binary markers +
 # on-device level checks. Binary markers are checked inside the built

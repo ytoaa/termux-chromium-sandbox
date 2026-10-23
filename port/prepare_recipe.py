@@ -164,6 +164,24 @@ termux_step_post_make_install() {
 # termux-chromium-sandbox-port: bionic pthread_getattr_np shield (port/DESIGN.md)
 _p="${PREFIX:-/data/data/com.termux/files/usr}/lib/chromium-sandboxed"
 export LD_PRELOAD="$_p/libtermux-gnp-fix.so${LD_PRELOAD:+:$LD_PRELOAD}"
+# Termux seccomp-only audio-pulse-server: (R9b candidate — port/DESIGN.md)
+# Point libpulse at the real PulseAudio socket so a sandboxed AudioService
+# utility skips runtime-dir discovery/verification (which trips base-policy
+# EPERM on non-brokerable calls). A user-set PULSE_SERVER — INCLUDING an
+# empty string — is never overwritten; no socket means no-op. Zero sandbox
+# policy change: allowlists, broker grants and syscall filters untouched
+# (see harness [34]: widening tokens are banned in this block).
+if [ -z "${PULSE_SERVER+x}" ]; then
+  _pas=""
+  case "${XDG_RUNTIME_DIR:-}" in
+    /*) [ -S "$XDG_RUNTIME_DIR/pulse/native" ] && _pas="$XDG_RUNTIME_DIR/pulse/native" ;;
+  esac
+  if [ -z "$_pas" ]; then
+    _pat="${PREFIX:-/data/data/com.termux/files/usr}/tmp/pulse/native"
+    [ -S "$_pat" ] && _pas="$_pat"
+  fi
+  [ -n "$_pas" ] && export PULSE_SERVER="unix:$_pas"
+fi
 exec "$_p/chromium-launcher.sh" "$@"
 SHIMWRAP
 	chmod +x "$_wrap"
