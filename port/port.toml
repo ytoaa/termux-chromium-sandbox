@@ -52,6 +52,12 @@ file = "base/allocator/partition_allocator/src/partition_alloc/stack/stack.cc"
 marker = "Termux seccomp-only bionic stack-top:"
 note = "partition_alloc stack-top lookup calls pthread_getattr_np unconditionally; cache the main-thread value and fill it from StartSeccompBPF before the BPF denies /proc"
 
+[rules.r9a]
+name = "network getsockopt SO_DOMAIN (Bionic)"
+file = "sandbox/policy/linux/bpf_network_policy_linux.cc"
+marker = "Termux seccomp-only net-sockopt:"
+note = "R9a CANDIDATE only — run #28 stays the validated baseline (last_validated_*); NetworkServiceSandbox remains default-off (upstream Linux default) until the post-build B-battery passes and a separate promotion approval. Scope: one (SOL_SOCKET, SO_DOMAIN) get-pair; no setsockopt/SO_PROTOCOL."
+
 [gates]
 # Future candidate gates (firefox-pattern): source verify + binary markers +
 # on-device level checks. Binary markers are checked inside the built

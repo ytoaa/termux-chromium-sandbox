@@ -40,6 +40,7 @@ R4_MARKER = "Termux seccomp-only zygote passthrough:"
 R5_MARKER = "Termux seccomp-only stack-top prewarm:"
 R7_MARKER = "Termux seccomp-only bionic stack cache:"
 R8_MARKER = "Termux seccomp-only bionic stack-top:"
+R9A_MARKER = "Termux seccomp-only net-sockopt:"
 
 
 class PortError(RuntimeError):
@@ -108,6 +109,7 @@ class Port:
     ZYGOTE_HOST = "content/browser/zygote_host/zygote_host_impl_linux.cc"
     SANDBOX_LINUX = "sandbox/policy/linux/sandbox_linux.cc"
     SYSCALL_RESTRICT = "sandbox/linux/seccomp-bpf-helpers/syscall_parameters_restrictions.cc"
+    NETWORK_POLICY = "sandbox/policy/linux/bpf_network_policy_linux.cc"
     STACK_TRACE = "base/debug/stack_trace.cc"
     PA_STACK_TRACE = ("base/allocator/partition_allocator/src/partition_alloc/"
                       "partition_alloc_base/debug/stack_trace.cc")
@@ -365,6 +367,30 @@ void* TermuxPrewarmStackTop() {
 const pthread_t g_termux_main_thread = pthread_self();
 #endif'''
 
+    # R9a (round 10, A/B matrix on run #28): the network service queries
+    # getsockopt(fd, SOL_SOCKET, SO_DOMAIN) at startup (socket tagging);
+    # RestrictGetSockoptForNetworkService() allows only SO_ERROR at
+    # SOL_SOCKET, so enabling NetworkServiceSandbox crash-looped the utility
+    # (trap nr=209 __NR_getsockopt, args (fd, 1, 39=SO_DOMAIN) — observed on
+    # the 4.19 testbed AND BPF install proven on kernel 6.1 census).
+    # Approved scope (review, single-CI-candidate): this ONE (SOL_SOCKET,
+    # SO_DOMAIN) get-pair under __BIONIC__ only. Do NOT extend here:
+    # SO_PROTOCOL and any setsockopt change require their own observed trap.
+    R9A_OLD = """  ResultExpr socket_optname_switch =
+      Switch(optname).Case(SO_ERROR, Allow()).Default(CrashSIGSYSSockopt());"""
+
+    R9A_NEW = """  ResultExpr socket_optname_switch =
+      Switch(optname)
+          .Case(SO_ERROR, Allow())
+#if defined(__BIONIC__)
+          // """ + R9A_MARKER + """ bionic net stack queries SO_DOMAIN at
+          // network-service startup (socket tagging); upstream Linux never
+          // reaches this optname from the network policy (feature is
+          // default-off there). get-side only; setsockopt untouched.
+          .Case(SO_DOMAIN, Allow())
+#endif  // defined(__BIONIC__)
+          .Default(CrashSIGSYSSockopt());"""
+
     def apply(self) -> None:
         self.replace_once(self.ZYGOTE_HOST, "R1 seccomp-only usable mode (Bionic)",
                           self.R1_OLD, self.R1_NEW)
@@ -378,6 +404,8 @@ const pthread_t g_termux_main_thread = pthread_self();
                           self.R5_OLD, self.R5_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R5 stack-top prewarm call (Bionic)",
                           self.R5B_OLD, self.R5B_NEW)
+        self.replace_once(self.NETWORK_POLICY, "R9a getsockopt(SOL_SOCKET, SO_DOMAIN) (Bionic)",
+                          self.R9A_OLD, self.R9A_NEW)
         self.replace_once(self.STACK_TRACE, "R7 bionic stack cache (base)",
                           self.R7_OLD, self.R7_NEW)
         self.replace_optional(self.PA_STACK_TRACE, "R7 bionic stack cache (PA copy)",
@@ -396,6 +424,7 @@ const pthread_t g_termux_main_thread = pthread_self();
             (self.ZYGOTE_HOST, R1_MARKER, "R1"),
             (self.SANDBOX_LINUX, R2_MARKER, "R2"),
             (self.SYSCALL_RESTRICT, R3_MARKER, "R3"),
+            (self.NETWORK_POLICY, R9A_MARKER, "R9a"),
             (self.SANDBOX_LINUX, R4_MARKER, "R4"),
             (self.SANDBOX_LINUX, R5_MARKER, "R5"),
             (self.STACK_TRACE, R7_MARKER, "R7"),

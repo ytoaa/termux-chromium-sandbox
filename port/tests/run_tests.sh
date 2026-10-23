@@ -226,4 +226,38 @@ grep -q 'local _wrap="\$_p/chromium-shield-wrapper.sh"' "$g27" \
   && pass "[27] wrapper is a separate file, bin repointed, recursion guard" \
   || fail "[27] launcher clobber regression"
 
+# [28] R9a network-policy rule: APPLIED + marker + idempotence + verify gate
+fresh
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+F="$WORK/src/sandbox/policy/linux/bpf_network_policy_linux.cc"
+[ $got -eq 0 ] && echo "$out" | grep -q 'APPLIED.*R9a' \
+  && grep -qF 'Termux seccomp-only net-sockopt:' "$F" \
+  || { fail "[28] R9a apply/marker"; echo "$out"; }
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+echo "$out" | grep -q 'ALREADY_PRESENT.*R9a' \
+  && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
+  && pass "[28] R9a applied+verified+idempotent" || fail "[28] R9a (idempotence/verify)"
+
+# [29] R9a anchor drift -> PORT ERROR (fail closed: candidate must not ship unpatched)
+fresh
+sed -i 's/Case(SO_ERROR, Allow())/Case(SO_ERRORTAMP, Allow())/' "$WORK/src/sandbox/policy/linux/bpf_network_policy_linux.cc"
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+[ $got -ne 0 ] && echo "$out" | grep -q 'R9a' && pass "[29] R9a anchor drift -> PORT ERROR" || { fail "[29] R9a drift"; echo "$out"; }
+
+# [29b] R9a missing file -> PORT ERROR (network policy is REQUIRED, not optional)
+fresh; rm "$WORK/src/sandbox/policy/linux/bpf_network_policy_linux.cc"
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+[ $got -ne 0 ] && echo "$out" | grep -qi 'missing\|R9a' && pass "[29b] R9a missing file -> PORT ERROR" || { fail "[29b] R9a missing"; echo "$out"; }
+
+# [30] R9a scope guard: exactly one SO_DOMAIN pair, bionic block get-side only
+fresh; python3 $PORT apply --src "$WORK/src" >/dev/null 2>&1
+F="$WORK/src/sandbox/policy/linux/bpf_network_policy_linux.cc"
+n_dom=$(grep -c 'Case(SO_DOMAIN, Allow())' "$F")
+n_mark=$(grep -c 'Termux seccomp-only net-sockopt:' "$F")
+setfn=$(awk '/RestrictSetSockoptForNetworkService\(\)/,/^}/' "$F" | grep -c '__BIONIC__')
+[ "$n_dom" -eq 1 ] && [ "$n_mark" -eq 1 ] && [ "$setfn" -eq 0 ] \
+  && ! grep -q 'SO_PROTOCOL, Allow()' "$F" \
+  && pass "[30] R9a scope: 1 pair, get-side only, no SO_PROTOCOL/set drift" \
+  || fail "[30] R9a scope drift (dom=$n_dom mark=$n_mark set-bionic=$setfn)"
+
 exit $rc
