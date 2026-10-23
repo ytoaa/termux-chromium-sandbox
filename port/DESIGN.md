@@ -567,3 +567,16 @@ CI build: still NOT dispatched — awaiting approval (single build, ref
 64e02760...). Nothing promoted; run #28 remains baseline; no policy or
 broker/allow-list widening anywhere. Evidence: gate-out/r9/{v4*,R9B_FINDINGS.md,
 shield-wrapper-r9b.sh, spy, ipc_diag2.*, exec_catch.*} + device logs.
+
+## Round 11 postmortem — run #30 (R9b candidate CI) failed at SELF-TEST; product code unaffected
+
+Dispatch verified pre-flight (headSha 1ddf25f == approved port commit;
+termux_ref input == 64e02760). gate job self-test FAILed only on harness
+cases [33a]-[33h]: the behaviour-stub launcher embedded a Termux-absolute
+shebang — ubuntu runners have no /data/data path ('bad interpreter').
+40/42 cases PASSed on CI including [32] (R9b markers in generated recipe)
+and [34] (no widening tokens). build job skipped (fail-closed by design);
+no artifact produced; NOT retried per authorization. Fix committed
+(#!/usr/bin/env bash) with local re-verification 42/42. Awaiting
+re-dispatch approval for the single candidate build (port commit advances
+to the fix commit; everything else per prior approval).
