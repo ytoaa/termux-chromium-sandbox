@@ -10,14 +10,22 @@ and invites a PR. This project is that attempt.
 
 ## Status
 
-- **Phase 3 — device regression gate: PASS** (2026-10-22, main device: Android
-  17 / kernel 6.1 GKI / aarch64, run #28 deb `155.0.8059.84`, sha256
-  `4e7dce52…dbe820a`): fully-green gated build (self-test + build + all
-  package gates), then X11 DEVICE GATE PASS on the packaged artifact — 6
-  renderer seccomp-bpf activations, codecs 5/5 (h264/vp9/av1/aac/opus), 7 live
-  children with `Seccomp_filters=2` + `NoNewPrivs=1` (stock baseline 0–1).
-  Chromium's own BPF policy is installed per-process. See `port/DESIGN.md`
-  round 7 (the bionic `pthread_getattr_np` shield) and round 9.
+- **Validated baseline (Round 13, 2026-10-24): run #31 / Chromium
+  `156.0.8078.47`** (port `403274f`, termux-packages `64e02760`, deb sha256
+  `29c4080d…9395b27c`) — fully-green gated build (CI self-test 42/42 + build
+  + package gates incl. R9a grep), then A/B/C/D device gates on both devices
+  and Round-12/12.1 soak: on kernel 6.1, 635 ACT-scoped rows
+  `Seccomp_filters=2`+`NoNewPrivs=1` with zero violations; AudioServiceSandbox
+  stream owner pid is the sandboxed utility (no browser-side fallback);
+  60-min D + 10/10 relaunches; browser download manager A+D sha-match;
+  zombie rows 0 with full reap; testbed dpkg install->purge residual 0.
+  Network/Audio sandbox features remain **default-OFF** (enable via
+  `--enable-features=NetworkServiceSandbox,AudioServiceSandbox`); default-on,
+  apt/Release publishing are separate approvals. LMK observability is
+  **NOT_VERIFIED** on non-root (not claimed absent). Prior baseline run #28
+  (`155.0.8059.84`, sha256 `4e7dce52…dbe820a`, X11 DEVICE GATE PASS
+  2026-10-22, 6 renderer activations, codecs 5/5, 7 children filters=2) is
+  preserved in `port/port.toml gates.device_gate_history`.
 - **Phase 0 — feasibility: PASS** (2026-10-19, device: Android 17 / kernel 6.1 GKI / aarch64)
   - `poc/seccomp_probe.c`: a plain Termux process CAN install its own
     seccomp-bpf filter (`prctl PR_SET_SECCOMP` → `PR_GET_SECCOMP=2`), ALLOW

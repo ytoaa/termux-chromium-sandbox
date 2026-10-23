@@ -1,9 +1,10 @@
-# Contract ledger — Phase 3 device gate GREEN (first validated candidate).
+# Contract ledger — validated baseline: run #31 / Chromium 156.0.8078.47 (Round 13 promotion 2026-10-24).
+# Prior validated baseline run #28 / 155.0.8059.84 preserved in gates.device_gate_history.
 [port]
 version = "0.1.0"
 phase = "validated"            # feasibility | porting | gated-build | validated
 last_validated_port = "0.1.0"
-last_validated_chromium = "155.0.8059.84"
+last_validated_chromium = "156.0.8078.47"
 policy_mode = "fail-closed"
 
 [termux]
@@ -56,13 +57,13 @@ note = "partition_alloc stack-top lookup calls pthread_getattr_np unconditionall
 name = "network getsockopt SO_DOMAIN (Bionic)"
 file = "sandbox/policy/linux/bpf_network_policy_linux.cc"
 marker = "Termux seccomp-only net-sockopt:"
-note = "R9a CANDIDATE only — run #28 stays the validated baseline (last_validated_*); NetworkServiceSandbox remains default-off (upstream Linux default) until the post-build B-battery passes and a separate promotion approval. Scope: one (SOL_SOCKET, SO_DOMAIN) get-pair; no setsockopt/SO_PROTOCOL."
+note = "R9a VALIDATED in run #31 (156.0.8078.47, port 403274f, termux 64e02760, deb sha256 29c4080d...27c) — B/D battery: network utility ACT, restarts 0, CRASHING 0, no new SIGSYS; #28 B-signature (restarts 16/CRASHING 32) eliminated. Scope guard unchanged: exactly one (SOL_SOCKET, SO_DOMAIN) get-pair under __BIONIC__; no setsockopt, no SO_PROTOCOL. Feature remains DEFAULT-OFF; default-on requires separate approval."
 
 [rules.r9b]
 name = "PULSE_SERVER export in shield wrapper (packaging-level)"
 file = "port/prepare_recipe.py"
 marker = "Termux seccomp-only audio-pulse-server:"
-note = "Zero privilege widening — audio server-selection behavior only. No C/C++/BPF/broker/syscall changes; user PULSE_SERVER (incl. empty string) respected; no-socket is a no-op. Candidate: #28 baseline stays validated; default-on/promotion separate approvals."
+note = "Zero privilege widening — audio server-selection behavior only. No C/C++/BPF/broker/syscall changes; user PULSE_SERVER (incl. empty string) respected; no-socket is a no-op. VALIDATED in run #31: AudioServiceSandbox ON on both devices — sandboxed utility owns PA stream (client pid in ACT set), in-window RMS audible, 60-min D soak, download manager + zombie checks closed. Feature remains DEFAULT-OFF; default-on requires separate approval."
 
 [gates]
 # Future candidate gates (firefox-pattern): source verify + binary markers +
@@ -74,7 +75,12 @@ binary_markers = [
 ]
 required_media_codecs = ["h264", "vp9", "av1", "aac", "opus"]
 require_bpf_per_process = true   # /proc Seccomp_filters must exceed Android baseline
-device_gate = "PASS 2026-10-22 run #28 deb 155.0.8059.84 (sha256 4e7dce52…dbe820a): renderer BPF activations=6, codecs 5/5 probably, 7 live children filters=2 nnp=1 (stock baseline 0); X11 DEVICE GATE PASS"
+device_gate = "PASS 2026-10-24 run #31 deb 156.0.8078.47 (sha256 29c4080d2a84...9395b27c; port 403274f, termux 64e02760): A/B/C/D both devices; D(60m)+D60 soak on kernel 6.1 — 635 ACT-scoped rows Seccomp_filters=2 NoNewPrivs=1 violations 0; audio owner pid in ACT set (no fallback); WS 3602 msgs, YouTube T1-T5, AAC, IDB/LS; browser download manager A+D sha-match; zombie Z-rows 0 + full reap; 10/10 relaunches; CRASHING/SIGSYS/restarting/pa-refused 0; testbed dpkg install->purge residual 0. LMK: NOT_VERIFIED (non-root logcat; absence of observation not claimed as absence of LMK)."
+device_gate_history = [
+  "PREVIOUS BASELINE (preserved): PASS 2026-10-22 run #28 deb 155.0.8059.84 (sha256 4e7dce52...dbe820a): renderer BPF activations=6, codecs 5/5 probably, 7 live children filters=2 nnp=1 (stock baseline 0); X11 DEVICE GATE PASS",
+  "INTERMEDIATE: run #29 (156.0.8078.47, first R9a candidate, sha256 5dae2702...d2fc950) — R9a B-battery PASS 2026-10-23 (restarts 0/CRASHING 0); superseded by #31 which adds the R9b wrapper as packaged.",
+  "FAILED (recorded): run #30 — CI self-test harness shebang portability (fixed 4b1f5da), no artifact.",
+]
 bpf_evidence_script = "port/bpf_evidence.sh"
 bpf_evidence_phases = ["P0-marker","P0-tripwire","P2-census","P2-broker","P2b-causality","P3-types"]
 broker_socket_inode_proof = true

@@ -675,7 +675,7 @@ NOT_VERIFIED items (HTTP large-file download path; zombie-state field) and
 LMK visibility (non-root: NOT_VERIFIED). No regressions vs A condition or
 vs #28/#29/#31 signatures. Baselines untouched; promotion still pending.
 
-## Round 12.1 — residual verification closure (2026-04-24, #31 deb, no rebuild)
+## Round 12.1 — residual verification closure (2026-10-24, #31 deb, no rebuild)
 
 1) Monitored-window reconciliation: D60 per-pid "44 min" was a metric error
    (i-index assumed 60s; real cadence ~63s). True coverage: unmonitored gap
