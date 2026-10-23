@@ -626,3 +626,51 @@ STATUS: candidate fully validated. NOT promoted (awaiting explicit approval):
 run #28 remains validated baseline; last_validated_* untouched; Network/
 Audio sandbox remain default-OFF; no apt/release. Recommendation in final
 report.
+
+## Round 12 — long-run soak on #31 artifact (2026-10-24)
+
+Fixed inputs verified: deb sha256 29c4080d... re-checked pre-run; no rebuild,
+no source change, no promotion. Main = extract-only; testbed = dpkg install
+(dpkg -V clean) -> matrix -> purge, residual 0 (only runtime-created empty
+extensions dir, 0 files).
+
+MAIN (kernel 6.1, authoritative):
+- Phases A(15m)/B(12m)/C(12m) + D(60m) + D60 re-run(60m, corrected assets,
+  external auto-detect monitor) + aux2 A/B/C(10m)+D(25m) with fixed pages;
+  10/10 relaunches OK (launch, milestone, graceful exit, residual 0 each).
+- D60@44-min monitored window: 174 unique pids; browser/2 zygotes/2 network
+  utilities/acted-children all span 2640s continuous; ACT-scoped seccomp2
+  rows 635 with filters=2 & nnp=1 -> VIOLATIONS 0 (browser/zygote platform
+  rows correctly filters=1; crashpad nnp=1 pre-sandbox rows are not
+  sandboxed pids and excluded per protocol).
+- CRASHING / SIGSYS / 'restarting service' / PA-context-refused: 0 in every
+  phase, both devices.
+- Resources: RSS plateau 1.9-2.4GB across 15 buckets (no monotonic growth;
+  end ~= mid), browser FD 253->272 stable under tab churn (create/close via
+  CDP every 120s), cpu/min decay 8029->269 (page-load -> steady, no
+  runaway). Zombie state field not captured (NOT_VERIFIED formally;
+  indirectly: exited pids stop appearing -> reaped, END residuals 0).
+- Audio: sandboxed utility owns the stream — PA client pid 29581 ∈ ACT set
+  in 30/49 sampled rows (single stable owner pid, itself filters=2 nnp=1,
+  44-min survival); rms >150 in 27/49 samples, median 2892, max 7504;
+  AUDIO_PLAY 153 loops; WS_OK 3602 (sustained + reconnect cycles); YouTube
+  T5 + AAC DONE; LS 104/IDB OK.
+
+TESTBED (4.19): TB2 30m + TB3 25m + TB4 30m + TB4' 30m (all D, monitor +
+CDP media injector on TB3'/TB4'): stability 0/0/0 everywhere; audio stream
+owner pid 22411 ∈ ACT across 23-min window (4/4 sampled sink rows), rms
+22/23 samples >150 (max 6625); Seccomp_filters not exported on 4.19 (nnp=1
+518 rows + mode=2 + MAIN census as per-protocol evidence).
+
+Method fixes discovered mid-run (measurement-only, no product change):
+initial-argv media tabs can be autoplay-gesture-starved -> CDP-created tabs
+are the reliable media path (injector added); fixed monitor device missed a
+drifted sink -> auto-detect added (r12_mon2); audio page needed JS play() +
+timeupdate logging; DL fetch page never surfaced -> big-file download
+NOT_VERIFIED (honest); pkill -f self-match caused two self-kills (moved to
+script-file cleanup).
+
+Verdict: Round 12 PASS on all enumerated gates except two recorded
+NOT_VERIFIED items (HTTP large-file download path; zombie-state field) and
+LMK visibility (non-root: NOT_VERIFIED). No regressions vs A condition or
+vs #28/#29/#31 signatures. Baselines untouched; promotion still pending.
