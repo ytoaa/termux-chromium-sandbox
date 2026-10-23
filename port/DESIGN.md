@@ -580,3 +580,49 @@ no artifact produced; NOT retried per authorization. Fix committed
 (#!/usr/bin/env bash) with local re-verification 42/42. Awaiting
 re-dispatch approval for the single candidate build (port commit advances
 to the fix commit; everything else per prior approval).
+
+## Round 11 FINAL — run #31: R9b candidate CI PASS + both-device A/B/C/D gates PASS (2026-10-24)
+
+Pre-flight: dispatch headSha == approved port commit 403274f; termux_ref input
+pinned to 64e02760... (never master); single dispatch, no retries.
+Result: gate self-test 42/42 on CI (shebang fix effective), build success
+(87m, sccache prefix-restore warm), package gates incl. R9a grep PASS.
+Artifact: chromium-sandboxed 156.0.8078.47 aarch64, sha256
+29c4080d2a849c07eae46a87e44e39231fa92021c1e10e24f363e1e29395b27c.
+
+Artifact verification (extracted DEB, not just logs): R9b wrapper markers +
+guards (user-set incl. empty respected — shipped-wrapper stub-tree behaviour
+test: unset->unix:<socket> exported; empty->kept empty; tcp->kept);
+LD_PRELOAD chain and exec-line intact; chromium-launcher.sh sha256 identical
+to #29 (untouched); port-apply log 'APPLIED] R9a' recorded.
+
+Device gates (A/B/C/D matrix, both devices, server pre-healthcheck, PID-linked
+in-window measurements):
+- MAIN (kernel 6.1, extract-only): every condition AUDIBLE in-window
+  (rms 1103-4664), CRASHING/pa-refused/restarting all 0, milestones full
+  (YouTube T1..T5, AAC done, IDB/LS). D census: 9/9 ACT pids with
+  Seccomp_filters=2 + NoNewPrivs=1 at activation instant, including
+  sub=network.mojom.NetworkService. PA client pid ∩ ACT utility pid
+  (26194@C, 29415@D) != browser pid -> stream owner is the sandboxed
+  utility, browser-side fallback formally excluded.
+- TESTBED (4.19, dpkg install -> matrix -> purge): ii; A-D all AUDIBLE
+  (rms 1169-3113), CRASHING/refused/restarting 0, END-LIVE 6-8 pids at ~63s
+  window (>=30s survival incl. audio utility + zygote children), PA owner =
+  ACT'd sandboxed utility (24772@C, 26940@D). 4.19 cannot export
+  Seccomp_filters (kernel limitation) -> nnp=1 + activation logs + MAIN
+  census serve as filter evidence, per protocol. Purge: dpkg residual 0;
+  only runtime-created empty extensions/ dir (0 files) remained.
+- #28/#29 comparison: #28 B-condition signature (restarts 16 / CRASHING 32)
+  gone on #31 (0/0); defaults-off (A) identical feature set; no regressions
+  found. NET_204_ERR/HTTPS_ERR page fetches: environment quirk identical in
+  ALL conditions incl. A and #28 baselines (not a sandbox effect); YouTube
+  streaming proves real network works.
+Known limits: wrapper no-ops without socket at standard paths (by design,
+user env precedence); third-party PA clients can pollute naive owner-detect
+(avoided via ACT∩PA membership); in-process GPU/WebGL-off on testbed matches
+stock (unchanged since round 9).
+
+STATUS: candidate fully validated. NOT promoted (awaiting explicit approval):
+run #28 remains validated baseline; last_validated_* untouched; Network/
+Audio sandbox remain default-OFF; no apt/release. Recommendation in final
+report.
