@@ -117,5 +117,20 @@ check('[s39] durable label-consume step present before classify',
       any('Consume retry-approved label' in k for k in _steps_out)
       and list(_steps_out).index(next(k for k in _steps_out if 'Consume retry-approved' in k))
           < list(_steps_out).index(next(k for k in _steps_out if 'Classify' in k)))
+_ps=[st.get('run','') for st in _dwj['outcome']['steps'] if 'Push state' in str(st.get('name',''))]
+_ps=_ps[0] if _ps else ''
+check('[s40] state push honest bootstrap (no || true on POST; verify before PUT; create/update split)',
+      'POST' in _ps and 'git/refs' in _ps and '-f ref="refs/heads/maintenance-state"' in _ps
+      and '-f sha="$base" > ref-create.json' in _ps
+      and 'creating maintenance-state' in _ps and 'updating existing state file' in _ps
+      and 'creating initial state file' in _ps
+      and 'git/ref/heads/maintenance-state' in _ps
+      and '-f sha="$base" > ref-create.json 2>/dev/null || true' not in _ps)
+check('[s41] issues.json typed guard (array vs error object)',
+      'if type=="object" then (.error // false) else false end' in _dwt)
+check('[s42] called-job name parsing splits on last slash',
+      'split("/") | last' in _dwt)
+check('[s43] log download errors surfaced not hidden',
+      'log download failed (job id' in _dwt)
 print(f'MAINTENANCE-STATIC PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)

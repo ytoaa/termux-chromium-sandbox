@@ -9,7 +9,7 @@
 # human applied `retry-approved`; unknown failures BLOCK; GitHub API errors
 # FAIL CLOSED (no silent seed/empty fallbacks on real errors).
 #
-# STATE: maintenance/state.json on orphan branch `maintenance-state`.
+# STATE: maintenance/state.json on the `maintenance-state` branch (regular branch, created from the default-branch head on first run).
 # Legitimate first run (file absent -> 404) falls back to
 # maintenance/state.seed.json; ANY other API error aborts the run.
 name: Daily Maintenance
@@ -215,16 +215,24 @@ jobs:
             failure|timed_out)
               # Round 15.2 #2: ALWAYS produce result.json on failure paths,
               # preserving failed job names, stage, log excerpt, run url.
-              jobs_json=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '[.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | {name,conclusion}]' || echo '[]')
-              failed_names=$(echo "$jobs_json" | jq -r '[.[].name | split(" ")[0]] | join(",")')
+              # Phase B remediation D: called-workflow jobs appear as
+              # '<caller job name> / <called job name>' — extract the segment
+              # after the LAST '/' so 'gate'/'build' classify correctly
+              # regardless of prefix or spaces. Errors surface, never hidden.
+              jobs_json=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '[.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | {id,name,conclusion}]' || echo '[]')
+              failed_names=$(echo "$jobs_json" | jq -r '[.[].name | split("/") | last | ltrimstr(" ") | split(" ")[0]] | join(",")')
               stage=unknown
               echo "$failed_names" | grep -qw 'gate' && stage=gate || true
               echo "$failed_names" | grep -qw 'build' && stage=build || true
-              jid=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | .id' | tail -1 || true)
-              if [ -n "${jid:-}" ]; then
-                gh api "repos/${{ github.repository }}/actions/jobs/$jid/logs" 2>/dev/null | tail -c 4000 > tail.log || echo "log unavailable (job $jid)" > tail.log
+              jid=$(echo "$jobs_json" | jq -r '.[-1].id // empty')
+              if [ -n "${jid:-}" ] && [ "$jid" != "null" ]; then
+                if gh api "repos/${{ github.repository }}/actions/jobs/$jid/logs" > full.log 2>log.err; then
+                  tail -c 4000 full.log > tail.log
+                else
+                  { echo "log download failed (job id $jid): $(tail -2 log.err)"; } > tail.log
+                fi
               else
-                echo "no failed job details retrievable (result=$res)" > tail.log
+                echo "no failed job id retrievable (result=$res; api may have errored)" > tail.log
               fi
               jq -n --arg stage "$stage" --arg jobs "$failed_names" --rawfile tail tail.log \
                 --arg url "$CI_URL" --argjson run "${{ github.run_id }}" --arg res "$res" \
@@ -270,7 +278,7 @@ jobs:
         run: |
           set -euo pipefail
           [ -f ops.json ] || echo '{"create_issues":[],"comment_issues":[]}' > ops.json
-          if [ "$(jq -r '.error // false' issues.json)" = "true" ]; then
+          if [ "$(jq -r 'if type=="object" then (.error // false) else false end' issues.json)" = "true" ]; then
             echo '::error::issues API was unavailable at decide-time; refusing issue writes to avoid duplicates'
             exit 1
           fi
@@ -293,6 +301,10 @@ jobs:
           python3 port/maintenance.py stamp --state state2.json --ops ops.json
 
       - name: Push state to maintenance-state branch (failure = loud)
+        # Round 15.4-C remediation: never swallow git/refs errors; verify
+        # the branch exists BEFORE the PUT; split create vs update paths.
+        # NOTE: maintenance-state is a REGULAR branch created from the
+        # default-branch head on first run (not an orphan).
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -300,18 +312,29 @@ jobs:
           [ -f state2.json ] || { echo "no state change"; exit 0; }
           msg="maintenance state: $(jq -r '.last_successful_build.package_version // "n/a"' state2.json)"
           content=$(base64 -w0 state2.json)
-          sha=$(gh api "repos/${{ github.repository }}/contents/maintenance/state.json?ref=maintenance-state" --jq .sha 2>/dev/null || true)
-          if [ -n "$sha" ]; then
+          if ! gh api "repos/${{ github.repository }}/git/ref/heads/maintenance-state" --jq .object.sha >/dev/null 2>ref.err; then
+            if ! grep -qiE 'Not Found|Reference does not exist' ref.err; then
+              echo "::error::branch probe failed: $(tail -2 ref.err)"; exit 1
+            fi
+            echo "creating maintenance-state from ${{ github.ref_name }}"
+            base=$(gh api "repos/${{ github.repository }}/git/ref/heads/${{ github.ref_name }}" --jq .object.sha)
+            gh api -X POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/heads/maintenance-state" -f sha="$base" > ref-create.json
+            gh api "repos/${{ github.repository }}/git/ref/heads/maintenance-state" --jq .object.sha >/dev/null
+          fi
+          sha=$(gh api "repos/${{ github.repository }}/contents/maintenance/state.json?ref=maintenance-state" --jq .sha 2>file.err || true)
+          if [ ! -s file.err ] && [ -n "$sha" ]; then
+            echo "updating existing state file (sha $sha)"
             gh api -X PUT "repos/${{ github.repository }}/contents/maintenance/state.json" \
               -f message="$msg" -f content="$content" -f sha="$sha" \
               -f branch="maintenance-state" > /dev/null
-          else
-            base=$(gh api "repos/${{ github.repository }}/git/refs/heads/${{ github.ref_name }}" --jq .object.sha)
-            gh api -X POST "repos/${{ github.repository }}/git/refs" \
-              -f ref="refs/heads/maintenance-state" -f sha="$base" > /dev/null 2>&1 || true
+          elif grep -qiE 'Not Found' file.err 2>/dev/null; then
+            echo "creating initial state file"
             gh api -X PUT "repos/${{ github.repository }}/contents/maintenance/state.json" \
               -f message="$msg" -f content="$content" \
               -f branch="maintenance-state" > /dev/null
+          else
+            echo "::error::state file probe failed: $(tail -2 file.err)"; exit 1
           fi
           echo "state pushed"
 

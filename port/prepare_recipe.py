@@ -88,11 +88,22 @@ def align_versions(text: str, termux_dir: Path) -> tuple[str, list]:
     ht = host_tools_version(termux_dir)
     if ht is None:
         return text, notes
-    cur = re.search(r'^TERMUX_PKG_VERSION=([0-9][0-9.]*)', text, re.M).group(1)
+    # Phase B remediation A: upstream drifted to QUOTED version lines
+    # (TERMUX_PKG_VERSION="156.0.8078.47" at 2af83c387...). Support quoted
+    # and bare forms, preserve the file's own quote style on rewrite, and
+    # raise an explicit RecipeError instead of crashing on None.group(1).
+    ver_re = re.compile(r'^TERMUX_PKG_VERSION=(?:"([0-9][0-9.]*)"|\'([0-9][0-9.]*)\'|([0-9][0-9.]*))', re.M)
+    m = ver_re.search(text)
+    if not m:
+        raise RecipeError("TERMUX_PKG_VERSION line unrecognised in recipe "
+                          "(expected bare or quoted dotted version)")
+    cur = m.group(1) or m.group(2) or m.group(3)
+    quote = '"' if m.group(1) is not None else ("'" if m.group(2) is not None else '')
     if cur == ht:
         return text, notes
     sha = fetch_tarball_sha256(ht)
-    text = re.sub(r'^TERMUX_PKG_VERSION=[0-9][0-9.]*', f"TERMUX_PKG_VERSION={ht}", text, count=1, flags=re.M)
+    text = ver_re.sub(lambda mm: f"TERMUX_PKG_VERSION={quote}{ht}{quote}",
+                      text, count=1)
     text = re.sub(r'^TERMUX_PKG_SHA256=[0-9a-f]+', f"TERMUX_PKG_SHA256={sha}", text, count=1, flags=re.M)
     notes.append(f"aligned clone {cur} -> host-tools {ht} (sha256 from release hashes)")
     return text, notes

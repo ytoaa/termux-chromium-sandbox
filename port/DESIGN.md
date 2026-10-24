@@ -782,7 +782,7 @@ Architecture (single pipeline, no duplicate workflows):
 - `.github/workflows/daily-maintenance.yml` — cron 23 0 * * * (09:23 KST) +
   manual dry-run/approve-retry. Permissions: actions:read, issues:write,
   contents:write (ONLY the Contents-API commit of maintenance/state.json on
-  the orphan `maintenance-state` branch — path+branch hardcoded; branch-
+  the `maintenance-state` branch (regular, bootstrapped from default-branch head; not orphan) — path+branch hardcoded; branch-
   scoped tokens don't exist, flagged for review). Concurrency serializes
   daily runs; the build workflow has its own serial group so
   manual+scheduled builds never overlap (no cancellation of in-flight
@@ -1019,3 +1019,48 @@ Transition plan:
 
 Totals: engine 46/46, static 39/39, integration 25/25, revision 4/4,
 harness 46/46. Verdict: GO (see final report).
+
+### Phase B (first real build, run 40098664387) + Remediation
+
+Real dispatch (dry_run=false) executed the pipeline end-to-end for the
+first time: evaluate seeded state, decided BUILD `156.0.8078.47-2`
+(sig fec82d2d32ef91de; termux drifted to 2af83c387...), TERMUX_SANDBOXED_
+REVISION=2 propagated correctly, gate job PASS, called build died at
+prepare (40s). Outcome behaved EXACTLY as designed: failure classified
+unknown (fail-closed), Issue #2 created with full sig + labels, blocked,
+no candidate, validated 156 untouched; follow-up dry-run re-decided
+`skip / open-issue-exists` proving durable duplicate protection even with
+the state branch never created (push had failed). Verdict was NO-GO on
+three concrete defects, all remediated here with minimal scope:
+
+A  Real upstream drift: at 2af83c387 chromium/build.sh uses QUOTED
+   TERMUX_PKG_VERSION="156.0.8078.47"; align_versions' bare-only regex hit
+   None.group(1). Now parses bare/double/single quotes, preserves the
+   file's quote style on rewrite (lambda replacement keeps surrounding
+   characters), raises RecipeError on unrecognised shapes, and is tested
+   against the REAL recipes at 2af83c387 pinned as fixtures
+   (port/tests/fixtures/real_*_2af83c3), including align-to-host-tools,
+   SHA256 swap from mocked release hashes, revision-2 injection on the
+   quoted file, and bash -n. Source SHA256/patch contracts untouched.
+B  issues.json guard now typed (`if type=="object"...`) — normal arrays
+   (empty or populated) parse cleanly; only the error object fails closed
+   (tests B:*).
+C  State-push bootstrap is honest: branch probe distinguishes legit
+   404-absent from real API errors (both logged), POST git/refs errors
+   are NOT swallowed (`> ref-create.json` kept), existence is re-verified
+   before any PUT, and create-file vs update-file are separate explicit
+   paths with a loud probe-failure branch. maintenance-state documented
+   as what it actually is: a REGULAR branch from the default-branch head,
+   not an orphan (README/workflow text corrected).
+D  Called-workflow jobs are named '<caller job> / <called job>' (observed:
+   'Reusable build (only when decided) / build'). The split-at-space
+   parser saw 'Reusable' -> stage unknown + log unavailable. Now extracts
+   the segment after the LAST '/', ltrim-str, then split-space; job id
+   comes from the same filtered set; log-download failures record the
+   actual gh/HTTP stderr plus job id (never silent). Fixture uses the
+   REAL names from run 40098664387 (tests D1-D3); unknown-still-blocks
+   policy retained.
+
+Test totals after remediation: engine 46/46, static 43/43 (s40-s43 new),
+integration 25/25, recipe/fixtures/classify 10/10, revision 4/4,
+harness 47/47. NO new real build was executed during remediation.

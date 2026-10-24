@@ -329,8 +329,8 @@ python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS
   || fail "[35] maintenance engine scenarios"
 
 # [36] Round 15 workflow/seed static verification.
-python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=39 FAIL=0$' \
-  && pass "[36] maintenance static workflow+seed 39/39" \
+python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=43 FAIL=0$' \
+  && pass "[36] maintenance static workflow+seed 43/43" \
   || fail "[36] maintenance static checks"
 
 # [37] TERMUX_PKG_REVISION injection behavior (default-off reproducibility).
@@ -344,5 +344,10 @@ fi
 python3 "port/tests/maintenance_integration_test.py" 2>&1 | grep -q '^MAINTENANCE-INTEGRATION PASS=25 FAIL=0$' \
   && pass "[38] maintenance integration simulation 25/25" \
   || fail "[38] maintenance integration simulation"
+
+# [39] Phase B remediation: real-recipe fixtures + typed issues guard + called-job classification.
+bash "port/tests/maintenance_recipe_test.sh" 2>&1 | tail -1 | grep -q '^RECIPE-CLASSIFY-TESTS RC=0$' \
+  && pass "[39] recipe/fixtures/classify suite (A/B/D)" \
+  || fail "[39] recipe/fixtures/classify suite"
 
 exit $rc
