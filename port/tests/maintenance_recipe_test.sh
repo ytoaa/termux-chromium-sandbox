@@ -140,5 +140,56 @@ print('B-cases ok')
 PY
 [ $RC -eq 0 ] && ok "B-parser" || true
 
+# [C*] bash-comment boundary cases (Phase B final parser hardening):
+# parser verdicts must agree with how BASH actually assigns the value.
+python3 - <<'PY' || bad C-cases crash
+import subprocess, sys
+sys.path.insert(0,'port')
+import prepare_recipe as P
+cases=[
+ ('TERMUX_PKG_VERSION=1.2.3',               '1.2.3', True),
+ ('TERMUX_PKG_VERSION="1.2.3"',             '1.2.3', True),
+ ("TERMUX_PKG_VERSION='1.2.3'",             '1.2.3', True),
+ ('TERMUX_PKG_VERSION=1.2.3 #comment',      '1.2.3', True),
+ ('TERMUX_PKG_VERSION="1.2.3" #comment',    '1.2.3', True),
+ ('TERMUX_PKG_VERSION=1.2.3\t#comment',    '1.2.3', True),
+ ('TERMUX_PKG_VERSION=1.2.3#junk',          None,    False),
+ ('TERMUX_PKG_VERSION="1.2.3"#junk',        None,    False),
+ ("TERMUX_PKG_VERSION='1.2.3'#junk",        None,    False),
+ ('TERMUX_PKG_VERSION=1.2.3junk',           None,    False),
+]
+for src, want_ver, want_ok in cases:
+    got = P.parse_version_line(src)
+    if want_ok:
+        assert got and got[0] == want_ver, (src, got)
+    else:
+        assert got is None, (src, got)
+    # empirical BASH comparison: what value does bash itself assign?
+    r = subprocess.run(['bash','-c', src + '\nprintf %s "$TERMUX_PKG_VERSION"'],
+                       capture_output=True, text=True)
+    bash_val = r.stdout
+    if want_ok:
+        assert bash_val == want_ver, (src, 'bash=', bash_val)
+    else:
+        # parser must refuse anything whose bash value is NOT a clean dotted version
+        import re as _re
+        assert not _re.fullmatch(r'[0-9]+(\.[0-9]+)*', bash_val), (src, 'bash accepted!', bash_val)
+# comment preserved after alignment rewrite (quote style + trailing)
+new = P.VER_STRICT.sub(lambda m: 'TERMUX_PKG_VERSION={0}{1}{0}{2}'.format('"','9.9.9.9',m.group(4)),
+                       'TERMUX_PKG_VERSION="1.2.3"  # keepme', count=1)
+assert new == 'TERMUX_PKG_VERSION="9.9.9.9"  # keepme', new
+# abnormal recipe -> RecipeError; abnormal host-tools -> None
+import pathlib, tempfile
+d = pathlib.Path(tempfile.mkdtemp()); (d/'x11-packages/chromium-host-tools').mkdir(parents=True)
+(d/'x11-packages/chromium-host-tools/build.sh').write_text('TERMUX_PKG_VERSION="1.2.3"\n')
+try:
+    P.align_versions('TERMUX_PKG_VERSION=1.2.3#junk\n', d); raise SystemExit('accepted junk-comment!')
+except P.RecipeError: pass
+(d/'x11-packages/chromium-host-tools/build.sh').write_text('TERMUX_PKG_VERSION="1.2.3"#junk\n')
+assert P.host_tools_version(d) is None
+print('C-cases ok (10 + bash-parity + preserve + errors)')
+PY
+[ $RC -eq 0 ] && ok "C-boundary" || true
+
 echo "RECIPE-CLASSIFY-TESTS RC=$RC"
 exit $RC

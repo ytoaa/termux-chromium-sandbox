@@ -86,7 +86,7 @@ VER_STRICT = re.compile(
     r"^[ \t]*TERMUX_PKG_VERSION="
     r"(?:\"([0-9]+(?:\.[0-9]+)*)\"|'([0-9]+(?:\.[0-9]+)*)'"
     r"|([0-9]+(?:\.[0-9]+)*))"
-    r"([ \t]*(?:#.*)?)$", re.M)
+    r"([ \t]+#.*|[ \t]*)$", re.M)
 
 
 def parse_version_line(text: str):

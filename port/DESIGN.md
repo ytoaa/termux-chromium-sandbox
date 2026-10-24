@@ -1090,3 +1090,19 @@ Harness after hardening: engine 46/46, static 43/43 (s40 strengthened),
 integration 25/25, recipe/classify 11/11, revision 4/4, harness 47/47,
 CI selftest green. No real build executed; Issue #2 blocked; validated
 156 intact. Verdict: GO for the single non-dry-run Phase B revalidation.
+
+### Phase B final parser boundary (bash comment parity)
+
+VER_STRICT trailing group was `([ \t]*(?:#.*)?)$` — accepted `#junk`
+WITHOUT preceding whitespace. Bash reality (empirically checked):
+`VAR=1.2.3#junk`, `VAR="1.2.3"#junk`, `VAR='1.2.3'#junk` all assign the
+JUNK-CONTAINING value `1.2.3#junk` — the parser partially matching them
+as 1.2.3 violated fail-closed/bash-parity. Fixed to
+`([ \t]+#.*|[ \t]*)$`: a comment requires >=1 whitespace before '#';
+bare/quoted forms and legitimate ' #comment' / '\t#comment' trailers
+still pass (and are preserved verbatim through alignment rewrites, group
+4 unchanged); `=1.2.3junk` remains rejected. New C-boundary suite (13
+PASS total): 10-case table (accept/reject) + per-case EMPIRICAL bash
+assignment comparison (reject set must never be a clean dotted value in
+bash) + comment-preservation rewrite + recipe RecipeError / host-tools
+None. No other logic touched.
