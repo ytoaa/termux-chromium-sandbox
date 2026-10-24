@@ -68,7 +68,7 @@ jobs:
                --jq .content > state.b64 2>"$err"; then
             base64 -d state.b64 > state.json
             echo "STATE_SOURCE=branch" >> "$GITHUB_ENV"
-          elif grep -qi 'Not Found' "$err"; then
+          elif grep -qiE "Not Found|No commit found for the ref" "$err"; then
             cp maintenance/state.seed.json state.json
             echo "STATE_SOURCE=seed (first run, branch/file absent)" >> "$GITHUB_ENV"
           else
