@@ -160,6 +160,7 @@ jobs:
       - name: Classify called-build result
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           res="${{ needs.build.result }}"
@@ -195,8 +196,6 @@ jobs:
               echo '{"success":false,"stage":"verify","log_tail":"build reported success but no deb outputs present","ci_run":0,"ci_url":""}' > result.json
             fi
           fi
-        env:
-          CI_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
       - name: Apply result to state
         run: |
