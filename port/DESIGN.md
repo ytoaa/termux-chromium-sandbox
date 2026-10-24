@@ -708,3 +708,65 @@ runs. pkill/self-match discipline upheld via script-file cleanup.
 Round 12.1 verdict: items 1-4 CLOSED PASS, item 5 NOT_VERIFIED (structural,
 non-root). NOT_VERIFIED ledger shrinks to: LMK visibility only. Promotion
 recommendation updated in final report; nothing promoted here.
+
+## Round 14 — real-world compatibility & default-enablement fitness (2026-10-24, #31 artifact, no rebuild)
+
+Fixed inputs re-verified pre-run (deb sha256 29c4080d..., ledger 0f0d728).
+Main extract-only (A 15m / B 30m / C 30m / D 60m + supplementary B'/D' 15m
+with fixed injector); testbed dpkg install -> D30 -> purge (residual 0,
+dpkg -V clean); live PulseAudio never touched on either device (isolated
+second instance with null-sink used for alt-socket E2E, own pidfile kill).
+
+Stability (all 6 main phases + TB D30): residuals 0, CRASHING 0,
+Received-SIGSYS 0, 'restarting service' 0, PA-context refused 0 everywhere.
+ACT-scoped BPF rows: violations 0 (D: 635+ rows filters=2 nnp=1 pattern
+reproduced); network-utility cmdlines attest --enable-features propagation
+(B: NetworkServiceSandbox; D: both).
+
+Network compatibility (B/D): HTTP/1.1 local incl. 302->target (8), slow
+streamed body, chunked 15s long-connection completed; WebSocket sustained
+(WS_OK 14954@D60) + netflap (both servers down 60s) -> OPEN storm + full
+reconnect, audio unaffected (AUDIO_PLAY 148 vs baseline 140); Service
+Worker registered + 51-62 intercepted fetch hits; cookie persist + cache
+304 sequence (http-origin required: file:// origin blocks SW/cookies/CORS —
+a harness design lesson, symmetric across A-D, not a sandbox effect);
+downloads via browser download manager during audio: 2x13MB SHA256 match
+(main D) + 2x (supp D'); HTTPS external OK (YouTube T5 x11, AAC x14).
+Tiering: HTTP/2 attested server-side (curl ALPN=2) + pages loaded in
+chrome (client negotiation NOT_VERIFIED — netlog out of scope); HTTP/3
+path available (curl h3 OK) but chrome-side use NOT_VERIFIED; IPv6
+unreachable on this network (curl -6 fail) -> NOT_VERIFIED (environment).
+
+Audio compatibility (C/D + TB): formats page Opus 4131 plays + VPX 23
+(FMT_ERR 20 transient); 3 concurrent streams owner = sandboxed utility
+(30710 in ACT, filters=2); owner-in-ACT on every audio-bearing phase
+(29581/22411/5396/27200); pause/resume+tab churn sustained; clip-end ->
+new stream recreation proven via netflap & injector cycles.
+Wrapper PA branches on testbed 7/7 (B1 prefix-socket export, B2 XDG
+preferred, B3 prefix fallback, B4 tcp kept, B5 EMPTY kept, B6 no-socket
+no-op, B7 custom kept; LD_PRELOAD intact in all). E2E against ISOLATED
+second PA (null-sink r14alt, auth-anonymous, own pidfile): user-specified
+non-standard socket -> AUDIBLE (rms 2893 on r14alt.monitor) and sink-input
+client pid = sandboxed utility (188x != browser) -> fallback excluded.
+Bad-socket injection: expected failure (1 refused, browser alive, no
+crash/restart) — classified distinct from normal-env regression.
+
+Resources: main-run RSS rose monotonically (A 0.35G/min ~= D 0.29G/min,
+same rate, up to 17.8G/188 live renderers) -> traced to UNCAPPED injector
+tab churn + Chromium idle-renderer pool, NOT sandbox: after injector cap
+(<=8 tabs) identical D workload PLATEAUS at 2.0-2.7GB (supp D'). FD and
+cpu trends stable; no LMK observation channel (NOT_VERIFIED standing).
+
+Performance: same-workload dcl medians B' 81 vs D' 131.5 ms (n=4) and
+main B 73.5 vs D 152 (n=24) — audio sandbox correlated with +~50-80ms
+page-load dcl at heavy concurrent load; small-n, no UX jank observed;
+marked 'observed, precision insufficient', NOT a defect claim. Audio
+output latency field not collected (NOT_VERIFIED).
+
+Open observations (non-blocking): (1) WS-close storm occurred in main B
+and D runs (227k/245k lines) but B' rerun was clean (0) — 3/4 net-sandbox
+phases + C clean -> transient tool/environment event; root cause not
+closed, reproduction conditions unknown (ws server stderr was discarded
+in main runs — recorded as measurement gap).
+
+Verdict inputs are in FINAL REPORT; nothing promoted, no defaults changed.
