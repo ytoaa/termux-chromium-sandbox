@@ -202,6 +202,6 @@ jobs:
             echo "### Maintenance outcome"
             echo "- action/reason: \`${{ steps.decide.outputs.action }} — ${{ steps.decide.outputs.reason }}\`"
             echo "- dry_run: \`${{ inputs.dry_run }}\` approve_retry: \`${{ inputs.approve_retry }}\`"
-            [ -f result.json ] && echo "- result: \`$(jq -c '{success,stage}' result.json)\`"
-            [ -f ops.json ] && echo "- issues created: $(jq '.create_issues|length' ops.json), comments: $(jq '.comment_issues|length' ops.json)"
+            if [ -f result.json ]; then echo "- result: \`$(jq -c '{success,stage}' result.json)\`"; fi
+            if [ -f ops.json ]; then echo "- issues created: $(jq '.create_issues|length' ops.json), comments: $(jq '.comment_issues|length' ops.json)"; fi
           } >> "$GITHUB_STEP_SUMMARY"
