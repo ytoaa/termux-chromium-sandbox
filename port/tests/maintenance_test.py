@@ -18,7 +18,8 @@ def base_state():
         'status':'BUILD_VERIFIED_CANDIDATE','validated':True},
       'candidates': [], 'blocked': {}, 'history': []}
 
-def probes(version='156.0.8078.47', recipe_sha='R1', host_sha='H1', head='64e02760', errs=None, cksum=True, host_version=None):
+T40='ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12'
+def probes(version='156.0.8078.47', recipe_sha='R1', host_sha='H1', head=T40, errs=None, cksum=True, host_version=None):
     hv = host_version or version
     return {'official_stable':version,'termux_head':head,'pins_verified':cksum and bool(version and hv),'fetch_errors':errs or [],
             'recipe':{'version':version,'host_version':hv,'recipe_sha':recipe_sha,'host_sha':host_sha,'revision':0,'distro_version':version}}
@@ -78,10 +79,10 @@ check('[m7] checksum-fail-closed', pl['action']=='skip' and pl['reason']=='sourc
 # [8] success -> candidate recorded, validated untouched
 pl=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
 GOOD_OK={'success':True,'stage':'ok','deb_sha256':'a'*64,
-         'deb_version':'157.0.100.5','termux_sha':'b'*40,
+         'deb_version':'157.0.100.5','termux_sha':T40,
          'ci_url':'https://github.com/o/r/actions/runs/99','ci_run':99,'artifact':'build-99'}
 st5,ops5=M.apply_result(s,pl,dict(GOOD_OK),'t')
-check('[8a] candidate recorded (full fields)', st5['candidates'][-1]['deb_sha256']=='a'*64 and st5['candidates'][-1]['status']=='BUILD_VERIFIED_CANDIDATE' and st5['candidates'][-1]['ci_run']==99 and st5['candidates'][-1]['artifact']=='build-99' and st5['candidates'][-1]['termux_sha']=='b'*40)
+check('[8a] candidate recorded (full fields)', st5['candidates'][-1]['deb_sha256']=='a'*64 and st5['candidates'][-1]['status']=='BUILD_VERIFIED_CANDIDATE' and st5['candidates'][-1]['ci_run']==99 and st5['candidates'][-1]['artifact']=='build-99' and st5['candidates'][-1]['termux_sha']==T40)
 check('[8b] last_successful updated', st5['last_successful_build']['upstream_version']=='157.0.100.5')
 check('[8c] validated untouched', st5['validated']==s['validated'])
 check('[8d] never claims validated', st5['candidates'][-1]['validated'] is False)
@@ -152,7 +153,7 @@ check('[18b] skipped-anomaly -> no block no issue', len(opsx['create_issues'])==
 
 # --- Round 15.2 cases ---
 GOOD={'success':True,'stage':'ok','deb_sha256':'c'*64,'deb_version':'157.0.100.5',
-      'termux_sha':'d'*40,'ci_url':'https://x/runs/9','ci_run':9,'artifact':'build-9'}
+      'termux_sha':T40,'ci_url':'https://x/runs/9','ci_run':9,'artifact':'build-9'}
 plG=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
 stb,opsb=M.apply_result(s,plG,{**GOOD,'deb_sha256':'not-a-sha'},'t')
 check('[19a] bad sha -> verify block + issue', (list(stb['blocked'].values())[0]['stage']=='verify' or 'verify' in str(stb['blocked'])) and len(opsb['create_issues'])==1 and not stb['candidates'])
@@ -194,5 +195,24 @@ st23b,_=M.apply_result(st23,pl23,{'success':False,'stage':'build','log_tail':'x'
 sig23=M.build_signature('157.0.100.5','R2','H2','PORT-A')
 check('[23b] re-link persisted', st23b['blocked'].get(sig23,{}).get('issue')==9)
 
+# [24] success with FOREIGN termux sha -> verify (never a candidate)
+plX=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
+stX,opsX=M.apply_result(s,plX,{**GOOD,'termux_sha':'0'*40},'t')
+check('[24] foreign termux sha blocked', (not stX['candidates'] or stX['candidates'][-1].get('deb_sha256')!='c'*64) and list(stX['blocked'].values())[0]['stage']=='verify')
+# [25] unrecognized stage string -> unknown -> blocks (fail closed)
+stY,opsY=M.apply_result(s,plX,{'success':False,'stage':'banana','log_tail':'x','ci_run':1,'ci_url':'https://x'},'t')
+check('[25] bad stage -> unknown blocks+issue', list(stY['blocked'].values())[0]['classification']=='unknown' and len(opsY['create_issues'])==1)
+# [26] serialized approval survives JSON round-trip and is consumed
+import tempfile, os as _os
+stB=copy.deepcopy(s); sigB=M.build_signature('157.0.100.5','R2','H2','PORT-A')
+stB['blocked'][sigB]={'classification':'port','issue':11,'retry_approved':False,
+    'inputs':{'recipe_sha':'R2','host_sha':'H2','port_sha':'PORT-A'}}
+planA=M.decide(stB,probes('157.0.100.5','R2','H2'),'PORT-A','t',
+               [{'number':11,'title':M.issue_title({'upstream_version':'157.0.100.5','revision':1,'signature':M.build_signature('157.0.100.5','R2','H2','PORT-A')},'gate'),'labels':['auto-build-blocked','retry-approved']}],None)
+ser=json.loads(json.dumps(planA))
+check('[26] approval origin in serialized plan', ser.get('approval',{}).get('issue')==11)
+stA,_=M.apply_result(stB,ser,{'success':False,'stage':'gate','log_tail':'x','ci_run':1,'ci_url':'https://x'},'t')
+entA=list(stA['blocked'].values())[0]
+check('[26b] consumed via serialized plan only', entA['retry_approved'] is False and 11 in (entA.get('approval_consumed_issues') or []))
 print(f'MAINTENANCE-TESTS PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)

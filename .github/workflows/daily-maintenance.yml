@@ -50,6 +50,7 @@ jobs:
       action: ${{ steps.decide.outputs.action }}
       reason: ${{ steps.decide.outputs.reason }}
       target: ${{ steps.decide.outputs.target }}
+      relink: ${{ steps.decide.outputs.relink }}
     steps:
       - uses: actions/checkout@v7
 
@@ -118,6 +119,7 @@ jobs:
           echo "action=$(python3 -c "import json;print(json.load(open('plan.json'))['action'])")" >> "$GITHUB_OUTPUT"
           echo "reason=$(python3 -c "import json;print(json.load(open('plan.json'))['reason'])")" >> "$GITHUB_OUTPUT"
           echo "target=$(python3 -c "import json;print(json.dumps((json.load(open('plan.json')).get('target') or {})))")" >> "$GITHUB_OUTPUT"
+          echo "relink=$(python3 -c "import json;print('true' if json.load(open('plan.json')).get('relink') else 'false')")" >> "$GITHUB_OUTPUT"
           { echo "### Maintenance plan"; echo '```json'; cat plan.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
@@ -142,8 +144,11 @@ jobs:
     name: Classify outcome + issues + state
     needs: [evaluate, build]
     # always(): collect failures AND cancellations of the called build.
+    # Round 15.3 #2: also run for relink-only repairs (no build performed).
     if: always() && needs.evaluate.result == 'success'
-        && needs.evaluate.outputs.action == 'build' && inputs.dry_run != true
+        && (needs.evaluate.outputs.action == 'build'
+            || needs.evaluate.outputs.relink == 'true')
+        && inputs.dry_run != true
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
@@ -190,7 +195,7 @@ jobs:
               # Round 15.2 #2: ALWAYS produce result.json on failure paths,
               # preserving failed job names, stage, log excerpt, run url.
               jobs_json=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '[.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | {name,conclusion}]' || echo '[]')
-              failed_names=$(echo "$jobs_json" | jq -r '[.[].name] | join(",")')
+              failed_names=$(echo "$jobs_json" | jq -r '[.[].name | split(" ")[0]] | join(",")')
               stage=unknown
               echo "$failed_names" | grep -qw 'gate' && stage=gate || true
               echo "$failed_names" | grep -qw 'build' && stage=build || true

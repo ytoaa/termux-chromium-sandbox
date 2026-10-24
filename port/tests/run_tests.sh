@@ -324,13 +324,13 @@ BODY=$(sed -n '/cat > "\$_wrap" <<.SHIMWRAP./,/^SHIMWRAP$/p' "$G32")
   || fail "[34] R9b forbidden token in wrapper"
 
 # [35] Round 15 maintenance engine scenario tests (offline, mocked).
-python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS=42 FAIL=0$' \
-  && pass "[35] maintenance engine 42/42 scenarios" \
+python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS=46 FAIL=0$' \
+  && pass "[35] maintenance engine 46/46 scenarios" \
   || fail "[35] maintenance engine scenarios"
 
 # [36] Round 15 workflow/seed static verification.
-python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=34 FAIL=0$' \
-  && pass "[36] maintenance static workflow+seed 34/34" \
+python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=36 FAIL=0$' \
+  && pass "[36] maintenance static workflow+seed 36/36" \
   || fail "[36] maintenance static checks"
 
 # [37] TERMUX_PKG_REVISION injection behavior (default-off reproducibility).
@@ -339,5 +339,10 @@ if bash "port/tests/maintenance_revision_test.sh" 2>&1 | grep -c '^PASS  \[37' |
 else
   fail "[37] revision injection suite"
 fi
+
+# [38] Round 15.3 Actions-equivalent integration simulation (file round-trips).
+python3 "port/tests/maintenance_integration_test.py" 2>&1 | grep -q '^MAINTENANCE-INTEGRATION PASS=13 FAIL=0$' \
+  && pass "[38] maintenance integration simulation 13/13" \
+  || fail "[38] maintenance integration simulation"
 
 exit $rc

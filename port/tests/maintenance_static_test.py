@@ -99,5 +99,10 @@ for _jn,_j in dw['jobs'].items():
             _ok=False; _bad.append(f'{_jn}#{_i}:{_c.stderr.strip()[:80]}')
         os.unlink(_p)
 check('[s34] all run-blocks pass bash -n (expressions substituted)', _ok, str(_bad))
+check('[s35] relink-only repair path wired (evaluate output + outcome if)',
+      'relink' in _dwj['evaluate']['outputs'] and 'relink' in _dwj['outcome']['if']
+      and "relink == 'true'" in _dwj['outcome']['if'])
+check('[s36] failed job names prefix-normalized (split at space)',
+      _dwt.count('split') > 0 and ('" ")[0]' in _dwt))
 print(f'MAINTENANCE-STATIC PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)

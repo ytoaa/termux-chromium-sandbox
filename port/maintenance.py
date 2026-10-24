@@ -137,7 +137,15 @@ def cmd_fetch(args) -> int:
 
 # --------------------------------------------------------------- decide ----
 
+ALLOWED_STAGES = ('gate', 'build', 'verify', 'unknown', 'ok', 'cancelled',
+                  'skipped-anomaly')
+
+
 def classify_failure(stage: str, log_tail: str) -> str:
+    # Round 15.3 #3: an unrecognized stage string from any producer is
+    # treated as unknown (which BLOCKS) — never silently passed through.
+    if stage not in ALLOWED_STAGES:
+        stage = 'unknown'
     t = (log_tail or '').lower()
     if any(k in t for k in TRANSIENT):
         return 'infra'
@@ -158,7 +166,7 @@ def issue_title(target: dict, reason: str) -> str:
 
 
 def render_issue(target: dict, probes: dict, last: dict, stage: str,
-                 log_tail: str, run_url: str) -> str:
+                 log_tail: str, run_url: str, failure_jobs: str = '') -> str:
     return '\n'.join([
         '## Auto-build blocked — manual investigation required',
         '',
@@ -168,7 +176,7 @@ def render_issue(target: dict, probes: dict, last: dict, stage: str,
         f" (revision {target['revision']})",
         f"- Port SHA: `{target['port_sha']}`  Termux pinned SHA: `{target['termux_ref']}`",
         f"- Build signature: `{target['signature']}`  Failure stage: `{stage}`"
-        + (f"  Failed jobs: `{(target.get('failure_jobs') or '')}`" if target.get('failure_jobs') else ''),
+        + (f"  Failed jobs: `{failure_jobs}`" if failure_jobs else ''),
         f"- Last successful build: `{last.get('upstream_version')}-r{last.get('revision')}`"
         f" (CI run {last.get('ci_run')}, deb sha256 `{str(last.get('deb_sha256'))[:16]}…`)",
         '- Validated baseline: untouched (port.toml [port] last_validated_*).',
@@ -289,13 +297,19 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
                     issue_matches_sig(i.get('title', ''), sig) and \
                     i.get('number') not in consumed:
                 blocked['retry_approved'] = True
-                blocked['_approval_source_issue'] = i.get('number')
+                # Round 15.3 #1: the approval ORIGIN must survive
+                # serialization — outcome re-reads the ORIGINAL state.json,
+                # so memory-only markers would never be consumed.
+                plan['approval'] = {'issue': i.get('number'),
+                                    'signature': sig}
                 diag.append('retry-approved LABEL on issue '
                             f'{i.get("number")} — ONE attempt (will be consumed)')
                 break
     if blocked:
         if blocked.get('retry_approved'):
             plan['approval_used'] = True
+            plan.setdefault('approval', {'issue': 'dispatch',
+                                         'signature': sig})
             diag.append('retry-approved observed — one attempt allowed '
                         '(consumed by the following apply)')
         elif blocked.get('classification') == 'infra' and \
@@ -406,6 +420,12 @@ def apply_result(state: dict, plan: dict, result: dict, now: str):
                         + '\n'.join(problems) + '\n' + (log_tail or ''))
             result = dict(result or {})
             result['log_tail'] = log_tail
+    if ok and str(result.get('termux_sha') or '') != str(t.get('termux_ref') or ''):
+        ok = False
+        stage = 'verify'
+        log_tail = ('termux_sha mismatch: result '
+                    f'{result.get("termux_sha")!r} != pinned target '
+                    f'{t.get("termux_ref")!r}\n' + (log_tail or ''))
     if ok:
         cand = dict(t)
         cand.update({'status': 'BUILD_VERIFIED_CANDIDATE',
@@ -415,6 +435,9 @@ def apply_result(state: dict, plan: dict, result: dict, now: str):
                      'ci_run': result.get('ci_run'),
                      'ci_url': result.get('ci_url'),
                      'artifact': result.get('artifact'),
+                     # Round 15.3 #3: artifact existence is confirmed by the
+                     # device-gate fetch step (human), never claimed here.
+                     'artifact_verified': False,
                      'recorded_at': now,
                      'validated': False})
         st['candidates'] = (st['candidates'] + [cand])[-20:]
@@ -433,11 +456,10 @@ def apply_result(state: dict, plan: dict, result: dict, now: str):
     prev = st['blocked'].get(t['signature']) or {}
     # Round 15.2 #4: any attempt that ran under an approval consumes it.
     consumed_list = list(prev.get('approval_consumed_issues') or [])
-    if plan.get('approval_used'):
-        src = (prev.get('_approval_source_issue')
-               or (state.get('blocked') or {}).get(t['signature'], {})
-                   .get('_approval_source_issue'))
-        if src is not None and src not in consumed_list:
+    appr = plan.get('approval') or {}
+    if plan.get('approval_used') or appr:
+        src = appr.get('issue')
+        if isinstance(src, int) and src not in consumed_list:
             consumed_list.append(src)
     if prev.get('retry_approved') or plan.get('approval_used'):
         prev = dict(prev)
@@ -472,7 +494,8 @@ def apply_result(state: dict, plan: dict, result: dict, now: str):
             'body': render_issue(t, plan.get('probes') or {},
                                  state.get('last_successful_build') or {},
                                  stage, log_tail,
-                                 result.get('ci_url') or '(link unavailable)')})
+                                 result.get('ci_url') or '(link unavailable)',
+                                 failure_jobs=str(result.get('failure_jobs') or ''))})
     else:
         ops['comment_issues'].append({
             'issue': prev['issue'],

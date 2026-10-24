@@ -927,3 +927,38 @@ Merge prerequisites (owner actions, separate approvals):
 Tests: engine 42/42 (19-23 new + 11a2), static 34/34 (s34 = every run:
 block passes bash -n with expressions substituted), revision 4/4, full
 harness 45/45. Still zero long builds; dry-run dispatch re-verified parse.
+
+### Round 15.3 — real state-transfer-path fixes (review of 98e6581)
+
+1. Approval one-shot survives SERIALIZATION: decide no longer keeps the
+   origin in memory only — it writes plan.approval={issue,signature} into
+   plan.json; apply consumes using ONLY the deserialized plan + the
+   ORIGINAL state.json (what the outcome job really reads). A surviving
+   label can never authorize a second attempt (integration iA1-4 across
+   simulated days).
+2. Relink-only repair path executes: evaluate exposes a `relink` output and
+   the outcome job runs for `action==build OR relink==true` (never on
+   dry_run). Relink performs ZERO builds and ZERO issue creations while
+   persisting the issue re-attachment to maintenance-state (iB1-3),
+   repairing the ledger after a state-push loss; the following day's decide
+   keeps skipping from the repaired state.
+3. Failed job names now reach the Issue body (render_issue receives
+   result.failure_jobs — previously read from the wrong dict) with prefix-
+   tolerant normalization (name split at first space; grep -qw), asserted
+   with EXACT substrings (iC1) instead of the old weak stage-substring
+   check. Success validation additionally requires result.termux_sha to
+   equal the PINNED target.termux_ref — a success built from a different
+   source SHA is downgraded to verify (blocked + issue, iD1); candidates
+   carry artifact_verified=false (existence confirmation belongs to the
+   human device-gate fetch, never auto-claimed). classify_failure
+   whitelists stages — any unrecognized stage string becomes 'unknown'
+   and BLOCKS.
+4. Integration simulation (port/tests/maintenance_integration_test.py)
+   mirrors the Actions dataflow EXACTLY: engine invoked via CLI
+   (subprocess), state/plan/issues/running/result as FILES on disk, every
+   step re-reading from disk (never reusing decide's memory) — covering
+   approved-retry-then-block across days, lost-state relink with zero
+   builds, failure job names in bodies, foreign-termux-sha success
+   rejection, busy/issues-error regressions: 13/13.
+Totals: engine 46/46, static 36/36 (s35 relink wiring, s36 prefix
+normalization), revision 4/4, integration 13/13, harness 46/46.
