@@ -26,6 +26,16 @@ and invites a PR. This project is that attempt.
   (`155.0.8059.84`, sha256 `4e7dce52…dbe820a`, X11 DEVICE GATE PASS
   2026-10-22, 6 renderer activations, codecs 5/5, 7 children filters=2) is
   preserved in `port/port.toml gates.device_gate_history`.
+- **Maintenance automation (Round 15, PR #1 — pending merge, currently
+  inert):** daily probe (Chromium Stable vs Termux recipe pins) -> build
+  decision engine (`port/maintenance.py`, offline/mock-tested) -> reuses the
+  existing build workflow via `workflow_call` (all invariants preserved) ->
+  candidate ledger on the `maintenance-state` branch (status
+  BUILD_VERIFIED_CANDIDATE) -> fail-closed GitHub Issues with dedup and
+  retry-gating. Automation NEVER widens policy, NEVER mutates validated,
+  NEVER publishes. Schedule fires only after PR merge (default-branch
+  cron) — merge and activation are separate approvals.
+
 - **Phase 0 — feasibility: PASS** (2026-10-19, device: Android 17 / kernel 6.1 GKI / aarch64)
   - `poc/seccomp_probe.c`: a plain Termux process CAN install its own
     seccomp-bpf filter (`prctl PR_SET_SECCOMP` → `PR_GET_SECCOMP=2`), ALLOW

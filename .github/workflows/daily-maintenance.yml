@@ -1,0 +1,239 @@
+# Round 15 — daily maintenance pipeline: probe upstream, decide, optionally
+# invoke the EXISTING build workflow (workflow_call), record candidate state,
+# open deduplicated block-Issues on failure.
+#
+# Hard invariants (enforced by port/maintenance.py + this file): automation
+# never edits BPF/Broker/syscall policy; never bypasses R1~R9b transforms
+# (build itself is fail-closed); never mutates last_validated_* (validated
+# promotion is a human act on port.toml); never publishes apt/Release; never
+# retries blocked targets without changed inputs or an explicit
+# retry-approved label; unknown failure classes block (fail closed).
+#
+# STATE: maintenance/state.json on orphan branch `maintenance-state`
+# (first run falls back to maintenance/state.seed.json; pushes use
+# GITHUB_TOKEN and therefore cannot self-trigger workflows).
+name: Daily Maintenance
+
+on:
+  schedule:
+    # 00:23 UTC = 09:23 Asia/Seoul. Missed schedules deliver the latest
+    # occurrence only; runs are idempotent per build signature + concurrency.
+    - cron: '23 0 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Probe + decide only (no build, no issue writes, no state push)'
+        type: boolean
+        default: true
+      approve_retry:
+        description: 'Approve one retry of currently blocked signatures (after human review)'
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  issues: write
+  # contents:write is needed ONLY for the Contents-API commit of
+  # maintenance/state.json on the maintenance-state branch (path+branch
+  # hard-coded in the push step). Branch-scoped token perms do not exist;
+  # this minimal grant is flagged for review.
+  contents: write
+
+concurrency:
+  group: daily-maintenance
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    name: Probe -> decide -> (build) -> record
+    runs-on: ubuntu-26.04
+    timeout-minutes: 400
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Probe upstream (Chromium Stable + Termux recipe pins)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 port/maintenance.py fetch --out probes.json --token "${GITHUB_TOKEN}"
+
+      - name: Load state (maintenance-state branch, else seed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${{ github.repository }}/contents/maintenance/state.json?ref=maintenance-state" \
+               --jq .content 2>/dev/null | base64 -d > state.json 2>/dev/null && \
+             python3 -c "import json;json.load(open('state.json'))"; then
+            echo "STATE_SOURCE=branch" >> "$GITHUB_ENV"
+          else
+            cp maintenance/state.seed.json state.json
+            echo "STATE_SOURCE=seed" >> "$GITHUB_ENV"
+          fi
+          python3 - <<'PY'
+          import json
+          d=json.load(open('state.json'))
+          assert 'validated' in d and 'last_successful_build' in d
+          PY
+
+      - name: Load open block-issues + detect in-progress builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/issues?state=open&labels=auto-build-blocked&per_page=100" \
+            --jq '[.[] | {number,title,labels:[.labels[].name]}]' > issues.json 2>/dev/null || echo '[]' > issues.json
+          n=$(gh api "repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=50" \
+              --jq '[.workflow_runs[] | select(.name=="Build Termux Chromium Seccomp Sandbox Port")] | length' 2>/dev/null || echo 0)
+          if [ "$n" != "0" ]; then echo '{"signature":"RUNNING-ANY"}' > running.json; else echo 'null' > running.json; fi
+
+      - name: Decide
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.approve_retry }}" = "true" ]; then
+            python3 - <<'PY'
+          import json
+          s=json.load(open('state.json'))
+          for v in (s.get('blocked') or {}).values():
+              v['retry_approved']=True
+          json.dump(s,open('state.json','w'),indent=1)
+          PY
+          fi
+          python3 port/maintenance.py decide --state state.json --probes probes.json \
+            --out plan.json --issues issues.json --port-sha "${{ github.sha }}" \
+            --now "$(date -u +%FT%TZ)"
+          python3 - <<'PY'
+          import json
+          p=json.load(open('plan.json'))
+          try:
+              run=json.load(open('running.json'))
+          except Exception:
+              run=None
+          if p.get('action')=='build' and run:
+              p['action']='skip'; p['reason']='build-workflow-busy'
+              json.dump(p,open('plan.json','w'),indent=1)
+          PY
+          echo "action=$(python3 -c "import json;print(json.load(open('plan.json'))['action'])")" >> "$GITHUB_OUTPUT"
+          echo "reason=$(python3 -c "import json;print(json.load(open('plan.json'))['reason'])")" >> "$GITHUB_OUTPUT"
+          echo "target=$(python3 -c "import json;print(json.dumps((json.load(open('plan.json')).get('target') or {})))")" >> "$GITHUB_OUTPUT"
+          { echo "### Maintenance plan"; echo '```json'; cat plan.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Call existing build workflow (only when decided)
+        if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
+        id: build
+        uses: ./.github/workflows/build-chromium.yml
+        with:
+          termux_ref: ${{ fromJson(steps.decide.outputs.target).termux_ref }}
+          pkg_revision: ${{ string(fromJson(steps.decide.outputs.target).revision) }}
+
+      - name: Collect outcome
+        if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          success=false; stage=build; : > tail.log
+          if [ "${{ steps.build.outcome }}" = "success" ]; then success=true; stage=ok; fi
+          if [ "$success" = "false" ]; then
+            jobs=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '.jobs[] | "\(.name)|\(.conclusion)"' || true)
+            echo "$jobs" | grep -q '^gate|failure' && stage=gate || true
+            jid=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '.jobs[] | select(.conclusion=="failure") | .id' | tail -1 || true)
+            if [ -n "${jid:-}" ]; then
+              gh api "repos/${{ github.repository }}/actions/jobs/$jid/logs" 2>/dev/null | tail -c 4000 > tail.log || echo "log unavailable" > tail.log
+            fi
+          fi
+          jq -n --argjson ok "$success" --arg stage "$stage" --rawfile tail tail.log \
+            --arg url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{success:$ok, stage:$stage, log_tail:$tail, ci_url:$url, ci_run:($ENV.GITHUB_RUN_ID|tonumber)}' > result.json
+          if [ "$success" = "true" ]; then
+            jq --arg d "${{ steps.build.outputs.deb_sha256 }}" \
+               --arg v "${{ steps.build.outputs.deb_version }}" \
+               --arg t "${{ steps.build.outputs.termux_sha }}" \
+               '. + {deb_sha256:$d, deb_version:$v, termux_sha:$t, artifact:("build-"+(env.GITHUB_RUN_ID))}' \
+               result.json > r2.json && mv r2.json result.json
+            if [ -z "$(jq -r '.deb_sha256 // ""' result.json)" ]; then
+              echo '{"success":false,"stage":"verify","log_tail":"build reported success but no deb outputs present","ci_run":0,"ci_url":""}' > result.json
+            fi
+          fi
+
+      - name: Apply result to state + emit issue ops
+        if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          [ -f result.json ] || echo '{"success":false,"stage":"build","log_tail":"no result collected","ci_run":0,"ci_url":""}' > result.json
+          python3 port/maintenance.py apply --state state.json --plan plan.json \
+            --result result.json --out state2.json --issues-out ops.json
+
+      - name: Create/comment block issues (engine-deduplicated)
+        if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ -f ops.json ] || echo '{"create_issues":[],"comment_issues":[]}' > ops.json
+          n=$(jq '.create_issues | length' ops.json); i=0
+          while [ "$i" -lt "$n" ]; do
+            title=$(jq -r ".create_issues[$i].title" ops.json)
+            jq -r ".create_issues[$i].body" ops.json > issue-body.md
+            labels=$(jq -r ".create_issues[$i].labels | join(\",\")" ops.json)
+            num=$(gh issue create --title "$title" --body-file issue-body.md --label "$labels" | grep -oE '[0-9]+$')
+            jq --argjson i "$i" --argjson num "$num" '.create_issues[$i].issue=$num' ops.json > o.json && mv o.json ops.json
+            i=$((i+1))
+          done
+          m=$(jq '.comment_issues | length' ops.json); i=0
+          while [ "$i" -lt "$m" ]; do
+            num=$(jq -r ".comment_issues[$i].issue" ops.json)
+            jq -r ".comment_issues[$i].body" ops.json > cbody.md
+            gh issue comment "$num" --body-file cbody.md || true
+            i=$((i+1))
+          done
+          python3 - <<'PY'
+          import json
+          ops=json.load(open('ops.json')); st=json.load(open('state2.json'))
+          created=[(c['title'],c.get('issue')) for c in ops.get('create_issues',[]) if c.get('issue')]
+          for sig,b in (st.get('blocked') or {}).items():
+              if not b.get('issue'):
+                  for title,num in created:
+                      if sig[:8] in title:
+                          b['issue']=num
+          json.dump(st,open('state2.json','w'),indent=1)
+          PY
+
+      - name: Push state to maintenance-state branch
+        if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ -f state2.json ] || { echo "no state change"; exit 0; }
+          msg="maintenance state: $(jq -r '.last_successful_build.package_version // "n/a"' state2.json)"
+          content=$(base64 -w0 state2.json)
+          sha=$(gh api "repos/${{ github.repository }}/contents/maintenance/state.json?ref=maintenance-state" --jq .sha 2>/dev/null || true)
+          if [ -n "$sha" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/contents/maintenance/state.json" \
+              -f message="$msg" -f content="$content" -f sha="$sha" \
+              -f branch="maintenance-state" > /dev/null
+          else
+            base=$(gh api "repos/${{ github.repository }}/git/refs/heads/${{ github.ref_name }}" --jq .object.sha)
+            gh api -X POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/heads/maintenance-state" -f sha="$base" > /dev/null 2>&1 || true
+            gh api -X PUT "repos/${{ github.repository }}/contents/maintenance/state.json" \
+              -f message="$msg" -f content="$content" \
+              -f branch="maintenance-state" > /dev/null
+          fi
+          echo "state pushed"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Maintenance outcome"
+            echo "- action/reason: \`${{ steps.decide.outputs.action }} — ${{ steps.decide.outputs.reason }}\`"
+            echo "- dry_run: \`${{ inputs.dry_run }}\` approve_retry: \`${{ inputs.approve_retry }}\`"
+            [ -f result.json ] && echo "- result: \`$(jq -c '{success,stage}' result.json)\`"
+            [ -f ops.json ] && echo "- issues created: $(jq '.create_issues|length' ops.json), comments: $(jq '.comment_issues|length' ops.json)"
+          } >> "$GITHUB_STEP_SUMMARY"

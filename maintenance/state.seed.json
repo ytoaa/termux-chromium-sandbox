@@ -1,0 +1,41 @@
+{
+  "validated": {
+    "upstream_version": "156.0.8078.47",
+    "port_version": "0.1.0",
+    "port_sha": "403274f29bb288bf81643f0d1772837df49b7dca",
+    "termux_sha": "64e02760c276cb68f514261653baf59aed45d4fd",
+    "deb_sha256": "29c4080d2a849c07eae46a87e44e39231fa92021c1e10e24f363e1e29395b27c",
+    "ci_run": 39976822670,
+    "note": "Round 13 promotion; device-gated (seccomp-BPF census, audio owner, downloads). Auto-maintenance MUST NOT mutate this block; only humans promote via port.toml."
+  },
+  "last_successful_build": {
+    "upstream_version": "156.0.8078.47",
+    "revision": 1,
+    "package_version": "156.0.8078.47-1",
+    "termux_ref": "64e02760c276cb68f514261653baf59aed45d4fd",
+    "port_sha": "403274f29bb288bf81643f0d1772837df49b7dca",
+    "signature": "seed-manual",
+    "deb_sha256": "29c4080d2a849c07eae46a87e44e39231fa92021c1e10e24f363e1e29395b27c",
+    "ci_run": 39976822670,
+    "ci_url": "https://github.com/ytoaa/termux-chromium-sandbox/actions/runs/39976822670",
+    "artifact": "build-39976822670",
+    "status": "BUILD_VERIFIED_CANDIDATE",
+    "recorded_at": "2026-10-24T00:00:00+09:00",
+    "validated": true,
+    "note": "Seeded from run #31 (recognized as the first successful build; signature 'seed-manual' never matches a computed signature so a later identical-input build may still be considered once; the engine dedups against candidates too)."
+  },
+  "candidates": [
+    {
+      "upstream_version": "156.0.8078.47",
+      "revision": 1,
+      "package_version": "156.0.8078.47-1",
+      "signature": "seed-manual",
+      "deb_sha256": "29c4080d2a849c07eae46a87e44e39231fa92021c1e10e24f363e1e29395b27c",
+      "ci_run": 39976822670,
+      "status": "BUILD_VERIFIED_CANDIDATE",
+      "validated": true
+    }
+  ],
+  "blocked": {},
+  "history": []
+}

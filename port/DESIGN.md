@@ -770,3 +770,84 @@ closed, reproduction conditions unknown (ws server stderr was discarded
 in main runs — recorded as measurement gap).
 
 Verdict inputs are in FINAL REPORT; nothing promoted, no defaults changed.
+
+## Round 15 — automated maintenance pipeline (2026-10-24, this PR)
+
+Goal: daily probe -> conditional build -> fail-stop + Issue -> candidate
+retention, with humans as the only path to security-policy or validated
+changes. Nothing here is active until the PR is merged (schedule fires only
+on the default branch) — and merge is a separate approval.
+
+Architecture (single pipeline, no duplicate workflows):
+- `.github/workflows/daily-maintenance.yml` — cron 23 0 * * * (09:23 KST) +
+  manual dry-run/approve-retry. Permissions: actions:read, issues:write,
+  contents:write (ONLY the Contents-API commit of maintenance/state.json on
+  the orphan `maintenance-state` branch — path+branch hardcoded; branch-
+  scoped tokens don't exist, flagged for review). Concurrency serializes
+  daily runs; the build workflow has its own serial group so
+  manual+scheduled builds never overlap (no cancellation of in-flight
+  ~1h builds).
+- Reuses `.github/workflows/build-chromium.yml` via **workflow_call** —
+  every existing invariant stays: termux_ref pinned to an exact sha,
+  separate package identity, R1~R9b transforms (fail-closed self-test gate
+  job), sccache, package gates, artifacts. Manual workflow_dispatch is
+  unchanged (static test s1). New: optional pkg_revision ->
+  TERMUX_SANDBOXED_REVISION (unset = byte-identical to pre-Round-15 recipe,
+  preserving #31 reproducibility), plus job outputs (deb sha/version,
+  termux/port sha) for the state ledger. (GITHUB_TOKEN cannot
+  workflow_dispatch/repository_dispatch another run; workflow_call is the
+  only token-legal composition — documented.)
+- `port/maintenance.py` — pure offline decision engine (no subprocess/exec
+  surface; network only in `fetch`): build signature =
+  sha256(upstream_version, recipe-blob-sha, host-tools-blob-sha, port_sha).
+  termux-master HEAD drift alone never rebuilds (§4 "actual build inputs").
+  Rules: behind -> skip; identical signature -> skip; candidate exists ->
+  skip; new version -> build rev1; same version + changed inputs ->
+  revision+1 (`156.0.8078.47-2` style — Termux native version-revision,
+  upstream version never synthesized above official); fetch/checksum errors
+  -> fail-closed skip; blocked signature -> skip unless inputs changed or
+  retry_approved.
+- State (`maintenance/state.json` on `maintenance-state`, seed =
+  `maintenance/state.seed.json` recognizing run #31 as the first
+  successful build + the validated baseline verbatim). validated block is
+  read-only to automation (tests s17/s18/s19; apply never rewrites it).
+- Failure handling: called-workflow job conclusions classify stage
+  (gate->port, verify->port, build+transient-keywords->infra); infra gets
+  exactly ONE automatic retry then escalates; port/unknown block
+  immediately with a deduplicated `auto-build-blocked` Issue carrying
+  version, port sha, termux sha, stage, log excerpt, CI link, last success,
+  repro steps, blocked status. Second failure on same signature comments on
+  the existing Issue (no spam). Closing the Issue alone does NOT retry —
+  unblock requires changed inputs, `retry-approved` label, or the
+  approve_retry dispatch (engine test 6d/6e).
+- Success -> candidate recorded with status BUILD_VERIFIED_CANDIDATE,
+  deb sha256, ci links (validated stays untouched — device gates remain
+  human gates). Retention: candidates keep ci_run/artifact ids; GH
+  artifacts expire per repo retention setting (recommend 90d — an OWNER
+  setting); expired artifact => state keeps history, rebuild allowed by
+  human dispatch.
+- Renovate (main) stays untouched: it only bumps the detection ledger
+  `port/upstream.renovate`; no build trigger, no collision (test s25).
+- Supersedes this PR's v1 (check-chromium-upstream.yml +
+  check_chromium_updates.py, issue-only watcher) — removed; probe logic
+  absorbed into maintenance.py fetch.
+
+Verification (all offline/static; NO long CI build was run, NO schedule is
+active until merge):
+- port/tests/maintenance_test.py         23/23 scenarios (§10 list 1-10 +
+  infra-vs-port classification, dedup, closed-issue-still-blocked,
+  retry-approved one-shot, divergence informational)
+- port/tests/maintenance_static_test.py  25/25 workflow/seed invariants
+- port/tests/maintenance_revision_test.sh 4/4 revision injection
+- Full harness now 45/45 (new cases [35][36][37] gate CI self-test too —
+  the build workflow's fail-closed gate now also protects the maintenance
+  code paths).
+
+Merge prerequisites (owner actions, separate approvals):
+1. Review daily-maintenance permissions grant (contents:write rationale).
+2. Decide artifact retention (Settings -> Actions, recommend 90 days) and
+   ensure GitHub Actions status badge/branch protection expectations.
+3. Merge PR #1 -> schedule becomes live on default branch. Until then this
+   is inert.
+4. Optionally create the `maintenance-state` branch beforehand (first run
+   auto-creates it from the seed otherwise).

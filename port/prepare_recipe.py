@@ -10,7 +10,7 @@ Modes:
 Exit non-zero on any contract violation (fail closed).
 """
 from __future__ import annotations
-import argparse, hashlib, re, shutil, subprocess, sys
+import argparse, hashlib, os, re, shutil, subprocess, sys
 from pathlib import Path
 
 PKG_SRC = "x11-packages/chromium"
@@ -245,6 +245,24 @@ def prepare(termux_dir: Path) -> dict:
             text, align_notes = align_versions(text, termux_dir)
             for n in align_notes:
                 print("NOTE:", n)
+            # Maintenance revision override (Round 15): only set when the
+            # caller explicitly passes TERMUX_SANDBOXED_REVISION (empty =
+            # byte-identical to pre-Round-15 behavior, so #31 reproducibility
+            # holds). Chromium upstream version is NEVER touched here —
+            # upstream version and our package revision stay independent.
+            rev = (os.environ.get("TERMUX_SANDBOXED_REVISION") or "").strip()
+            if rev:
+                if not re.fullmatch(r"[0-9]{1,2}", rev):
+                    raise RecipeError(f"invalid TERMUX_SANDBOXED_REVISION: {rev!r}")
+                if re.search(r"^TERMUX_PKG_REVISION=", text, re.M):
+                    text = re.sub(r'^TERMUX_PKG_REVISION=.*$',
+                                  f'TERMUX_PKG_REVISION="{rev}"', text,
+                                  count=1, flags=re.M)
+                else:
+                    text = re.sub(r'^(TERMUX_PKG_VERSION=.*)$',
+                                  r'\1\nTERMUX_PKG_REVISION="%s"' % rev, text,
+                                  count=1, flags=re.M)
+                print("NOTE: TERMUX_PKG_REVISION set to", rev)
             if HOOK_BEGIN not in text:
                 # Chain, NEVER clobber: if the recipe defines its own
                 # termux_step_post_get_source (chromium does — it applies
