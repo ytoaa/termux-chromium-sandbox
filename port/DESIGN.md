@@ -895,3 +895,35 @@ Merge prerequisites (owner actions, separate approvals):
    handoff s30, pinned inputs s31, per-job least-privilege s32), revision
    suite 4/4; full harness 45/45 (CI self-test gates all of it).
    Still zero long CI builds and no merge.
+
+### Round 15.2 — post-processing hardening (review of 1310acf)
+
+1. Success result JSON: the old jq passed a JSON literal as an INPUT FILE
+   name (always crashed). Now `echo | jq` builds raw result; SHAPE
+   VALIDATION MOVED INTO THE ENGINE (apply): deb_sha256 must be 64-hex,
+   deb_version must equal the decided package_version, termux_sha 40-hex,
+   ci_run positive int, ci_url https, artifact present — any mismatch
+   downgrades a 'success' to stage=verify (blocked + issue), so a
+   malformed success can never mint a candidate (tests 19a-d).
+2. Failure paths (failure|timed_out) now ALWAYS emit result.json with the
+   failed job NAMES (queried from the same-run jobs API), stage
+   (gate|build from actual reusable-workflow job keys), 4KB log excerpt and
+   run url (test 20). cancelled / skipped-anomaly remain non-blocking.
+3. infra retry contradiction fixed: first infra failure stores
+   infra_failures=1 (no issue); decide then EXPLICITLY allows the single
+   retry (test 11a2); second infra failure -> failures=2 -> issue + block;
+   decide skips at >=2 (11b/11c).
+4. retry-approved is one-shot per signature: label match sets
+   approval_used; the FOLLOWING apply consumes it (retry_approved=False +
+   approval_consumed_issues += [issue]); a still-open labelled issue can
+   never authorize a second daily retry (22a-c). Success clears the block
+   entry entirely.
+5. Durability: outcome job pre-creates required labels (idempotent, hard
+   fail if unavailable). Durable dedup survives state-push loss: an OPEN
+   issue with the exact full signature blocks even when state.blocked is
+   gone, and apply persists the re-link (plan.relink) so the ledger
+   re-attaches to issue #N (23a/b). Approval checks run BEFORE this
+   durable skip, so human-authorized retries are never swallowed.
+Tests: engine 42/42 (19-23 new + 11a2), static 34/34 (s34 = every run:
+block passes bash -n with expressions substituted), revision 4/4, full
+harness 45/45. Still zero long builds; dry-run dispatch re-verified parse.

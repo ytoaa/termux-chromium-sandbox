@@ -165,37 +165,71 @@ jobs:
           set -euo pipefail
           res="${{ needs.build.result }}"
           echo "called build job result: $res"
-          success=false; stage=build; : > tail.log
+          : > tail.log
           case "$res" in
-            success) success=true; stage=ok ;;
+            success)
+              # Round 15.2 #1: raw result; the ENGINE validates shape
+              # (deb sha 64hex, deb_version == expected package_version,
+              # termux_sha 40hex, ci_run>0, ci_url https, artifact) and
+              # downgrades malformed success to a 'verify' failure itself.
+              echo '{"success":true,"stage":"ok"}' \
+                | jq --arg d "${{ needs.build.outputs.deb_sha256 }}" \
+                     --arg v "${{ needs.build.outputs.deb_version }}" \
+                     --arg t "${{ needs.build.outputs.termux_sha }}" \
+                     --arg url "$CI_URL" --arg art "build-${{ github.run_id }}" \
+                     --argjson run "${{ github.run_id }}" \
+                     '. + {deb_sha256:$d, deb_version:$v, termux_sha:$t,
+                           ci_url:$url, ci_run:$run, artifact:$art}' \
+                     > result.json ;;
             cancelled)
-              jq -n '{success:false, stage:"cancelled", log_tail:"run cancelled (user or timeout) — not counted as build failure", ci_url:env.CI_URL, ci_run:(env.GITHUB_RUN_ID|tonumber)}' > result.json ;;
+              jq -n --arg url "$CI_URL" --argjson run "${{ github.run_id }}" \
+                '{success:false, stage:"cancelled",
+                  log_tail:"run cancelled (user or timeout) — not counted as build failure",
+                  failure_jobs:"", ci_url:$url, ci_run:$run}' > result.json ;;
             failure|timed_out)
-              jobs=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '.jobs[] | "\(.name)|\(.conclusion)"' || true)
-              echo "$jobs" | grep -q '^gate|failure' && stage=gate || true
-              echo "$jobs" | grep -q '^build|failure' && stage=build || true
+              # Round 15.2 #2: ALWAYS produce result.json on failure paths,
+              # preserving failed job names, stage, log excerpt, run url.
+              jobs_json=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '[.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | {name,conclusion}]' || echo '[]')
+              failed_names=$(echo "$jobs_json" | jq -r '[.[].name] | join(",")')
+              stage=unknown
+              echo "$failed_names" | grep -qw 'gate' && stage=gate || true
+              echo "$failed_names" | grep -qw 'build' && stage=build || true
               jid=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | .id' | tail -1 || true)
               if [ -n "${jid:-}" ]; then
-                gh api "repos/${{ github.repository }}/actions/jobs/$jid/logs" 2>/dev/null | tail -c 4000 > tail.log || echo "log unavailable" > tail.log
-              fi ;;
+                gh api "repos/${{ github.repository }}/actions/jobs/$jid/logs" 2>/dev/null | tail -c 4000 > tail.log || echo "log unavailable (job $jid)" > tail.log
+              else
+                echo "no failed job details retrievable (result=$res)" > tail.log
+              fi
+              jq -n --arg stage "$stage" --arg jobs "$failed_names" --rawfile tail tail.log \
+                --arg url "$CI_URL" --argjson run "${{ github.run_id }}" --arg res "$res" \
+                '{success:false, stage:$stage, log_tail:$tail,
+                  failure_jobs:($jobs + " (result=" + $res + ")"),
+                  ci_url:$url, ci_run:$run}' > result.json ;;
             skipped)
-              # skipped while decision said build == orchestration anomaly, NOT a
-              # real build failure: record + no issue, no blocked state
-              jq -n '{success:false, stage:"skipped-anomaly", log_tail:"build job skipped despite decided build (orchestration) — recorded, not blocking", ci_url:env.CI_URL, ci_run:(env.GITHUB_RUN_ID|tonumber)}' > result.json ;;
+              jq -n --arg url "$CI_URL" --argjson run "${{ github.run_id }}" \
+                '{success:false, stage:"skipped-anomaly",
+                  log_tail:"build job skipped despite decided build (orchestration) — recorded, not blocking",
+                  failure_jobs:"", ci_url:$url, ci_run:$run}' > result.json ;;
             *)
-              jq -n --arg r "$res" '{success:false, stage:"unknown", log_tail:("unexpected result: "+$r), ci_url:env.CI_URL, ci_run:(env.GITHUB_RUN_ID|tonumber)}' > result.json ;;
+              jq -n --arg r "$res" --arg url "$CI_URL" --argjson run "${{ github.run_id }}" \
+                '{success:false, stage:"unknown", log_tail:("unexpected result: "+$r),
+                  failure_jobs:$r, ci_url:$url, ci_run:$run}' > result.json ;;
           esac
-          if [ "$success" = "true" ]; then
-            jq --arg d "${{ needs.build.outputs.deb_sha256 }}" \
-               --arg v "${{ needs.build.outputs.deb_version }}" \
-               --arg t "${{ needs.build.outputs.termux_sha }}" \
-               --arg url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-               '. + {deb_sha256:$d, deb_version:$v, termux_sha:$t, artifact:("build-"+(env.GITHUB_RUN_ID)), ci_url:$url}' \
-               '{"success":true,"stage":"ok"}' > result.json
-            if [ -z "${{ needs.build.outputs.deb_sha256 }}" ]; then
-              echo '{"success":false,"stage":"verify","log_tail":"build reported success but no deb outputs present","ci_run":0,"ci_url":""}' > result.json
-            fi
-          fi
+          test -s result.json
+          jq -c '{success,stage,ci_run,deb_sha256:(.deb_sha256//null)}' result.json
+
+      - name: Ensure labels exist (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create auto-build-blocked --color B60205 \
+            --description "auto-maintenance blocked target; human investigation required" >/dev/null 2>&1 || true
+          for c in port infra unknown; do
+            gh label create "classification/$c" --color 5319E7 >/dev/null 2>&1 || true
+          done
+          gh label list --limit 200 | grep -q '^auto-build-blocked' \
+            || { echo "::error::required label unavailable"; exit 1; }
 
       - name: Apply result to state
         run: |

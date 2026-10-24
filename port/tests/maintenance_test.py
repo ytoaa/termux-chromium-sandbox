@@ -77,8 +77,11 @@ check('[m7] checksum-fail-closed', pl['action']=='skip' and pl['reason']=='sourc
 
 # [8] success -> candidate recorded, validated untouched
 pl=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
-st5,ops5=M.apply_result(s,pl,{'success':True,'stage':'ok','deb_sha256':'DEB2','ci_url':'u','ci_run':99,'artifact':'build-99'},'t')
-check('[8a] candidate recorded', st5['candidates'][-1]['deb_sha256']=='DEB2' and st5['candidates'][-1]['status']=='BUILD_VERIFIED_CANDIDATE')
+GOOD_OK={'success':True,'stage':'ok','deb_sha256':'a'*64,
+         'deb_version':'157.0.100.5','termux_sha':'b'*40,
+         'ci_url':'https://github.com/o/r/actions/runs/99','ci_run':99,'artifact':'build-99'}
+st5,ops5=M.apply_result(s,pl,dict(GOOD_OK),'t')
+check('[8a] candidate recorded (full fields)', st5['candidates'][-1]['deb_sha256']=='a'*64 and st5['candidates'][-1]['status']=='BUILD_VERIFIED_CANDIDATE' and st5['candidates'][-1]['ci_run']==99 and st5['candidates'][-1]['artifact']=='build-99' and st5['candidates'][-1]['termux_sha']=='b'*40)
 check('[8b] last_successful updated', st5['last_successful_build']['upstream_version']=='157.0.100.5')
 check('[8c] validated untouched', st5['validated']==s['validated'])
 check('[8d] never claims validated', st5['candidates'][-1]['validated'] is False)
@@ -97,7 +100,9 @@ check('[m10b] busy skip', pl['action']=='skip' and pl['reason']=='build-workflow
 # infra classification: transient gets ONE automatic retry, then blocks
 pl=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
 sti,opsi=M.apply_result(s,pl,{'success':False,'stage':'build','log_tail':'error: 502 Bad Gateway from sccache','ci_url':'u'},'t')
-check('[11a] infra transient -> one retry, no issue', len(opsi['create_issues'])==0 and list(sti['blocked'].values())[0]['classification']=='infra')
+check('[11a] infra first -> no issue, failures=1', len(opsi['create_issues'])==0 and list(sti['blocked'].values())[0]['classification']=='infra' and list(sti['blocked'].values())[0]['infra_failures']==1)
+plR=M.decide(sti,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
+check('[11a2] decide ALLOWS the single automatic retry', plR['action']=='build', plR['reason'])
 sti2,opsi2=M.apply_result(sti,pl,{'success':False,'stage':'build','log_tail':'502 again','ci_url':'u'},'t')
 check('[11b] infra second time -> block+issue', len(opsi2['create_issues'])==1)
 pl=M.decide(sti2,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
@@ -144,6 +149,50 @@ check('[18] cancelled -> no block no issue', len(opsc['create_issues'])==0 and n
 # skipped-anomaly likewise non-blocking
 stx,opsx=M.apply_result(s,pl,{'success':False,'stage':'skipped-anomaly','log_tail':'orchestration skip','ci_url':'u'},'t')
 check('[18b] skipped-anomaly -> no block no issue', len(opsx['create_issues'])==0 and not stx.get('blocked'), json.dumps(opsx)[:120])
+
+# --- Round 15.2 cases ---
+GOOD={'success':True,'stage':'ok','deb_sha256':'c'*64,'deb_version':'157.0.100.5',
+      'termux_sha':'d'*40,'ci_url':'https://x/runs/9','ci_run':9,'artifact':'build-9'}
+plG=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
+stb,opsb=M.apply_result(s,plG,{**GOOD,'deb_sha256':'not-a-sha'},'t')
+check('[19a] bad sha -> verify block + issue', (list(stb['blocked'].values())[0]['stage']=='verify' or 'verify' in str(stb['blocked'])) and len(opsb['create_issues'])==1 and not stb['candidates'])
+stb2,_=M.apply_result(s,plG,{**GOOD,'deb_version':'157.0.100.9'},'t')
+check('[19b] version mismatch -> verify', list(stb2['blocked'].values())[0]['stage']=='verify')
+stb3,_=M.apply_result(s,plG,{**GOOD,'ci_run':0},'t')
+check('[19c] ci_run invalid -> verify', list(stb3['blocked'].values())[0]['stage']=='verify')
+stok,opsok=M.apply_result(s,plG,dict(GOOD),'t')
+check('[19d] good shape -> candidate full', stb3 and stok['candidates'][-1]['deb_sha256']=='c'*64 and stok['candidates'][-1]['ci_url']=='https://x/runs/9' and len(opsok['create_issues'])==0)
+
+# [20] failure result with failed job names preserved into issue body
+plF=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
+stf2,opsf2b=M.apply_result(s,plF,{'success':False,'stage':'gate','log_tail':'PORT ERROR R3 anchor',
+    'failure_jobs':'gate','ci_url':'https://x/runs/8','ci_run':8},'t')
+body=opsf2b['create_issues'][0]['body']
+check('[20] failed job names in issue', 'gate' in body and 'PORT ERROR' in body and stf2['blocked'][list(stf2['blocked'])[0]]['failure_jobs']=='gate')
+
+# [22] label approval consumed exactly once
+st22=copy.deepcopy(s)
+sig22=M.build_signature('157.0.100.5','R2','H2','PORT-A')
+st22['blocked'][sig22]={'classification':'port','issue':5,'retry_approved':False,
+    'inputs':{'recipe_sha':'R2','host_sha':'H2','port_sha':'PORT-A'}}
+t22=M.issue_title({'upstream_version':'157.0.100.5','revision':1,'signature':sig22},'gate')
+iss22=[{'number':5,'title':t22,'labels':['auto-build-blocked','retry-approved']}]
+pl22=M.decide(st22,probes('157.0.100.5','R2','H2'),'PORT-A','t',iss22,None)
+check('[22a] approval first attempt builds', pl22['action']=='build' and pl22.get('approval_used'))
+st22b,ops22=M.apply_result(st22,pl22,{'success':False,'stage':'gate','log_tail':'still broken','ci_url':'u','ci_run':1},'t')
+ent=st22b['blocked'][sig22]
+check('[22b] approval consumed', ent['retry_approved'] is False and 5 in (ent.get('approval_consumed_issues') or []))
+pl22c=M.decide(st22b,probes('157.0.100.5','R2','H2'),'PORT-A','t',iss22,None)
+check('[22c] label remains but NO second retry', pl22c['action']=='skip' and pl22c['reason']=='blocked-dedup', pl22c['reason'])
+
+# [23] lost state + open issue -> skip + re-link persisted via apply
+st23=copy.deepcopy(s)  # NO blocked entry (state push was lost)
+t23=M.issue_title({'upstream_version':'157.0.100.5','revision':1,'signature':M.build_signature('157.0.100.5','R2','H2','PORT-A')},'gate')
+pl23=M.decide(st23,probes('157.0.100.5','R2','H2'),'PORT-A','t',[{'number':9,'title':t23,'labels':['auto-build-blocked']}],None)
+check('[23a] open-issue-exists durable skip', pl23['action']=='skip' and pl23['reason']=='open-issue-exists', pl23['reason'])
+st23b,_=M.apply_result(st23,pl23,{'success':False,'stage':'build','log_tail':'x','ci_run':0,'ci_url':''},'t')
+sig23=M.build_signature('157.0.100.5','R2','H2','PORT-A')
+check('[23b] re-link persisted', st23b['blocked'].get(sig23,{}).get('issue')==9)
 
 print(f'MAINTENANCE-TESTS PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)

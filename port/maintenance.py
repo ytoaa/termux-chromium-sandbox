@@ -167,7 +167,8 @@ def render_issue(target: dict, probes: dict, last: dict, stage: str,
         f"- Package target: `chromium-sandboxed {target['package_version']}`"
         f" (revision {target['revision']})",
         f"- Port SHA: `{target['port_sha']}`  Termux pinned SHA: `{target['termux_ref']}`",
-        f"- Build signature: `{target['signature']}`  Failure stage: `{stage}`",
+        f"- Build signature: `{target['signature']}`  Failure stage: `{stage}`"
+        + (f"  Failed jobs: `{(target.get('failure_jobs') or '')}`" if target.get('failure_jobs') else ''),
         f"- Last successful build: `{last.get('upstream_version')}-r{last.get('revision')}`"
         f" (CI run {last.get('ci_run')}, deb sha256 `{str(last.get('deb_sha256'))[:16]}…`)",
         '- Validated baseline: untouched (port.toml [port] last_validated_*).',
@@ -281,25 +282,55 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
     # Round 15.1 #4: honor a real `retry-approved` LABEL on the open issue
     # for this exact signature (in addition to state flag / dispatch).
     blocked = (state.get('blocked') or {}).get(sig)
+    consumed = set((blocked or {}).get('approval_consumed_issues') or [])
     if blocked and not blocked.get('retry_approved'):
         for i in (issues or []):
             if 'retry-approved' in (i.get('labels') or []) and \
-                    issue_matches_sig(i.get('title', ''), sig):
+                    issue_matches_sig(i.get('title', ''), sig) and \
+                    i.get('number') not in consumed:
                 blocked['retry_approved'] = True
+                blocked['_approval_source_issue'] = i.get('number')
                 diag.append('retry-approved LABEL on issue '
-                            f'{i.get("number")} — one attempt allowed')
+                            f'{i.get("number")} — ONE attempt (will be consumed)')
                 break
     if blocked:
         if blocked.get('retry_approved'):
-            diag.append('retry-approved observed — one attempt allowed')
+            plan['approval_used'] = True
+            diag.append('retry-approved observed — one attempt allowed '
+                        '(consumed by the following apply)')
         elif blocked.get('classification') == 'infra' and \
-                int(blocked.get('infra_retries', 0)) < 1:
-            diag.append('infra flake — one automatic retry allowed')
+                int(blocked.get('infra_failures', 0)) == 1:
+            diag.append('infra flake (1/1) — the single automatic retry runs now')
         else:
             plan['action'] = 'skip'
             plan['reason'] = 'blocked-dedup'
             plan['target'] = target
             return plan
+
+    # Round 15.2 #5: durable dedup for LOST state (issue created but state
+    # push failed): an OPEN issue with this exact signature blocks even when
+    # state.blocked is absent — and re-links the ledger to it. Approvals are
+    # evaluated in the blocked branch above; with no state block, no approval
+    # exists, so skipping here can never swallow a human-authorized retry.
+    if not (state.get('blocked') or {}).get(sig):
+        for i in (issues or []):
+            if BLOCKED_LABEL in (i.get('labels') or []) and \
+                    issue_matches_sig(i.get('title', ''), sig):
+                stb = (state.setdefault('blocked', {})).setdefault(sig, {
+                    'classification': 'port', 'at': now,
+                    'inputs': {'recipe_sha': recipe['recipe_sha'],
+                               'host_sha': recipe['host_sha'],
+                               'port_sha': port_sha}})
+                stb['issue'] = i.get('number')
+                plan['relink'] = {'sig': sig, 'issue': i.get('number'),
+                                  'classification': 'port',
+                                  'inputs': stb['inputs']}
+                diag.append(f're-linked blocked entry to existing issue '
+                            f'{i.get("number")} (state.blocked was lost)')
+                plan['action'] = 'skip'
+                plan['reason'] = 'open-issue-exists'
+                plan['target'] = target
+                return plan
 
     if running and (running.get('signature') == sig or
                     running.get('signature') in ('RUNNING-ANY', 'API-ERROR')):
@@ -322,6 +353,16 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
 def apply_result(state: dict, plan: dict, result: dict, now: str):
     st = json.loads(json.dumps(state))
     ops = {'create_issues': [], 'comment_issues': []}
+    # Round 15.2 #5: persist re-links produced by decide (lost-state repair)
+    if plan.get('relink'):
+        rl = plan['relink']
+        st.setdefault('blocked', {})
+        cur = st['blocked'].get(rl['sig']) or {}
+        if not cur.get('issue'):
+            cur = {**{'classification': rl.get('classification', 'port'),
+                      'inputs': rl.get('inputs', {}), 'at': now}, **cur}
+            cur['issue'] = rl['issue']
+            st['blocked'][rl['sig']] = cur
     if plan.get('action') != 'build' or not plan.get('target'):
         st.setdefault('history', []).append({'at': now,
                                              'skip': plan.get('reason')})
@@ -332,10 +373,45 @@ def apply_result(state: dict, plan: dict, result: dict, now: str):
     st.setdefault('blocked', {})
     st.setdefault('candidates', [])
     st.setdefault('history', [])
+    log_tail = result.get('log_tail') or ''
+    if ok:
+        # Round 15.2 #1: success is only recorded when EVERY field is
+        # present with the expected shape; otherwise downgrade to a
+        # 'verify' failure (blocked + issue) — a malformed success is a
+        # failure, never a candidate.
+        problems = []
+        sha = str(result.get('deb_sha256') or '')
+        ver = str(result.get('deb_version') or '')
+        tsha = str(result.get('termux_sha') or '')
+        run = result.get('ci_run')
+        url = str(result.get('ci_url') or '')
+        art = str(result.get('artifact') or '')
+        if not re.fullmatch(r'[0-9a-f]{64}', sha):
+            problems.append(f'deb_sha256 malformed: {sha[:20]!r}')
+        expected = t['package_version']
+        if ver != expected:
+            problems.append(f'deb_version {ver!r} != expected {expected!r}')
+        if not re.fullmatch(r'[0-9a-f]{40}', tsha):
+            problems.append(f'termux_sha malformed: {tsha[:20]!r}')
+        if not (isinstance(run, int) and run > 0):
+            problems.append(f'ci_run invalid: {run!r}')
+        if not url.startswith('https://'):
+            problems.append(f'ci_url invalid: {url[:40]!r}')
+        if not art:
+            problems.append('artifact name missing')
+        if problems:
+            ok = False
+            stage = 'verify'
+            log_tail = ('success-shaped result failed validation:\n'
+                        + '\n'.join(problems) + '\n' + (log_tail or ''))
+            result = dict(result or {})
+            result['log_tail'] = log_tail
     if ok:
         cand = dict(t)
         cand.update({'status': 'BUILD_VERIFIED_CANDIDATE',
                      'deb_sha256': result.get('deb_sha256'),
+                     'deb_version': result.get('deb_version'),
+                     'termux_sha': result.get('termux_sha'),
                      'ci_run': result.get('ci_run'),
                      'ci_url': result.get('ci_url'),
                      'artifact': result.get('artifact'),
@@ -343,7 +419,7 @@ def apply_result(state: dict, plan: dict, result: dict, now: str):
                      'validated': False})
         st['candidates'] = (st['candidates'] + [cand])[-20:]
         st['last_successful_build'] = dict(cand)
-        st['blocked'].pop(t['signature'], None)
+        st['blocked'].pop(t['signature'], None)  # success clears block+approvals
         st['history'].append({'at': now, 'success':
                               f"{t['package_version']} sig={t['signature']}"})
         return st, ops
@@ -353,26 +429,42 @@ def apply_result(state: dict, plan: dict, result: dict, now: str):
     if stage in ('cancelled', 'skipped-anomaly'):
         st['history'].append({'at': now, stage: t['signature']})
         return st, ops
-    log_tail = result.get('log_tail') or ''
     cls = classify_failure(stage, log_tail)
     prev = st['blocked'].get(t['signature']) or {}
-    if cls == 'infra' and int(prev.get('infra_retries', 0)) < 1:
+    # Round 15.2 #4: any attempt that ran under an approval consumes it.
+    consumed_list = list(prev.get('approval_consumed_issues') or [])
+    if plan.get('approval_used'):
+        src = (prev.get('_approval_source_issue')
+               or (state.get('blocked') or {}).get(t['signature'], {})
+                   .get('_approval_source_issue'))
+        if src is not None and src not in consumed_list:
+            consumed_list.append(src)
+    if prev.get('retry_approved') or plan.get('approval_used'):
+        prev = dict(prev)
+        prev['retry_approved'] = False
+        prev['approval_consumed_issues'] = consumed_list
+        prev.pop('_approval_source_issue', None)
+    n = int(prev.get('infra_failures', 0)) + 1
+    if cls == 'infra' and n <= 1:
         st['blocked'][t['signature']] = {
+            **prev,
             'classification': 'infra',
-            'infra_retries': int(prev.get('infra_retries', 0)) + 1,
+            'infra_failures': n,
             'inputs': {'recipe_sha': t['recipe_sha'],
                        'host_sha': t['host_sha'], 'port_sha': t['port_sha']},
             'stage': stage, 'at': now}
-        st['history'].append({'at': now, 'infra-retry': t['signature']})
+        st['history'].append({'at': now, 'infra-retry-pending': t['signature']})
         return st, ops
     st['blocked'][t['signature']] = {
         'classification': cls,
-        'issue': prev.get('issue'),
+        'issue': prev.get('issue') or plan.get('pending_issue'),
         'retry_approved': bool(prev.get('retry_approved')),
+        'approval_consumed_issues': consumed_list,
         'inputs': {'recipe_sha': t['recipe_sha'], 'host_sha': t['host_sha'],
                    'port_sha': t['port_sha']},
         'stage': stage, 'at': now,
-        'infra_retries': int(prev.get('infra_retries', 0))}
+        'infra_failures': n,
+        'failure_jobs': (result or {}).get('failure_jobs', '')}
     if not prev.get('issue'):
         ops['create_issues'].append({
             'title': issue_title(t, stage),

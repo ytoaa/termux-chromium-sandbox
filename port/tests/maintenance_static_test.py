@@ -83,5 +83,21 @@ check('[s32] per-job permissions least-privilege',
       and 'issues' not in str(_dwj['evaluate'].get('permissions',{}).get('contents',''))
       and _dwj['outcome']['permissions']['contents']=='write'
       and _dwj['build'].get('permissions') is None)
+# s34: every run: block in daily-maintenance passes bash -n
+# (expressions substituted with placeholder literals)
+import subprocess as _sp, tempfile as _tf
+_ok=True; _bad=[]
+for _jn,_j in dw['jobs'].items():
+    for _i,_st in enumerate(_j.get('steps',[]) or []):
+        _r=_st.get('run')
+        if not _r: continue
+        _x=_re.sub(r'\$\{\{[^}]*\}\}','PLACEHOLDER',_r)
+        with _tf.NamedTemporaryFile('w',suffix='.sh',delete=False) as _f:
+            _f.write('#!/usr/bin/env bash\n'+_x); _p=_f.name
+        _c=_sp.run(['bash','-n',_p],capture_output=True,text=True)
+        if _c.returncode!=0:
+            _ok=False; _bad.append(f'{_jn}#{_i}:{_c.stderr.strip()[:80]}')
+        os.unlink(_p)
+check('[s34] all run-blocks pass bash -n (expressions substituted)', _ok, str(_bad))
 print(f'MAINTENANCE-STATIC PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)
