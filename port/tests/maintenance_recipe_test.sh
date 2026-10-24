@@ -100,5 +100,45 @@ stage=unknown; echo "$failed_names" | grep -qw 'gate' && stage=gate || true; ech
 [ "$stage" = "build" ] && ok D2 || bad D2 "stage=$stage"
 failed_names2=$(echo '[{"id":1,"name":"Reusable build (only when decided) / gate","conclusion":"failure"}]' | jq -r '[.[].name | split("/") | last | ltrimstr(" ") | split(" ")[0]] | join(",")')
 [ "$failed_names2" = "gate" ] && ok D3 || bad D3 "got=$failed_names2"
+# [B*] strict version parser boundary cases (Phase B remediation B)
+python3 - <<'PY' || bad B-cases crash
+import sys
+sys.path.insert(0,'port')
+import prepare_recipe as P
+cases=[
+ ('TERMUX_PKG_VERSION=156.0.8078.47', ('156.0.8078.47','', '')),
+ ('TERMUX_PKG_VERSION="156.0.8078.47"', ('156.0.8078.47','"', '')),
+ ("TERMUX_PKG_VERSION='156.0.8078.47'", ('156.0.8078.47',"'", '')),
+ ('TERMUX_PKG_VERSION=156.0.8078.47  # upstream bump', ('156.0.8078.47','', '  # upstream bump')),
+ ('  TERMUX_PKG_VERSION="1.2.3"', ('1.2.3','"','')),
+ ('TERMUX_PKG_VERSION=156.0.8078.47junk', None),
+ ("TERMUX_PKG_VERSION=\"156.0.8078.47'", None),
+ ('TERMUX_PKG_VERSION = "1.2.3"', None),
+ ('TERMUX_PKG_VERSION="1.2.3\"4"', None),
+ ('TERMUX_PKG_VERSION=', None),
+ ('no version line here', None),
+ ('TERMUX_PKG_VERSION=1.2.3.', None),
+]
+for src,want in cases:
+    got=P.parse_version_line(src)
+    assert got==want, (src, got, want)
+# rewrite preserves trailing comment and quote style
+new=P.VER_STRICT.sub(lambda m:'TERMUX_PKG_VERSION={0}{1}{0}{2}'.format('"','9.9.9.9',m.group(4)),
+                     'TERMUX_PKG_VERSION="1.2.3" # keepme', count=1)
+assert new=='TERMUX_PKG_VERSION="9.9.9.9" # keepme', new
+# align: junk suffix must RecipeError (not partial pass)
+import pathlib,tempfile
+d=pathlib.Path(tempfile.mkdtemp()); (d/'x11-packages/chromium-host-tools').mkdir(parents=True)
+(d/'x11-packages/chromium-host-tools/build.sh').write_text('TERMUX_PKG_VERSION="1.2.3"\n')
+try:
+    P.align_versions('TERMUX_PKG_VERSION=1.2.3suffix\n', d); raise SystemExit('partial match passed!')
+except P.RecipeError: pass
+# host parser junk -> None (align no-ops, no crash)
+(d/'x11-packages/chromium-host-tools/build.sh').write_text('TERMUX_PKG_VERSION="1.2.3junk"\n')
+assert P.host_tools_version(d) is None
+print('B-cases ok')
+PY
+[ $RC -eq 0 ] && ok "B-parser" || true
+
 echo "RECIPE-CLASSIFY-TESTS RC=$RC"
 exit $RC

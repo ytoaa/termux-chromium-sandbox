@@ -59,8 +59,8 @@ def host_tools_version(termux_dir: Path) -> str | None:
     f = termux_dir / "x11-packages" / "chromium-host-tools" / "build.sh"
     if not f.is_file():
         return None
-    m = re.search(r'^TERMUX_PKG_VERSION="?([0-9][0-9.]*)"?', f.read_text(), re.M)
-    return m.group(1) if m else None
+    parsed = parse_version_line(f.read_text())
+    return parsed[0] if parsed else None
 
 def fetch_tarball_sha256(version: str) -> str:
     """sha256 from the release's .hashes asset (fail closed)."""
@@ -77,6 +77,28 @@ def fetch_tarball_sha256(version: str) -> str:
         raise RecipeError(f"sha256 for {version} not found in hashes asset")
     return m.group(1)
 
+# Phase B remediation B: ONE strict version-line parser for recipe and
+# host-tools alike. Accepts exactly bare / "..." / '...' dotted versions,
+# optional leading indentation, optional trailing spaces + # comment.
+# Anything else (junk suffixes, mismatched quotes, spaced assignment) does
+# NOT partially match — callers must treat None as invalid.
+VER_STRICT = re.compile(
+    r"^[ \t]*TERMUX_PKG_VERSION="
+    r"(?:\"([0-9]+(?:\.[0-9]+)*)\"|'([0-9]+(?:\.[0-9]+)*)'"
+    r"|([0-9]+(?:\.[0-9]+)*))"
+    r"([ \t]*(?:#.*)?)$", re.M)
+
+
+def parse_version_line(text: str):
+    """-> (version, quote_char, trailing_text) or None (never partial)."""
+    m = VER_STRICT.search(text)
+    if not m:
+        return None
+    ver = m.group(1) or m.group(2) or m.group(3)
+    quote = '"' if m.group(1) is not None else ("'" if m.group(2) is not None else '')
+    return ver, quote, m.group(4)
+
+
 def align_versions(text: str, termux_dir: Path) -> tuple[str, list]:
     """Upstream drift guard: the recipe's own post_get_source compares our
     TERMUX_PKG_VERSION against chromium-host-tools/build.sh and termux_error_exit
@@ -92,18 +114,16 @@ def align_versions(text: str, termux_dir: Path) -> tuple[str, list]:
     # (TERMUX_PKG_VERSION="156.0.8078.47" at 2af83c387...). Support quoted
     # and bare forms, preserve the file's own quote style on rewrite, and
     # raise an explicit RecipeError instead of crashing on None.group(1).
-    ver_re = re.compile(r'^TERMUX_PKG_VERSION=(?:"([0-9][0-9.]*)"|\'([0-9][0-9.]*)\'|([0-9][0-9.]*))', re.M)
-    m = ver_re.search(text)
-    if not m:
+    parsed = parse_version_line(text)
+    if not parsed:
         raise RecipeError("TERMUX_PKG_VERSION line unrecognised in recipe "
                           "(expected bare or quoted dotted version)")
-    cur = m.group(1) or m.group(2) or m.group(3)
-    quote = '"' if m.group(1) is not None else ("'" if m.group(2) is not None else '')
+    cur, quote, _trailing = parsed
     if cur == ht:
         return text, notes
     sha = fetch_tarball_sha256(ht)
-    text = ver_re.sub(lambda mm: f"TERMUX_PKG_VERSION={quote}{ht}{quote}",
-                      text, count=1)
+    text = VER_STRICT.sub(lambda mm: 'TERMUX_PKG_VERSION={0}{1}{0}{2}'.format(
+        quote, ht, mm.group(4)), text, count=1)
     text = re.sub(r'^TERMUX_PKG_SHA256=[0-9a-f]+', f"TERMUX_PKG_SHA256={sha}", text, count=1, flags=re.M)
     notes.append(f"aligned clone {cur} -> host-tools {ht} (sha256 from release hashes)")
     return text, notes

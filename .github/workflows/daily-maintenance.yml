@@ -316,8 +316,12 @@ jobs:
             if ! grep -qiE 'Not Found|Reference does not exist' ref.err; then
               echo "::error::branch probe failed: $(tail -2 ref.err)"; exit 1
             fi
-            echo "creating maintenance-state from ${{ github.ref_name }}"
-            base=$(gh api "repos/${{ github.repository }}/git/ref/heads/${{ github.ref_name }}" --jq .object.sha)
+            # Contract: maintenance-state ALWAYS bootstraps from the
+            # REPOSITORY DEFAULT BRANCH head (never the dispatch/work ref —
+            # a PR-branch dispatch must not fork state off a feature head).
+            default_branch=$(gh api "repos/${{ github.repository }}" --jq .default_branch)
+            echo "creating maintenance-state from default branch $default_branch"
+            base=$(gh api "repos/${{ github.repository }}/git/ref/heads/$default_branch" --jq .object.sha)
             gh api -X POST "repos/${{ github.repository }}/git/refs" \
               -f ref="refs/heads/maintenance-state" -f sha="$base" > ref-create.json
             gh api "repos/${{ github.repository }}/git/ref/heads/maintenance-state" --jq .object.sha >/dev/null

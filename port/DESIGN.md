@@ -1064,3 +1064,29 @@ D  Called-workflow jobs are named '<caller job> / <called job>' (observed:
 Test totals after remediation: engine 46/46, static 43/43 (s40-s43 new),
 integration 25/25, recipe/fixtures/classify 10/10, revision 4/4,
 harness 47/47. NO new real build was executed during remediation.
+
+### Phase B pre-revalidation hardening (final, before single re-build)
+
+Two review findings closed with minimal scope:
+A. State bootstrap contract alignment: first-run `maintenance-state`
+   creation now resolves the REPOSITORY DEFAULT BRANCH via the repo API
+   (`--jq .default_branch`) and takes that exact commit SHA for POST
+   git/refs — previously `github.ref_name` meant a dispatch from the PR
+   work-branch would fork state off the feature head, violating the
+   'default-branch head' contract. Existing branch is never recreated;
+   non-404 probe errors still abort; POST is unswallowed; existence
+   re-verified before PUT; create-file vs update-file paths remain split.
+   Static s40 asserts default_branch SHA is the actual POST input and
+   github.ref_name is absent from the push step.
+B. Strict version parsing: ONE shared VER_STRICT parser for recipe and
+   host-tools — bare/"..."/'...' dotted versions only, leading indent and
+   trailing spaces/#comment tolerated (and PRESERVED on rewrite via
+   captured trailing group), junk suffixes ("...47junk"), mismatched
+   quotes, spaced assignments and empty values NO LONGER partially match:
+   recipe path raises RecipeError, host path returns None (align no-ops,
+   upstream's own comparison remains the backstop). 12 boundary cases +
+   comment-preservation rewrite + align junk rejection tested (B-parser).
+Harness after hardening: engine 46/46, static 43/43 (s40 strengthened),
+integration 25/25, recipe/classify 11/11, revision 4/4, harness 47/47,
+CI selftest green. No real build executed; Issue #2 blocked; validated
+156 intact. Verdict: GO for the single non-dry-run Phase B revalidation.

@@ -119,9 +119,12 @@ check('[s39] durable label-consume step present before classify',
           < list(_steps_out).index(next(k for k in _steps_out if 'Classify' in k)))
 _ps=[st.get('run','') for st in _dwj['outcome']['steps'] if 'Push state' in str(st.get('name',''))]
 _ps=_ps[0] if _ps else ''
-check('[s40] state push honest bootstrap (no || true on POST; verify before PUT; create/update split)',
+check('[s40] state push bootstrap: DEFAULT BRANCH sha feeds POST; no || true; verify; split',
       'POST' in _ps and 'git/refs' in _ps and '-f ref="refs/heads/maintenance-state"' in _ps
+      and '--jq .default_branch' in _ps
+      and 'base=$(gh api "repos/${{ github.repository }}/git/ref/heads/$default_branch" --jq .object.sha)' in _ps
       and '-f sha="$base" > ref-create.json' in _ps
+      and 'github.ref_name' not in _ps
       and 'creating maintenance-state' in _ps and 'updating existing state file' in _ps
       and 'creating initial state file' in _ps
       and 'git/ref/heads/maintenance-state' in _ps
