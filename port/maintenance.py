@@ -74,7 +74,7 @@ def _get(url: str, token: str | None = None) -> bytes:
 def cmd_fetch(args) -> int:
     token = args.token or None
     probes = {'official_stable': None, 'termux_head': None,
-              'recipe': None, 'checksum_ok': False, 'fetch_errors': []}
+              'recipe': None, 'pins_verified': False, 'fetch_errors': []}
     try:
         items = json.loads(_get(RELEASES, token))
         vs = [x.get('version', '') for x in items
@@ -90,12 +90,17 @@ def cmd_fetch(args) -> int:
         probes['termux_head'] = head.get('sha')
     except Exception as e:  # noqa: BLE001
         probes['fetch_errors'].append(f'termux head: {type(e).__name__}')
-    try:
+    # Round 15.1 #3: BOTH recipe files are read AT THE PINNED HEAD SHA —
+    # no 'master' fallback, so probe state is atomic and matches the build
+    # checkout (which receives this exact sha as termux_ref).
+    if probes['termux_head'] and not probes['fetch_errors']:
+      try:
+        sha = probes['termux_head']
         recipe = _get(
-            f'https://raw.githubusercontent.com/{TERMUX}/master/{RECIPE_PATH}',
+            f'https://raw.githubusercontent.com/{TERMUX}/{sha}/{RECIPE_PATH}',
             token).decode('utf-8', 'replace')
         host = _get(
-            f'https://raw.githubusercontent.com/{TERMUX}/master/{HOST_PATH}',
+            f'https://raw.githubusercontent.com/{TERMUX}/{sha}/{HOST_PATH}',
             token).decode('utf-8', 'replace')
         m = VERSION.search(recipe)
         mh = VERSION.search(host)
@@ -112,9 +117,20 @@ def cmd_fetch(args) -> int:
                 'revision': int(rev.group(1)) if rev else 0,
                 'distro_version': distro.group(1) if distro else None,
             }
-            probes['checksum_ok'] = bool(probes['recipe']['version'])
-    except Exception as e:  # noqa: BLE001
+            # Round 15.1 #7: honest semantics — pins_verified means BOTH
+            # build.sh files were read at the pinned sha AND their literal
+            # version lines (+ the recipe distro/source pin when present)
+            # parsed. Deep tarball hash verification remains inside the
+            # build (prepare_recipe/termux contract); we never claim more.
+            r = probes['recipe']
+            probes['pins_verified'] = bool(
+                r['version'] and r['host_version'] and r['recipe_sha'] and
+                r['host_sha'])
+      except Exception as e:  # noqa: BLE001
         probes['fetch_errors'].append(f'termux recipe: {type(e).__name__}')
+    else:
+        if probes['termux_head'] is None:
+            probes['fetch_errors'].append('recipe read skipped: no pinned sha')
     Path(args.out).write_text(json.dumps(probes, indent=1) + '\n')
     return 0 if not probes['fetch_errors'] else 1
 
@@ -130,10 +146,15 @@ def classify_failure(stage: str, log_tail: str) -> str:
     return 'unknown'
 
 
+def issue_matches_sig(title: str, sig: str) -> bool:
+    # Round 15.1 #6: ONE matcher everywhere (decide dedup, stamp, label).
+    return f'sig {sig}' in (title or '')
+
+
 def issue_title(target: dict, reason: str) -> str:
     return (f"[auto-build] Chromium {target['upstream_version']} "
             f"revision {target['revision']} blocked ({reason}, "
-            f"sig {target['signature'][:8]})")
+            f"sig {target['signature']})")
 
 
 def render_issue(target: dict, probes: dict, last: dict, stage: str,
@@ -183,19 +204,24 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
         diag.append('probes incomplete: ' + '; '.join(probes['fetch_errors']))
         return plan
     recipe = probes.get('recipe') or {}
-    if not probes.get('checksum_ok') or not recipe.get('version'):
+    if not probes.get('pins_verified') or not recipe.get('version') \
+            or not recipe.get('host_version'):
         plan['reason'] = 'source-verification-failed'
-        diag.append('recipe/distro pin unreadable — refusing to build')
+        diag.append('recipe/host-tools pins unreadable at pinned sha — refusing')
         return plan
-    buildable = recipe['version']
+    # Round 15.1 #3: the version actually BUILT is the one prepare_recipe's
+    # align_versions policy lands on: chromium/build.sh VERSION := host-tools
+    # VERSION. Using it here keeps probe decisions consistent with the build.
+    buildable = recipe['host_version']
     official = probes.get('official_stable')
     if official != buildable:
         diag.append(f'official Stable {official} != termux recipe {buildable};'
                     ' the recipe version is the buildable source (contract:')
         diag.append('  prepare_recipe aligns recipe/host-tools at build time)')
-    if recipe.get('host_version') and recipe['host_version'] != buildable:
-        diag.append(f'recipe/host-tools differ ({buildable} vs '
-                    f'{recipe["host_version"]}); alignment applies')
+    if recipe.get('version') != recipe.get('host_version'):
+        diag.append(f'recipe version {recipe["version"]} != host-tools '
+                    f'{recipe["host_version"]}; building the ALIGNED value '
+                    f'(prepare_recipe policy) = {buildable}')
 
     last = state.get('last_successful_build') or {}
     sig = build_signature(buildable, recipe['recipe_sha'],
@@ -203,8 +229,15 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
     candidates = state.get('candidates') or []
 
     def mk_target(rev):
+        # Round 15.1 #7: revision 1 = PLAIN upstream version (no
+        # TERMUX_PKG_REVISION), matching how run #31 really shipped as
+        # '156.0.8078.47'. Only rev>=2 carries the '-N' suffix and passes
+        # the revision env into the build.
+        pv = buildable if rev <= 1 else f'{buildable}-{rev}'
         return {'upstream_version': buildable, 'revision': rev,
-                'package_version': f'{buildable}-{rev}',
+                'package_version': pv,
+                'deb_version': pv,
+                'pkg_revision_env': '' if rev <= 1 else str(rev),
                 'termux_ref': probes['termux_head'],
                 'port_sha': port_sha, 'signature': sig,
                 'recipe_sha': recipe['recipe_sha'],
@@ -237,7 +270,25 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
         plan['reason'] = 'upstream-behind-last-success'
         return plan
 
+    # Round 15.1 #6: issues list must be trustworthy; an API error marker
+    # fails closed (we cannot verify dedup or retry labels).
+    if isinstance(issues, dict) or (issues and isinstance(issues[0], dict)
+                                    and issues[0].get('error')):
+        plan['reason'] = 'issues-api-error-fail-closed'
+        diag.append('issues API unavailable — refusing to build/issue to avoid'
+                    ' duplicate issues and unverified retry state')
+        return plan
+    # Round 15.1 #4: honor a real `retry-approved` LABEL on the open issue
+    # for this exact signature (in addition to state flag / dispatch).
     blocked = (state.get('blocked') or {}).get(sig)
+    if blocked and not blocked.get('retry_approved'):
+        for i in (issues or []):
+            if 'retry-approved' in (i.get('labels') or []) and \
+                    issue_matches_sig(i.get('title', ''), sig):
+                blocked['retry_approved'] = True
+                diag.append('retry-approved LABEL on issue '
+                            f'{i.get("number")} — one attempt allowed')
+                break
     if blocked:
         if blocked.get('retry_approved'):
             diag.append('retry-approved observed — one attempt allowed')
@@ -251,7 +302,7 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
             return plan
 
     if running and (running.get('signature') == sig or
-                    running.get('signature') == 'RUNNING-ANY'):
+                    running.get('signature') in ('RUNNING-ANY', 'API-ERROR')):
         plan['reason'] = 'build-workflow-busy'
         plan['target'] = target
         return plan
@@ -260,7 +311,7 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
     plan['target'] = target
     for i in (issues or []):
         if BLOCKED_LABEL in (i.get('labels') or []) and \
-                sig in (i.get('title') or ''):
+                issue_matches_sig(i.get('title', ''), sig):
             plan['pending_issue'] = i.get('number')
             break
     return plan
@@ -295,6 +346,12 @@ def apply_result(state: dict, plan: dict, result: dict, now: str):
         st['blocked'].pop(t['signature'], None)
         st['history'].append({'at': now, 'success':
                               f"{t['package_version']} sig={t['signature']}"})
+        return st, ops
+    # Round 15.1 #2: cancellations and orchestration skips are NOT build
+    # failures — recorded in history only; no block, no issue (fail-closed
+    # still applies to every other stage, including 'unknown').
+    if stage in ('cancelled', 'skipped-anomaly'):
+        st['history'].append({'at': now, stage: t['signature']})
         return st, ops
     log_tail = result.get('log_tail') or ''
     cls = classify_failure(stage, log_tail)
@@ -378,7 +435,7 @@ def main(argv=None) -> int:
         for sig, b in (stt.get('blocked') or {}).items():
             if not b.get('issue'):
                 for title, num in created:
-                    if sig[:8] in title:
+                    if issue_matches_sig(title, sig):
                         b['issue'] = num
         Path(args.state).write_text(json.dumps(stt, indent=1) + '\n')
         print('STAMPED', len(created))

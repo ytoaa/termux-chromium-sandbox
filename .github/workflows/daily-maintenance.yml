@@ -1,23 +1,23 @@
-# Round 15 — daily maintenance pipeline: probe upstream, decide, optionally
-# invoke the EXISTING build workflow (workflow_call), record candidate state,
-# open deduplicated block-Issues on failure.
+# Round 15/15.1 — daily maintenance pipeline: probe -> decide -> (job-level
+# reusable build call) -> outcome/issues/state. Inert until merged to the
+# default branch (cron fires on default branch only).
 #
-# Hard invariants (enforced by port/maintenance.py + this file): automation
-# never edits BPF/Broker/syscall policy; never bypasses R1~R9b transforms
-# (build itself is fail-closed); never mutates last_validated_* (validated
-# promotion is a human act on port.toml); never publishes apt/Release; never
-# retries blocked targets without changed inputs or an explicit
-# retry-approved label; unknown failure classes block (fail closed).
+# Hard invariants (port/maintenance.py + this file): automation never edits
+# BPF/Broker/syscall policy; never bypasses R1~R9b (build is fail-closed);
+# never mutates last_validated_* (human act on port.toml only); never
+# publishes apt/Release; blocked targets skip unless inputs changed or a
+# human applied `retry-approved`; unknown failures BLOCK; GitHub API errors
+# FAIL CLOSED (no silent seed/empty fallbacks on real errors).
 #
-# STATE: maintenance/state.json on orphan branch `maintenance-state`
-# (first run falls back to maintenance/state.seed.json; pushes use
-# GITHUB_TOKEN and therefore cannot self-trigger workflows).
+# STATE: maintenance/state.json on orphan branch `maintenance-state`.
+# Legitimate first run (file absent -> 404) falls back to
+# maintenance/state.seed.json; ANY other API error aborts the run.
 name: Daily Maintenance
 
 on:
   schedule:
-    # 00:23 UTC = 09:23 Asia/Seoul. Missed schedules deliver the latest
-    # occurrence only; runs are idempotent per build signature + concurrency.
+    # 00:23 UTC = 09:23 Asia/Seoul. Missed schedules deliver only the latest
+    # occurrence; runs are idempotent (state signature + job-level locks).
     - cron: '23 0 * * *'
   workflow_dispatch:
     inputs:
@@ -26,65 +26,79 @@ on:
         type: boolean
         default: true
       approve_retry:
-        description: 'Approve one retry of currently blocked signatures (after human review)'
+        description: 'One-shot retry approval for currently blocked signatures (human review prerequisite)'
         type: boolean
         default: false
 
 permissions:
-  actions: read
-  issues: write
-  # contents:write is needed ONLY for the Contents-API commit of
-  # maintenance/state.json on the maintenance-state branch (path+branch
-  # hard-coded in the push step). Branch-scoped token perms do not exist;
-  # this minimal grant is flagged for review.
-  contents: write
+  contents: read
 
 concurrency:
   group: daily-maintenance
   cancel-in-progress: false
 
 jobs:
-  maintenance:
-    name: Probe -> decide -> (build) -> record
+  evaluate:
+    name: Probe upstream + decide
     runs-on: ubuntu-26.04
-    timeout-minutes: 400
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read    # in-progress build detection
+      issues: read     # dedup/retry-label lookup (fail-closed on API error)
     outputs:
       action: ${{ steps.decide.outputs.action }}
       reason: ${{ steps.decide.outputs.reason }}
+      target: ${{ steps.decide.outputs.target }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Probe upstream (Chromium Stable + Termux recipe pins)
+      - name: Probe upstream (head-pinned termux recipe reads)
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          python3 port/maintenance.py fetch --out probes.json --token "${GITHUB_TOKEN}"
+        run: python3 port/maintenance.py fetch --out probes.json --token "${GITHUB_TOKEN}"
 
-      - name: Load state (maintenance-state branch, else seed)
+      - name: "Load state (FAIL-CLOSED: only a true 404 seeds)"
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          err=state.err
           if gh api "repos/${{ github.repository }}/contents/maintenance/state.json?ref=maintenance-state" \
-               --jq .content 2>/dev/null | base64 -d > state.json 2>/dev/null && \
-             python3 -c "import json;json.load(open('state.json'))"; then
+               --jq .content > state.b64 2>"$err"; then
+            base64 -d state.b64 > state.json
             echo "STATE_SOURCE=branch" >> "$GITHUB_ENV"
-          else
+          elif grep -qi 'Not Found' "$err"; then
             cp maintenance/state.seed.json state.json
-            echo "STATE_SOURCE=seed" >> "$GITHUB_ENV"
+            echo "STATE_SOURCE=seed (first run, branch/file absent)" >> "$GITHUB_ENV"
+          else
+            echo '::error::state API failure (not a 404) — refusing seed fallback'
+            cat "$err" | tail -3
+            exit 1
           fi
           python3 port/maintenance.py validate-state --state state.json
 
-      - name: Load open block-issues + detect in-progress builds
+      - name: "Load block-issues + in-progress builds (FAIL-CLOSED)"
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api "repos/${{ github.repository }}/issues?state=open&labels=auto-build-blocked&per_page=100" \
-            --jq '[.[] | {number,title,labels:[.labels[].name]}]' > issues.json 2>/dev/null || echo '[]' > issues.json
-          n=$(gh api "repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=50" \
-              --jq '[.workflow_runs[] | select(.name=="Build Termux Chromium Seccomp Sandbox Port")] | length' 2>/dev/null || echo 0)
-          if [ "$n" != "0" ]; then echo '{"signature":"RUNNING-ANY"}' > running.json; else echo 'null' > running.json; fi
+          if gh api "repos/${{ github.repository }}/issues?state=open&labels=auto-build-blocked&per_page=100" \
+               --jq '[.[] | {number,title,labels:[.labels[].name]}]' > issues.json 2>issues.err; then
+            :
+          else
+            # empty list would silently defeat dedup AND retry-approved checks
+            echo '{"error":true}' > issues.json
+            echo "::warning::issues API unavailable — engine will fail closed"
+          fi
+          if gh api "repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=50" \
+               --jq '[.workflow_runs[] | select(.name=="Build Termux Chromium Seccomp Sandbox Port")] | length' \
+               > runs.count 2>runs.err; then
+            if [ "$(tr -d '"[:space:]' < runs.count)" != "0" ]; then echo '{"signature":"RUNNING-ANY"}' > running.json; else echo 'null' > running.json; fi
+          else
+            echo '{"signature":"API-ERROR"}' > running.json
+            echo "::warning::actions API unavailable — treat as busy (fail closed)"
+          fi
 
       - name: Decide
         id: decide
@@ -92,67 +106,115 @@ jobs:
           set -euo pipefail
           APPROVE=""
           if [ "${{ inputs.approve_retry }}" = "true" ]; then APPROVE="--approve-retry"; fi
+          # port build inputs = hash of build-consumed files only (doc-only
+          # commits do NOT change this -> no spurious rebuilds; Round 15.1 #5)
+          PORT_SIG=$(for f in port/chromium_sandbox_port.py port/prepare_recipe.py \
+                     port/port.toml port/gnp_shim.c port/ci.sh; do
+                       git rev-parse "HEAD:$f" 2>/dev/null || echo MISSING:$f; done \
+                     | sha256sum | cut -c1-16)
           python3 port/maintenance.py decide --state state.json --probes probes.json \
             --out plan.json --issues issues.json --running running.json \
-            --port-sha "${{ github.sha }}" --now "$(date -u +%FT%TZ)" $APPROVE
+            --port-sha "$PORT_SIG" --now "$(date -u +%FT%TZ)" $APPROVE
           echo "action=$(python3 -c "import json;print(json.load(open('plan.json'))['action'])")" >> "$GITHUB_OUTPUT"
           echo "reason=$(python3 -c "import json;print(json.load(open('plan.json'))['reason'])")" >> "$GITHUB_OUTPUT"
           echo "target=$(python3 -c "import json;print(json.dumps((json.load(open('plan.json')).get('target') or {})))")" >> "$GITHUB_OUTPUT"
           { echo "### Maintenance plan"; echo '```json'; cat plan.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Call existing build workflow (only when decided)
-        if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
-        id: build
-        uses: ./.github/workflows/build-chromium.yml
+      - uses: actions/upload-artifact@v4
         with:
-          termux_ref: ${{ fromJson(steps.decide.outputs.target).termux_ref }}
-          pkg_revision: ${{ fromJson(steps.decide.outputs.target).revision }}
+          name: maintenance-plan-${{ github.run_id }}
+          path: |
+            state.json
+            plan.json
+            probes.json
+            issues.json
 
-      - name: Collect outcome
-        if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
+  build:
+    name: Reusable build (only when decided)
+    needs: evaluate
+    if: needs.evaluate.outputs.action == 'build' && inputs.dry_run != true
+    uses: ./.github/workflows/build-chromium.yml
+    with:
+      termux_ref: ${{ fromJson(needs.evaluate.outputs.target).termux_ref }}
+      pkg_revision: ${{ fromJson(needs.evaluate.outputs.target).pkg_revision_env }}
+
+  outcome:
+    name: Classify outcome + issues + state
+    needs: [evaluate, build]
+    # always(): collect failures AND cancellations of the called build.
+    if: always() && needs.evaluate.result == 'success'
+        && needs.evaluate.outputs.action == 'build' && inputs.dry_run != true
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: write   # ONLY the maintenance/state.json Contents-API commit
+      issues: write     # deduplicated block issues
+      actions: read     # job-level classification of the called workflow
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: maintenance-plan-${{ github.run_id }}
+
+      - name: Classify called-build result
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          res="${{ needs.build.result }}"
+          echo "called build job result: $res"
           success=false; stage=build; : > tail.log
-          if [ "${{ steps.build.outcome }}" = "success" ]; then success=true; stage=ok; fi
-          if [ "$success" = "false" ]; then
-            jobs=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '.jobs[] | "\(.name)|\(.conclusion)"' || true)
-            echo "$jobs" | grep -q '^gate|failure' && stage=gate || true
-            jid=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '.jobs[] | select(.conclusion=="failure") | .id' | tail -1 || true)
-            if [ -n "${jid:-}" ]; then
-              gh api "repos/${{ github.repository }}/actions/jobs/$jid/logs" 2>/dev/null | tail -c 4000 > tail.log || echo "log unavailable" > tail.log
-            fi
-          fi
-          jq -n --argjson ok "$success" --arg stage "$stage" --rawfile tail tail.log \
-            --arg url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            '{success:$ok, stage:$stage, log_tail:$tail, ci_url:$url, ci_run:($ENV.GITHUB_RUN_ID|tonumber)}' > result.json
+          case "$res" in
+            success) success=true; stage=ok ;;
+            cancelled)
+              jq -n '{success:false, stage:"cancelled", log_tail:"run cancelled (user or timeout) — not counted as build failure", ci_url:env.CI_URL, ci_run:(env.GITHUB_RUN_ID|tonumber)}' > result.json ;;
+            failure|timed_out)
+              jobs=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '.jobs[] | "\(.name)|\(.conclusion)"' || true)
+              echo "$jobs" | grep -q '^gate|failure' && stage=gate || true
+              echo "$jobs" | grep -q '^build|failure' && stage=build || true
+              jid=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | .id' | tail -1 || true)
+              if [ -n "${jid:-}" ]; then
+                gh api "repos/${{ github.repository }}/actions/jobs/$jid/logs" 2>/dev/null | tail -c 4000 > tail.log || echo "log unavailable" > tail.log
+              fi ;;
+            skipped)
+              # skipped while decision said build == orchestration anomaly, NOT a
+              # real build failure: record + no issue, no blocked state
+              jq -n '{success:false, stage:"skipped-anomaly", log_tail:"build job skipped despite decided build (orchestration) — recorded, not blocking", ci_url:env.CI_URL, ci_run:(env.GITHUB_RUN_ID|tonumber)}' > result.json ;;
+            *)
+              jq -n --arg r "$res" '{success:false, stage:"unknown", log_tail:("unexpected result: "+$r), ci_url:env.CI_URL, ci_run:(env.GITHUB_RUN_ID|tonumber)}' > result.json ;;
+          esac
           if [ "$success" = "true" ]; then
-            jq --arg d "${{ steps.build.outputs.deb_sha256 }}" \
-               --arg v "${{ steps.build.outputs.deb_version }}" \
-               --arg t "${{ steps.build.outputs.termux_sha }}" \
-               '. + {deb_sha256:$d, deb_version:$v, termux_sha:$t, artifact:("build-"+(env.GITHUB_RUN_ID))}' \
-               result.json > r2.json && mv r2.json result.json
-            if [ -z "$(jq -r '.deb_sha256 // ""' result.json)" ]; then
+            jq --arg d "${{ needs.build.outputs.deb_sha256 }}" \
+               --arg v "${{ needs.build.outputs.deb_version }}" \
+               --arg t "${{ needs.build.outputs.termux_sha }}" \
+               --arg url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+               '. + {deb_sha256:$d, deb_version:$v, termux_sha:$t, artifact:("build-"+(env.GITHUB_RUN_ID)), ci_url:$url}' \
+               '{"success":true,"stage":"ok"}' > result.json
+            if [ -z "${{ needs.build.outputs.deb_sha256 }}" ]; then
               echo '{"success":false,"stage":"verify","log_tail":"build reported success but no deb outputs present","ci_run":0,"ci_url":""}' > result.json
             fi
           fi
+        env:
+          CI_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      - name: Apply result to state + emit issue ops
-        if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
+      - name: Apply result to state
         run: |
           set -euo pipefail
-          [ -f result.json ] || echo '{"success":false,"stage":"build","log_tail":"no result collected","ci_run":0,"ci_url":""}' > result.json
+          [ -f result.json ] || echo '{"success":false,"stage":"unknown","log_tail":"no result collected","ci_run":0,"ci_url":""}' > result.json
           python3 port/maintenance.py apply --state state.json --plan plan.json \
             --result result.json --out state2.json --issues-out ops.json
 
-      - name: Create/comment block issues (engine-deduplicated)
-        if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
+      - name: Create/comment block issues (engine-deduplicated, fail-closed)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           [ -f ops.json ] || echo '{"create_issues":[],"comment_issues":[]}' > ops.json
+          if [ "$(jq -r '.error // false' issues.json)" = "true" ]; then
+            echo '::error::issues API was unavailable at decide-time; refusing issue writes to avoid duplicates'
+            exit 1
+          fi
           n=$(jq '.create_issues | length' ops.json); i=0
           while [ "$i" -lt "$n" ]; do
             title=$(jq -r ".create_issues[$i].title" ops.json)
@@ -171,8 +233,7 @@ jobs:
           done
           python3 port/maintenance.py stamp --state state2.json --ops ops.json
 
-      - name: Push state to maintenance-state branch
-        if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
+      - name: Push state to maintenance-state branch (failure = loud)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -200,8 +261,8 @@ jobs:
         run: |
           {
             echo "### Maintenance outcome"
-            echo "- action/reason: \`${{ steps.decide.outputs.action }} — ${{ steps.decide.outputs.reason }}\`"
-            echo "- dry_run: \`${{ inputs.dry_run }}\` approve_retry: \`${{ inputs.approve_retry }}\`"
-            if [ -f result.json ]; then echo "- result: \`$(jq -c '{success,stage}' result.json)\`"; fi
+            echo "- decision: \`${{ needs.evaluate.outputs.action }} — ${{ needs.evaluate.outputs.reason }}\`"
+            echo "- build job result: \`${{ needs.build.result }}\`  dry_run: \`${{ inputs.dry_run }}\`"
+            if [ -f result.json ]; then echo "- classified: \`$(jq -c '{success,stage}' result.json)\`"; fi
             if [ -f ops.json ]; then echo "- issues created: $(jq '.create_issues|length' ops.json), comments: $(jq '.comment_issues|length' ops.json)"; fi
           } >> "$GITHUB_STEP_SUMMARY"

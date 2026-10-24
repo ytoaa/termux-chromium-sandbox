@@ -851,3 +851,47 @@ Merge prerequisites (owner actions, separate approvals):
    is inert.
 4. Optionally create the `maintenance-state` branch beforehand (first run
    auto-creates it from the seed otherwise).
+
+### Round 15.1 — pre-merge defect fixes (review of 93eb69f)
+
+1. steps[].uses -> **jobs.build.uses** (steps-level reusable-workflow calls
+   are NOT valid Actions syntax; the earlier dry-run merely never reached
+   that step because it was skipped). evaluate -> build -> outcome jobs
+   with needs + job outputs; plan/state/probes/issues transferred via a
+   workflow artifact pair (upload==download name asserted, s30).
+2. outcome runs `if: always() && evaluate succeeded && decided build &&
+   !dry_run`: collects failures AND classifications — cancelled and
+   orchestration-skip are recorded in history but NEVER block or open an
+   Issue (engine tests 18/18b); every other stage incl. unknown stays
+   fail-closed (blocked).
+3. fetch now pins termux master HEAD FIRST, then reads BOTH build.sh files
+   at that exact sha (atomic probe == build checkout; no master fallback).
+   The built version follows prepare_recipe's alignment policy
+   (chromium/build.sh VERSION := chromium-host-tools/build.sh VERSION),
+   so decide builds the host-aligned value (test [16]).
+4. `retry-approved` is a real mechanism: an OPEN block issue carrying that
+   label + the exact full signature in its title authorizes exactly one
+   attempt (test [14]); absence keeps blocking (14b); dispatch flag also
+   supported.
+5. Rebuild trigger uses a **port build-inputs hash** (tree shas of
+   chromium_sandbox_port.py, prepare_recipe.py, port.toml, gnp_shim.c,
+   ci.sh), not the repo HEAD — doc-only commits no longer cause rebuilds.
+6. One signature matcher (`issue_matches_sig`, full 16-hex in the title)
+   everywhere (dedup, stamp, label). GitHub API failures fail closed:
+   issues API error marker -> decide skips with
+   issues-api-error-fail-closed; actions API error -> treated as busy;
+   state API non-404 error aborts the job (no silent seed fallback — only
+   a true first-run 404 seeds).
+7. Ledger honesty: run #31 is recorded with its REAL plain version
+   '156.0.8078.47' (no retroactive -1); rev1 builds stay plain
+   (TERMUX_PKG_REVISION unset = Termux plain version), only rev>=2 get the
+   '-N' suffix + env; checksum_ok renamed to pins_verified with the exact
+   meaning: both files read at pinned sha + literal version lines parsed
+   (deep tarball hash verification remains a build-side duty, never
+   claimed).
+8. Tests: engine 31/31 (13 new-area cases incl. issues fail-closed, label
+   retry, cancelled/skip non-blocking, aligned version, api-busy),
+   static 33/33 (job-level grammar s28, outcome needs+always s29, artifact
+   handoff s30, pinned inputs s31, per-job least-privilege s32), revision
+   suite 4/4; full harness 45/45 (CI self-test gates all of it).
+   Still zero long CI builds and no merge.

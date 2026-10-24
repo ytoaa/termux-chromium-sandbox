@@ -18,9 +18,10 @@ def base_state():
         'status':'BUILD_VERIFIED_CANDIDATE','validated':True},
       'candidates': [], 'blocked': {}, 'history': []}
 
-def probes(version='156.0.8078.47', recipe_sha='R1', host_sha='H1', head='64e02760', errs=None, cksum=True):
-    return {'official_stable':version,'termux_head':head,'checksum_ok':cksum,'fetch_errors':errs or [],
-            'recipe':{'version':version,'host_version':version,'recipe_sha':recipe_sha,'host_sha':host_sha,'revision':0,'distro_version':version}}
+def probes(version='156.0.8078.47', recipe_sha='R1', host_sha='H1', head='64e02760', errs=None, cksum=True, host_version=None):
+    hv = host_version or version
+    return {'official_stable':version,'termux_head':head,'pins_verified':cksum and bool(version and hv),'fetch_errors':errs or [],
+            'recipe':{'version':version,'host_version':hv,'recipe_sha':recipe_sha,'host_sha':host_sha,'revision':0,'distro_version':version}}
 
 SIG = M.build_signature('156.0.8078.47','R1','H1','PORT-A')
 
@@ -31,7 +32,7 @@ check('[m1] identical-inputs skip', pl['action']=='skip' and pl['reason']=='iden
 
 # [2] new version -> build
 pl=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
-check('[m2] new-upstream build', pl['action']=='build' and pl['target']['upstream_version']=='157.0.100.5' and pl['target']['revision']==1 and pl['target']['package_version']=='157.0.100.5-1', json.dumps(pl)[:120])
+check('[m2] new-upstream build rev1=PLAIN version', pl['action']=='build' and pl['target']['upstream_version']=='157.0.100.5' and pl['target']['revision']==1 and pl['target']['package_version']=='157.0.100.5' and pl['target']['pkg_revision_env']=='', json.dumps(pl)[:120])
 
 # [3] same successful version (candidate) -> no rebuild
 st=copy.deepcopy(s); st['candidates']=[{'upstream_version':'157.0.100.5','status':'BUILD_VERIFIED_CANDIDATE','signature':M.build_signature('157.0.100.5','R2','H2','PORT-A')}]
@@ -40,7 +41,7 @@ check('[m3] candidate-already-built skip', pl['action']=='skip' and pl['reason']
 
 # [4] same chromium, port changed -> revision build
 pl=M.decide(s,probes(),'PORT-B','t',[],None)
-check('[m4] revision build', pl['action']=='build' and pl['target']['revision']==2 and pl['target']['package_version']=='156.0.8078.47-2', pl['reason'])
+check('[m4] revision build rev2 suffix+env', pl['action']=='build' and pl['target']['revision']==2 and pl['target']['package_version']=='156.0.8078.47-2' and pl['target']['pkg_revision_env']=='2', pl['reason'])
 
 # [5] patch failure -> blocked + issue creation
 pl=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
@@ -103,8 +104,46 @@ pl=M.decide(sti2,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
 check('[11c] blocked after infra exhaust', pl['action']=='skip' and pl['reason']=='blocked-dedup', pl['reason'])
 
 # official vs recipe divergence is informational, not failure
-pl=M.decide(s,{'official_stable':'158.0.0.1','termux_head':'T','checksum_ok':True,'fetch_errors':[],'recipe':{'version':'156.0.8078.47','host_version':'156.0.8078.47','recipe_sha':'R1','host_sha':'H1','revision':0,'distro_version':'156.0.8078.47'}},'PORT-A','t',[],None)
+pl=M.decide(s,{'official_stable':'158.0.0.1','termux_head':'T','pins_verified':True,'fetch_errors':[],'recipe':{'version':'156.0.8078.47','host_version':'156.0.8078.47','recipe_sha':'R1','host_sha':'H1','revision':0,'distro_version':'156.0.8078.47'}},'PORT-A','t',[],None)
 check('[12] divergence informational', pl['action']=='skip' and 'differs' not in pl['reason'] and any('official Stable' in d for d in pl['diagnostics']), pl['reason'])
+
+# --- Round 15.1 additions ---
+# [13] issues API error marker -> fail-closed skip
+pl=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[{'error':True}],None)
+check('[13] issues-api-error fail-closed', pl['action']=='skip' and pl['reason']=='issues-api-error-fail-closed', pl['reason'])
+
+# [14] retry-approved LABEL on matching open issue unblocks one attempt
+stl=copy.deepcopy(s)
+sigL=M.build_signature('157.0.100.5','R2','H2','PORT-A')
+stl['blocked'][sigL]={'classification':'port','issue':5,'retry_approved':False,
+    'inputs':{'recipe_sha':'R2','host_sha':'H2','port_sha':'PORT-A'}}
+tL=M.issue_title({'upstream_version':'157.0.100.5','revision':1,'signature':sigL},'gate')
+pl=M.decide(stl,probes('157.0.100.5','R2','H2'),'PORT-A','t',[{'number':5,'title':tL,'labels':['auto-build-blocked','retry-approved']}],None)
+check('[14] retry-approved label honored', pl['action']=='build', pl['reason'])
+stl2=copy.deepcopy(s)
+stl2['blocked'][sigL]={'classification':'port','issue':5,'retry_approved':False,
+    'inputs':{'recipe_sha':'R2','host_sha':'H2','port_sha':'PORT-A'}}
+pl=M.decide(stl2,probes('157.0.100.5','R2','H2'),'PORT-A','t',[{'number':5,'title':tL,'labels':['auto-build-blocked']}],None)
+check('[14b] without label stays blocked', pl['action']=='skip' and pl['reason']=='blocked-dedup', pl['reason'])
+
+# [15] full-sig title matching is consistent (dedup==stamp==label)
+check('[15] full-sig matcher', M.issue_matches_sig(tL, sigL) and not M.issue_matches_sig(tL.replace(sigL, sigL[:8]), sigL))
+
+# [16] buildable follows host-tools alignment (prepare_recipe policy)
+pl=M.decide(s,probes('157.0.100.5','R2','H2',host_version='157.0.100.7'),'PORT-A','t',[],None)
+check('[16] aligned host version built', pl['action']=='build' and pl['target']['upstream_version']=='157.0.100.7', json.dumps(pl)[:100])
+
+# [17] actions API error marker -> busy skip
+pl=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],{'signature':'API-ERROR'})
+check('[17] actions api-error busy skip', pl['action']=='skip' and pl['reason']=='build-workflow-busy', pl['reason'])
+
+# [18] cancelled outcome is recorded, never blocks/issues
+pl=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
+stc,opsc=M.apply_result(s,pl,{'success':False,'stage':'cancelled','log_tail':'run cancelled','ci_url':'u'},'t')
+check('[18] cancelled -> no block no issue', len(opsc['create_issues'])==0 and not stc.get('blocked'), json.dumps(opsc)[:120])
+# skipped-anomaly likewise non-blocking
+stx,opsx=M.apply_result(s,pl,{'success':False,'stage':'skipped-anomaly','log_tail':'orchestration skip','ci_url':'u'},'t')
+check('[18b] skipped-anomaly -> no block no issue', len(opsx['create_issues'])==0 and not stx.get('blocked'), json.dumps(opsx)[:120])
 
 print(f'MAINTENANCE-TESTS PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)

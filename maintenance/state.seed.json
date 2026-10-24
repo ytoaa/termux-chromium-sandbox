@@ -11,7 +11,8 @@
   "last_successful_build": {
     "upstream_version": "156.0.8078.47",
     "revision": 1,
-    "package_version": "156.0.8078.47-1",
+    "package_version": "156.0.8078.47",
+    "deb_version": "156.0.8078.47",
     "termux_ref": "64e02760c276cb68f514261653baf59aed45d4fd",
     "port_sha": "403274f29bb288bf81643f0d1772837df49b7dca",
     "signature": "seed-manual",
@@ -22,13 +23,14 @@
     "status": "BUILD_VERIFIED_CANDIDATE",
     "recorded_at": "2026-10-24T00:00:00+09:00",
     "validated": true,
-    "note": "Seeded from run #31 (recognized as the first successful build; signature 'seed-manual' never matches a computed signature so a later identical-input build may still be considered once; the engine dedups against candidates too)."
+    "note": "Seeded from run #31. The REAL shipped deb version is plain '156.0.8078.47' (no -N suffix; TERMUX_PKG_REVISION unset = plain). Ledger 'revision 1' means first-build semantics; the next input-changed rebuild correctly becomes 156.0.8078.47-2. Signature 'seed-manual' never matches a computed signature; engine dedups against candidates too."
   },
   "candidates": [
     {
       "upstream_version": "156.0.8078.47",
       "revision": 1,
-      "package_version": "156.0.8078.47-1",
+      "package_version": "156.0.8078.47",
+      "deb_version": "156.0.8078.47",
       "signature": "seed-manual",
       "deb_sha256": "29c4080d2a849c07eae46a87e44e39231fa92021c1e10e24f363e1e29395b27c",
       "ci_run": 39976822670,
