@@ -1,0 +1,41 @@
+# Daily detection only; no build, merge, release or apt publication.
+name: Daily Chromium Upstream Check
+
+on:
+  # GitHub cron uses UTC. 00:23 UTC = 09:23 Asia/Seoul.
+  schedule:
+    - cron: '23 0 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Check latest versions without creating an Issue'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: daily-chromium-upstream-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Compare Chromium and Termux versions (no build)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check versions and deduplicate GitHub Issues
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            python3 port/check_chromium_updates.py --dry-run
+          else
+            python3 port/check_chromium_updates.py
+          fi
