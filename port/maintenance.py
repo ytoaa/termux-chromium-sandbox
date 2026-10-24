@@ -350,6 +350,12 @@ def main(argv=None) -> int:
     d.add_argument('--running', default=None)
     d.add_argument('--port-sha', required=True)
     d.add_argument('--now', default='(unset)')
+    d.add_argument('--approve-retry', action='store_true')
+    v = sub.add_parser('validate-state')
+    v.add_argument('--state', required=True)
+    st = sub.add_parser('stamp')
+    st.add_argument('--state', required=True)
+    st.add_argument('--ops', required=True)
     a = sub.add_parser('apply')
     a.add_argument('--state', required=True)
     a.add_argument('--plan', required=True)
@@ -359,8 +365,29 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     if args.cmd == 'fetch':
         return cmd_fetch(args)
+    if args.cmd == 'validate-state':
+        d = json.loads(Path(args.state).read_text())
+        assert 'validated' in d and 'last_successful_build' in d, 'state schema'
+        print('STATE-VALID')
+        return 0
+    if args.cmd == 'stamp':
+        ops = json.loads(Path(args.ops).read_text())
+        stt = json.loads(Path(args.state).read_text())
+        created = [(c['title'], c.get('issue'))
+                   for c in ops.get('create_issues', []) if c.get('issue')]
+        for sig, b in (stt.get('blocked') or {}).items():
+            if not b.get('issue'):
+                for title, num in created:
+                    if sig[:8] in title:
+                        b['issue'] = num
+        Path(args.state).write_text(json.dumps(stt, indent=1) + '\n')
+        print('STAMPED', len(created))
+        return 0
     if args.cmd == 'decide':
         state = json.loads(Path(args.state).read_text())
+        if getattr(args, 'approve_retry', False):
+            for v in (state.get('blocked') or {}).values():
+                v['retry_approved'] = True
         probes = json.loads(Path(args.probes).read_text())
         issues = (json.loads(Path(args.issues).read_text())
                   if args.issues else [])

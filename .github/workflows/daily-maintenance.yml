@@ -73,11 +73,7 @@ jobs:
             cp maintenance/state.seed.json state.json
             echo "STATE_SOURCE=seed" >> "$GITHUB_ENV"
           fi
-          python3 - <<'PY'
-          import json
-          d=json.load(open('state.json'))
-          assert 'validated' in d and 'last_successful_build' in d
-          PY
+          python3 port/maintenance.py validate-state --state state.json
 
       - name: Load open block-issues + detect in-progress builds
         env:
@@ -94,29 +90,11 @@ jobs:
         id: decide
         run: |
           set -euo pipefail
-          if [ "${{ inputs.approve_retry }}" = "true" ]; then
-            python3 - <<'PY'
-          import json
-          s=json.load(open('state.json'))
-          for v in (s.get('blocked') or {}).values():
-              v['retry_approved']=True
-          json.dump(s,open('state.json','w'),indent=1)
-          PY
-          fi
+          APPROVE=""
+          if [ "${{ inputs.approve_retry }}" = "true" ]; then APPROVE="--approve-retry"; fi
           python3 port/maintenance.py decide --state state.json --probes probes.json \
-            --out plan.json --issues issues.json --port-sha "${{ github.sha }}" \
-            --now "$(date -u +%FT%TZ)"
-          python3 - <<'PY'
-          import json
-          p=json.load(open('plan.json'))
-          try:
-              run=json.load(open('running.json'))
-          except Exception:
-              run=None
-          if p.get('action')=='build' and run:
-              p['action']='skip'; p['reason']='build-workflow-busy'
-              json.dump(p,open('plan.json','w'),indent=1)
-          PY
+            --out plan.json --issues issues.json --running running.json \
+            --port-sha "${{ github.sha }}" --now "$(date -u +%FT%TZ)" $APPROVE
           echo "action=$(python3 -c "import json;print(json.load(open('plan.json'))['action'])")" >> "$GITHUB_OUTPUT"
           echo "reason=$(python3 -c "import json;print(json.load(open('plan.json'))['reason'])")" >> "$GITHUB_OUTPUT"
           echo "target=$(python3 -c "import json;print(json.dumps((json.load(open('plan.json')).get('target') or {})))")" >> "$GITHUB_OUTPUT"
@@ -128,7 +106,7 @@ jobs:
         uses: ./.github/workflows/build-chromium.yml
         with:
           termux_ref: ${{ fromJson(steps.decide.outputs.target).termux_ref }}
-          pkg_revision: ${{ string(fromJson(steps.decide.outputs.target).revision) }}
+          pkg_revision: ${{ fromJson(steps.decide.outputs.target).revision }}
 
       - name: Collect outcome
         if: steps.decide.outputs.action == 'build' && inputs.dry_run != true
@@ -191,17 +169,7 @@ jobs:
             gh issue comment "$num" --body-file cbody.md || true
             i=$((i+1))
           done
-          python3 - <<'PY'
-          import json
-          ops=json.load(open('ops.json')); st=json.load(open('state2.json'))
-          created=[(c['title'],c.get('issue')) for c in ops.get('create_issues',[]) if c.get('issue')]
-          for sig,b in (st.get('blocked') or {}).items():
-              if not b.get('issue'):
-                  for title,num in created:
-                      if sig[:8] in title:
-                          b['issue']=num
-          json.dump(st,open('state2.json','w'),indent=1)
-          PY
+          python3 port/maintenance.py stamp --state state2.json --ops ops.json
 
       - name: Push state to maintenance-state branch
         if: steps.decide.outputs.action == 'build' && inputs.dry_run != true

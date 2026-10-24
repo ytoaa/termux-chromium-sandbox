@@ -53,5 +53,11 @@ check('[s24] engine compiles', True)
 # renovate non-collision
 rv=json.load(open(os.path.join(ROOT,'..','renovate.json')))
 check('[s25] renovate confined to ledger file (no build trigger)', rv.get('autodiscover') is False and rv['enabledManagers']==['custom.regex'])
+import re as _re
+_dw=open(os.path.join(ROOT,'..','.github/workflows/daily-maintenance.yml')).read()
+check('[s26] no inline python heredocs (engine subcommands only)', "<<'PY'" not in _dw)
+_allowed={'fromJson','toJSON','tojson','contains','startsWith','endsWith','format','join','split','success','failure','always','cancelled','hashFiles'}
+_bad=[fn for e in _re.findall(r'\$\{\{(.*?)\}\}', _dw, _re.S) for fn in _re.findall(r'([A-Za-z_][A-Za-z0-9_]*)\s*\(', e) if fn not in _allowed]
+check('[s27] GH expression functions whitelisted (no string())', not _bad, str(_bad))
 print(f'MAINTENANCE-STATIC PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)
