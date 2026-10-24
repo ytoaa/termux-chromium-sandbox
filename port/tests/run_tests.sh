@@ -323,4 +323,31 @@ BODY=$(sed -n '/cat > "\$_wrap" <<.SHIMWRAP./,/^SHIMWRAP$/p' "$G32")
   && pass "[34] R9b wrapper: no forbidden widening tokens" \
   || fail "[34] R9b forbidden token in wrapper"
 
+# [35] Round 15 maintenance engine scenario tests (offline, mocked).
+python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS=46 FAIL=0$' \
+  && pass "[35] maintenance engine 46/46 scenarios" \
+  || fail "[35] maintenance engine scenarios"
+
+# [36] Round 15 workflow/seed static verification.
+python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=43 FAIL=0$' \
+  && pass "[36] maintenance static workflow+seed 43/43" \
+  || fail "[36] maintenance static checks"
+
+# [37] TERMUX_PKG_REVISION injection behavior (default-off reproducibility).
+if bash "port/tests/maintenance_revision_test.sh" 2>&1 | grep -c '^PASS  \[37' | grep -qx 4; then
+  pass "[37] revision injection default/inject/reject"
+else
+  fail "[37] revision injection suite"
+fi
+
+# [38] Round 15.3 Actions-equivalent integration simulation (file round-trips).
+python3 "port/tests/maintenance_integration_test.py" 2>&1 | grep -q '^MAINTENANCE-INTEGRATION PASS=25 FAIL=0$' \
+  && pass "[38] maintenance integration simulation 25/25" \
+  || fail "[38] maintenance integration simulation"
+
+# [39] Phase B remediation: real-recipe fixtures + typed issues guard + called-job classification.
+bash "port/tests/maintenance_recipe_test.sh" 2>&1 | tail -1 | grep -q '^RECIPE-CLASSIFY-TESTS RC=0$' \
+  && pass "[39] recipe/fixtures/classify suite (A/B/D)" \
+  || fail "[39] recipe/fixtures/classify suite"
+
 exit $rc

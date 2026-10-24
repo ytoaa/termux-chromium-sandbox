@@ -14,6 +14,41 @@ on:
         description: Build even when versions already match (reserved)
         type: boolean
         default: false
+      pkg_revision:
+        description: TERMUX_PKG_REVISION override (empty = unchanged; used by maintenance revision builds)
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      termux_ref:
+        description: termux-packages exact commit sha (pinned by maintenance probe)
+        type: string
+        required: true
+      pkg_revision:
+        description: TERMUX_PKG_REVISION override (empty = unchanged)
+        type: string
+        required: false
+        default: ""
+      source:
+        description: caller identity for audit (maintenance|manual)
+        type: string
+        required: false
+        default: "maintenance"
+    outputs:
+      deb_sha256:
+        value: ${{ jobs.build.outputs.deb_sha256 }}
+      deb_version:
+        value: ${{ jobs.build.outputs.deb_version }}
+      termux_sha:
+        value: ${{ jobs.build.outputs.termux_sha }}
+      port_sha:
+        value: ${{ jobs.build.outputs.port_sha }}
+
+# Serializes manual + maintenance builds: never two builds at once, no
+# cancel-in-progress (an in-flight 1h build is never thrown away).
+concurrency:
+  group: build-chromium-serial
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -43,6 +78,13 @@ jobs:
     needs: gate
     runs-on: ubuntu-26.04
     timeout-minutes: 350
+    env:
+      TERMUX_SANDBOXED_REVISION: ${{ inputs.pkg_revision }}
+    outputs:
+      deb_sha256: ${{ steps.emit.outputs.deb_sha256 }}
+      deb_version: ${{ steps.emit.outputs.deb_version }}
+      termux_sha: ${{ steps.emit.outputs.termux_sha }}
+      port_sha: ${{ steps.emit.outputs.port_sha }}
     steps:
       - uses: actions/checkout@v7
       - name: Checkout termux-packages (ref from inputs; sha recorded for audit)
@@ -118,6 +160,17 @@ jobs:
             || { echo "wrapper does not exec the real launcher"; rm -rf "$tmpd"; exit 1; }
           rm -rf "$tmpd"
           echo "PORT GATES PASS: $pkg $ver"
+      - name: Emit outputs (maintenance pipeline)
+        id: emit
+        if: always()
+        run: |
+          deb=$(ls termux-packages/output/chromium-sandboxed_*_aarch64.deb 2>/dev/null | head -1 || true)
+          if [ -n "$deb" ]; then
+            echo "deb_sha256=$(sha256sum "$deb" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+            echo "deb_version=$(dpkg-deb -f "$deb" Version)" >> "$GITHUB_OUTPUT"
+          fi
+          echo "termux_sha=$(cat termux-pin.txt 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+          echo "port_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Save sccache
         if: always()
         uses: actions/cache/save@v4

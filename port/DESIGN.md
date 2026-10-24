@@ -770,3 +770,339 @@ closed, reproduction conditions unknown (ws server stderr was discarded
 in main runs — recorded as measurement gap).
 
 Verdict inputs are in FINAL REPORT; nothing promoted, no defaults changed.
+
+## Round 15 — automated maintenance pipeline (2026-10-24, this PR)
+
+Goal: daily probe -> conditional build -> fail-stop + Issue -> candidate
+retention, with humans as the only path to security-policy or validated
+changes. Nothing here is active until the PR is merged (schedule fires only
+on the default branch) — and merge is a separate approval.
+
+Architecture (single pipeline, no duplicate workflows):
+- `.github/workflows/daily-maintenance.yml` — cron 23 0 * * * (09:23 KST) +
+  manual dry-run/approve-retry. Permissions: actions:read, issues:write,
+  contents:write (ONLY the Contents-API commit of maintenance/state.json on
+  the `maintenance-state` branch (regular, bootstrapped from default-branch head; not orphan) — path+branch hardcoded; branch-
+  scoped tokens don't exist, flagged for review). Concurrency serializes
+  daily runs; the build workflow has its own serial group so
+  manual+scheduled builds never overlap (no cancellation of in-flight
+  ~1h builds).
+- Reuses `.github/workflows/build-chromium.yml` via **workflow_call** —
+  every existing invariant stays: termux_ref pinned to an exact sha,
+  separate package identity, R1~R9b transforms (fail-closed self-test gate
+  job), sccache, package gates, artifacts. Manual workflow_dispatch is
+  unchanged (static test s1). New: optional pkg_revision ->
+  TERMUX_SANDBOXED_REVISION (unset = byte-identical to pre-Round-15 recipe,
+  preserving #31 reproducibility), plus job outputs (deb sha/version,
+  termux/port sha) for the state ledger. (GITHUB_TOKEN cannot
+  workflow_dispatch/repository_dispatch another run; workflow_call is the
+  only token-legal composition — documented.)
+- `port/maintenance.py` — pure offline decision engine (no subprocess/exec
+  surface; network only in `fetch`): build signature =
+  sha256(upstream_version, recipe-blob-sha, host-tools-blob-sha, port_sha).
+  termux-master HEAD drift alone never rebuilds (§4 "actual build inputs").
+  Rules: behind -> skip; identical signature -> skip; candidate exists ->
+  skip; new version -> build rev1; same version + changed inputs ->
+  revision+1 (`156.0.8078.47-2` style — Termux native version-revision,
+  upstream version never synthesized above official); fetch/checksum errors
+  -> fail-closed skip; blocked signature -> skip unless inputs changed or
+  retry_approved.
+- State (`maintenance/state.json` on `maintenance-state`, seed =
+  `maintenance/state.seed.json` recognizing run #31 as the first
+  successful build + the validated baseline verbatim). validated block is
+  read-only to automation (tests s17/s18/s19; apply never rewrites it).
+- Failure handling: called-workflow job conclusions classify stage
+  (gate->port, verify->port, build+transient-keywords->infra); infra gets
+  exactly ONE automatic retry then escalates; port/unknown block
+  immediately with a deduplicated `auto-build-blocked` Issue carrying
+  version, port sha, termux sha, stage, log excerpt, CI link, last success,
+  repro steps, blocked status. Second failure on same signature comments on
+  the existing Issue (no spam). Closing the Issue alone does NOT retry —
+  unblock requires changed inputs, `retry-approved` label, or the
+  approve_retry dispatch (engine test 6d/6e).
+- Success -> candidate recorded with status BUILD_VERIFIED_CANDIDATE,
+  deb sha256, ci links (validated stays untouched — device gates remain
+  human gates). Retention: candidates keep ci_run/artifact ids; GH
+  artifacts expire per repo retention setting (recommend 90d — an OWNER
+  setting); expired artifact => state keeps history, rebuild allowed by
+  human dispatch.
+- Renovate (main) stays untouched: it only bumps the detection ledger
+  `port/upstream.renovate`; no build trigger, no collision (test s25).
+- Supersedes this PR's v1 (check-chromium-upstream.yml +
+  check_chromium_updates.py, issue-only watcher) — removed; probe logic
+  absorbed into maintenance.py fetch.
+
+Verification (all offline/static; NO long CI build was run, NO schedule is
+active until merge):
+- port/tests/maintenance_test.py         23/23 scenarios (§10 list 1-10 +
+  infra-vs-port classification, dedup, closed-issue-still-blocked,
+  retry-approved one-shot, divergence informational)
+- port/tests/maintenance_static_test.py  25/25 workflow/seed invariants
+- port/tests/maintenance_revision_test.sh 4/4 revision injection
+- Full harness now 45/45 (new cases [35][36][37] gate CI self-test too —
+  the build workflow's fail-closed gate now also protects the maintenance
+  code paths).
+
+Merge prerequisites (owner actions, separate approvals):
+1. Review daily-maintenance permissions grant (contents:write rationale).
+2. Decide artifact retention (Settings -> Actions, recommend 90 days) and
+   ensure GitHub Actions status badge/branch protection expectations.
+3. Merge PR #1 -> schedule becomes live on default branch. Until then this
+   is inert.
+4. Optionally create the `maintenance-state` branch beforehand (first run
+   auto-creates it from the seed otherwise).
+
+### Round 15.1 — pre-merge defect fixes (review of 93eb69f)
+
+1. steps[].uses -> **jobs.build.uses** (steps-level reusable-workflow calls
+   are NOT valid Actions syntax; the earlier dry-run merely never reached
+   that step because it was skipped). evaluate -> build -> outcome jobs
+   with needs + job outputs; plan/state/probes/issues transferred via a
+   workflow artifact pair (upload==download name asserted, s30).
+2. outcome runs `if: always() && evaluate succeeded && decided build &&
+   !dry_run`: collects failures AND classifications — cancelled and
+   orchestration-skip are recorded in history but NEVER block or open an
+   Issue (engine tests 18/18b); every other stage incl. unknown stays
+   fail-closed (blocked).
+3. fetch now pins termux master HEAD FIRST, then reads BOTH build.sh files
+   at that exact sha (atomic probe == build checkout; no master fallback).
+   The built version follows prepare_recipe's alignment policy
+   (chromium/build.sh VERSION := chromium-host-tools/build.sh VERSION),
+   so decide builds the host-aligned value (test [16]).
+4. `retry-approved` is a real mechanism: an OPEN block issue carrying that
+   label + the exact full signature in its title authorizes exactly one
+   attempt (test [14]); absence keeps blocking (14b); dispatch flag also
+   supported.
+5. Rebuild trigger uses a **port build-inputs hash** (tree shas of
+   chromium_sandbox_port.py, prepare_recipe.py, port.toml, gnp_shim.c,
+   ci.sh), not the repo HEAD — doc-only commits no longer cause rebuilds.
+6. One signature matcher (`issue_matches_sig`, full 16-hex in the title)
+   everywhere (dedup, stamp, label). GitHub API failures fail closed:
+   issues API error marker -> decide skips with
+   issues-api-error-fail-closed; actions API error -> treated as busy;
+   state API non-404 error aborts the job (no silent seed fallback — only
+   a true first-run 404 seeds).
+7. Ledger honesty: run #31 is recorded with its REAL plain version
+   '156.0.8078.47' (no retroactive -1); rev1 builds stay plain
+   (TERMUX_PKG_REVISION unset = Termux plain version), only rev>=2 get the
+   '-N' suffix + env; checksum_ok renamed to pins_verified with the exact
+   meaning: both files read at pinned sha + literal version lines parsed
+   (deep tarball hash verification remains a build-side duty, never
+   claimed).
+8. Tests: engine 31/31 (13 new-area cases incl. issues fail-closed, label
+   retry, cancelled/skip non-blocking, aligned version, api-busy),
+   static 33/33 (job-level grammar s28, outcome needs+always s29, artifact
+   handoff s30, pinned inputs s31, per-job least-privilege s32), revision
+   suite 4/4; full harness 45/45 (CI self-test gates all of it).
+   Still zero long CI builds and no merge.
+
+### Round 15.2 — post-processing hardening (review of 1310acf)
+
+1. Success result JSON: the old jq passed a JSON literal as an INPUT FILE
+   name (always crashed). Now `echo | jq` builds raw result; SHAPE
+   VALIDATION MOVED INTO THE ENGINE (apply): deb_sha256 must be 64-hex,
+   deb_version must equal the decided package_version, termux_sha 40-hex,
+   ci_run positive int, ci_url https, artifact present — any mismatch
+   downgrades a 'success' to stage=verify (blocked + issue), so a
+   malformed success can never mint a candidate (tests 19a-d).
+2. Failure paths (failure|timed_out) now ALWAYS emit result.json with the
+   failed job NAMES (queried from the same-run jobs API), stage
+   (gate|build from actual reusable-workflow job keys), 4KB log excerpt and
+   run url (test 20). cancelled / skipped-anomaly remain non-blocking.
+3. infra retry contradiction fixed: first infra failure stores
+   infra_failures=1 (no issue); decide then EXPLICITLY allows the single
+   retry (test 11a2); second infra failure -> failures=2 -> issue + block;
+   decide skips at >=2 (11b/11c).
+4. retry-approved is one-shot per signature: label match sets
+   approval_used; the FOLLOWING apply consumes it (retry_approved=False +
+   approval_consumed_issues += [issue]); a still-open labelled issue can
+   never authorize a second daily retry (22a-c). Success clears the block
+   entry entirely.
+5. Durability: outcome job pre-creates required labels (idempotent, hard
+   fail if unavailable). Durable dedup survives state-push loss: an OPEN
+   issue with the exact full signature blocks even when state.blocked is
+   gone, and apply persists the re-link (plan.relink) so the ledger
+   re-attaches to issue #N (23a/b). Approval checks run BEFORE this
+   durable skip, so human-authorized retries are never swallowed.
+Tests: engine 42/42 (19-23 new + 11a2), static 34/34 (s34 = every run:
+block passes bash -n with expressions substituted), revision 4/4, full
+harness 45/45. Still zero long builds; dry-run dispatch re-verified parse.
+
+### Round 15.3 — real state-transfer-path fixes (review of 98e6581)
+
+1. Approval one-shot survives SERIALIZATION: decide no longer keeps the
+   origin in memory only — it writes plan.approval={issue,signature} into
+   plan.json; apply consumes using ONLY the deserialized plan + the
+   ORIGINAL state.json (what the outcome job really reads). A surviving
+   label can never authorize a second attempt (integration iA1-4 across
+   simulated days).
+2. Relink-only repair path executes: evaluate exposes a `relink` output and
+   the outcome job runs for `action==build OR relink==true` (never on
+   dry_run). Relink performs ZERO builds and ZERO issue creations while
+   persisting the issue re-attachment to maintenance-state (iB1-3),
+   repairing the ledger after a state-push loss; the following day's decide
+   keeps skipping from the repaired state.
+3. Failed job names now reach the Issue body (render_issue receives
+   result.failure_jobs — previously read from the wrong dict) with prefix-
+   tolerant normalization (name split at first space; grep -qw), asserted
+   with EXACT substrings (iC1) instead of the old weak stage-substring
+   check. Success validation additionally requires result.termux_sha to
+   equal the PINNED target.termux_ref — a success built from a different
+   source SHA is downgraded to verify (blocked + issue, iD1); candidates
+   carry artifact_verified=false (existence confirmation belongs to the
+   human device-gate fetch, never auto-claimed). classify_failure
+   whitelists stages — any unrecognized stage string becomes 'unknown'
+   and BLOCKS.
+4. Integration simulation (port/tests/maintenance_integration_test.py)
+   mirrors the Actions dataflow EXACTLY: engine invoked via CLI
+   (subprocess), state/plan/issues/running/result as FILES on disk, every
+   step re-reading from disk (never reusing decide's memory) — covering
+   approved-retry-then-block across days, lost-state relink with zero
+   builds, failure job names in bodies, foreign-termux-sha success
+   rejection, busy/issues-error regressions: 13/13.
+Totals: engine 46/46, static 36/36 (s35 relink wiring, s36 prefix
+normalization), revision 4/4, integration 13/13, harness 46/46.
+
+### Round 15.4 — final acceptance & operational readiness (close of dev rounds)
+
+Boundary fix (approval vs lost state): the retry-approved consumption now
+lives on GITHUB ITSELF — the outcome job's FIRST mutation step deletes the
+`retry-approved` label from the approving issue before classify/apply/push.
+One approval = one attempt is therefore durable even when the maintenance-
+state push fails (iF1b: push lost + label consumed -> next run blocked).
+If label removal fails, apply+push still record consumption (backstop); a
+re-attempt then requires BOTH the GitHub API and the state push to fail
+persistently — bounded and documented (iF1c shows the sole fallback path,
+which still creates exactly one more attempt, never an unbounded daily
+loop, because removal succeeds on the next outcome run). Manual re-approval
+(still works: re-add label. No new approval system was introduced.
+
+Integration suite extended to the full operational matrix (file-based,
+CLI subprocess — identical dataflow to Actions jobs): new-version build,
+identical-skip, port-input-change revision build, success->candidate,
+failure->issue+block, infra exactly-one-retry (iF2a-d), approval exactly-
+one (iA/iF1), approval-fail+push-lost -> blocked (iF1b), issue-created+
+ledger-lost -> no duplicate (iF6), lost-state relink (iB), SHA/version
+mismatch -> verify rejection (iD1/iF5), dry-run guards (static s13/s35),
+validated block byte-identical across every scenario (iF7). Static s37-s39
+verify the WORKFLOW SHELL semantics themselves: non-404 state errors abort,
+classify covers success/cancelled/failure|timed_out/skipped/* and hard-
+requires a non-empty result.json, label-consume precedes classify.
+
+Operational settings review (design KEPT as-is):
+- permissions: evaluate = read-only trio; build = none (inherits file);
+  outcome = issues:write + contents:write (single hardcoded Contents-API
+  path/branch) + actions:read. No pull-requests, no deployments.
+- maintenance-state: bot-only branch; pushes carry GITHUB_TOKEN (cannot
+  self-trigger). Recommend (owner) branch protection = admin-only pushes
+  with the Actions actor allowed; history is the audit ledger.
+- labels auto-provisioned (auto-build-blocked + classification/*) with a
+  hard existence check before any issue write.
+- duplicate builds impossible: daily concurrency group + build-chromium
+  serial group + evaluate busy-check (actions API, fail-closed as busy).
+- manual vs automatic share the SAME serial group — never overlap; a
+  running ~1h build is never cancelled.
+- retention: recommend 90 days (owner setting). Expired artifacts keep the
+  state ledger (ci_url + sha remain); rebuild = human dispatch.
+- usage: daily probe+decide = minutes; one full build only when inputs
+  actually change (signature-gated) — typically once per upstream release.
+- seed consistency: #31 recorded with its REAL plain version and full
+  identity fields (static s18/s18b/s19/s20 cross-check port.toml).
+
+Transition plan:
+  Phase A (this round): all code/test/state-transfer verification COMPLETE.
+  Phase B (separate approval): ONE non-dry-run dispatch on the PR branch
+    (or post-merge) exercising probe -> decide -> real build -> outcome ->
+    candidate ledger end to end. validated 156 stays untouched by design.
+  Phase C (separate approval): merge PR #1; the 09:23 KST schedule becomes
+    live on the default branch.
+
+Totals: engine 46/46, static 39/39, integration 25/25, revision 4/4,
+harness 46/46. Verdict: GO (see final report).
+
+### Phase B (first real build, run 40098664387) + Remediation
+
+Real dispatch (dry_run=false) executed the pipeline end-to-end for the
+first time: evaluate seeded state, decided BUILD `156.0.8078.47-2`
+(sig fec82d2d32ef91de; termux drifted to 2af83c387...), TERMUX_SANDBOXED_
+REVISION=2 propagated correctly, gate job PASS, called build died at
+prepare (40s). Outcome behaved EXACTLY as designed: failure classified
+unknown (fail-closed), Issue #2 created with full sig + labels, blocked,
+no candidate, validated 156 untouched; follow-up dry-run re-decided
+`skip / open-issue-exists` proving durable duplicate protection even with
+the state branch never created (push had failed). Verdict was NO-GO on
+three concrete defects, all remediated here with minimal scope:
+
+A  Real upstream drift: at 2af83c387 chromium/build.sh uses QUOTED
+   TERMUX_PKG_VERSION="156.0.8078.47"; align_versions' bare-only regex hit
+   None.group(1). Now parses bare/double/single quotes, preserves the
+   file's quote style on rewrite (lambda replacement keeps surrounding
+   characters), raises RecipeError on unrecognised shapes, and is tested
+   against the REAL recipes at 2af83c387 pinned as fixtures
+   (port/tests/fixtures/real_*_2af83c3), including align-to-host-tools,
+   SHA256 swap from mocked release hashes, revision-2 injection on the
+   quoted file, and bash -n. Source SHA256/patch contracts untouched.
+B  issues.json guard now typed (`if type=="object"...`) — normal arrays
+   (empty or populated) parse cleanly; only the error object fails closed
+   (tests B:*).
+C  State-push bootstrap is honest: branch probe distinguishes legit
+   404-absent from real API errors (both logged), POST git/refs errors
+   are NOT swallowed (`> ref-create.json` kept), existence is re-verified
+   before any PUT, and create-file vs update-file are separate explicit
+   paths with a loud probe-failure branch. maintenance-state documented
+   as what it actually is: a REGULAR branch from the default-branch head,
+   not an orphan (README/workflow text corrected).
+D  Called-workflow jobs are named '<caller job> / <called job>' (observed:
+   'Reusable build (only when decided) / build'). The split-at-space
+   parser saw 'Reusable' -> stage unknown + log unavailable. Now extracts
+   the segment after the LAST '/', ltrim-str, then split-space; job id
+   comes from the same filtered set; log-download failures record the
+   actual gh/HTTP stderr plus job id (never silent). Fixture uses the
+   REAL names from run 40098664387 (tests D1-D3); unknown-still-blocks
+   policy retained.
+
+Test totals after remediation: engine 46/46, static 43/43 (s40-s43 new),
+integration 25/25, recipe/fixtures/classify 10/10, revision 4/4,
+harness 47/47. NO new real build was executed during remediation.
+
+### Phase B pre-revalidation hardening (final, before single re-build)
+
+Two review findings closed with minimal scope:
+A. State bootstrap contract alignment: first-run `maintenance-state`
+   creation now resolves the REPOSITORY DEFAULT BRANCH via the repo API
+   (`--jq .default_branch`) and takes that exact commit SHA for POST
+   git/refs — previously `github.ref_name` meant a dispatch from the PR
+   work-branch would fork state off the feature head, violating the
+   'default-branch head' contract. Existing branch is never recreated;
+   non-404 probe errors still abort; POST is unswallowed; existence
+   re-verified before PUT; create-file vs update-file paths remain split.
+   Static s40 asserts default_branch SHA is the actual POST input and
+   github.ref_name is absent from the push step.
+B. Strict version parsing: ONE shared VER_STRICT parser for recipe and
+   host-tools — bare/"..."/'...' dotted versions only, leading indent and
+   trailing spaces/#comment tolerated (and PRESERVED on rewrite via
+   captured trailing group), junk suffixes ("...47junk"), mismatched
+   quotes, spaced assignments and empty values NO LONGER partially match:
+   recipe path raises RecipeError, host path returns None (align no-ops,
+   upstream's own comparison remains the backstop). 12 boundary cases +
+   comment-preservation rewrite + align junk rejection tested (B-parser).
+Harness after hardening: engine 46/46, static 43/43 (s40 strengthened),
+integration 25/25, recipe/classify 11/11, revision 4/4, harness 47/47,
+CI selftest green. No real build executed; Issue #2 blocked; validated
+156 intact. Verdict: GO for the single non-dry-run Phase B revalidation.
+
+### Phase B final parser boundary (bash comment parity)
+
+VER_STRICT trailing group was `([ \t]*(?:#.*)?)$` — accepted `#junk`
+WITHOUT preceding whitespace. Bash reality (empirically checked):
+`VAR=1.2.3#junk`, `VAR="1.2.3"#junk`, `VAR='1.2.3'#junk` all assign the
+JUNK-CONTAINING value `1.2.3#junk` — the parser partially matching them
+as 1.2.3 violated fail-closed/bash-parity. Fixed to
+`([ \t]+#.*|[ \t]*)$`: a comment requires >=1 whitespace before '#';
+bare/quoted forms and legitimate ' #comment' / '\t#comment' trailers
+still pass (and are preserved verbatim through alignment rewrites, group
+4 unchanged); `=1.2.3junk` remains rejected. New C-boundary suite (13
+PASS total): 10-case table (accept/reject) + per-case EMPIRICAL bash
+assignment comparison (reject set must never be a clean dotted value in
+bash) + comment-preservation rewrite + recipe RecipeError / host-tools
+None. No other logic touched.

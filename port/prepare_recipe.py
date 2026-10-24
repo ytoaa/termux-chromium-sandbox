@@ -10,7 +10,7 @@ Modes:
 Exit non-zero on any contract violation (fail closed).
 """
 from __future__ import annotations
-import argparse, hashlib, re, shutil, subprocess, sys
+import argparse, hashlib, os, re, shutil, subprocess, sys
 from pathlib import Path
 
 PKG_SRC = "x11-packages/chromium"
@@ -59,8 +59,8 @@ def host_tools_version(termux_dir: Path) -> str | None:
     f = termux_dir / "x11-packages" / "chromium-host-tools" / "build.sh"
     if not f.is_file():
         return None
-    m = re.search(r'^TERMUX_PKG_VERSION="?([0-9][0-9.]*)"?', f.read_text(), re.M)
-    return m.group(1) if m else None
+    parsed = parse_version_line(f.read_text())
+    return parsed[0] if parsed else None
 
 def fetch_tarball_sha256(version: str) -> str:
     """sha256 from the release's .hashes asset (fail closed)."""
@@ -77,6 +77,28 @@ def fetch_tarball_sha256(version: str) -> str:
         raise RecipeError(f"sha256 for {version} not found in hashes asset")
     return m.group(1)
 
+# Phase B remediation B: ONE strict version-line parser for recipe and
+# host-tools alike. Accepts exactly bare / "..." / '...' dotted versions,
+# optional leading indentation, optional trailing spaces + # comment.
+# Anything else (junk suffixes, mismatched quotes, spaced assignment) does
+# NOT partially match — callers must treat None as invalid.
+VER_STRICT = re.compile(
+    r"^[ \t]*TERMUX_PKG_VERSION="
+    r"(?:\"([0-9]+(?:\.[0-9]+)*)\"|'([0-9]+(?:\.[0-9]+)*)'"
+    r"|([0-9]+(?:\.[0-9]+)*))"
+    r"([ \t]+#.*|[ \t]*)$", re.M)
+
+
+def parse_version_line(text: str):
+    """-> (version, quote_char, trailing_text) or None (never partial)."""
+    m = VER_STRICT.search(text)
+    if not m:
+        return None
+    ver = m.group(1) or m.group(2) or m.group(3)
+    quote = '"' if m.group(1) is not None else ("'" if m.group(2) is not None else '')
+    return ver, quote, m.group(4)
+
+
 def align_versions(text: str, termux_dir: Path) -> tuple[str, list]:
     """Upstream drift guard: the recipe's own post_get_source compares our
     TERMUX_PKG_VERSION against chromium-host-tools/build.sh and termux_error_exit
@@ -88,11 +110,20 @@ def align_versions(text: str, termux_dir: Path) -> tuple[str, list]:
     ht = host_tools_version(termux_dir)
     if ht is None:
         return text, notes
-    cur = re.search(r'^TERMUX_PKG_VERSION=([0-9][0-9.]*)', text, re.M).group(1)
+    # Phase B remediation A: upstream drifted to QUOTED version lines
+    # (TERMUX_PKG_VERSION="156.0.8078.47" at 2af83c387...). Support quoted
+    # and bare forms, preserve the file's own quote style on rewrite, and
+    # raise an explicit RecipeError instead of crashing on None.group(1).
+    parsed = parse_version_line(text)
+    if not parsed:
+        raise RecipeError("TERMUX_PKG_VERSION line unrecognised in recipe "
+                          "(expected bare or quoted dotted version)")
+    cur, quote, _trailing = parsed
     if cur == ht:
         return text, notes
     sha = fetch_tarball_sha256(ht)
-    text = re.sub(r'^TERMUX_PKG_VERSION=[0-9][0-9.]*', f"TERMUX_PKG_VERSION={ht}", text, count=1, flags=re.M)
+    text = VER_STRICT.sub(lambda mm: 'TERMUX_PKG_VERSION={0}{1}{0}{2}'.format(
+        quote, ht, mm.group(4)), text, count=1)
     text = re.sub(r'^TERMUX_PKG_SHA256=[0-9a-f]+', f"TERMUX_PKG_SHA256={sha}", text, count=1, flags=re.M)
     notes.append(f"aligned clone {cur} -> host-tools {ht} (sha256 from release hashes)")
     return text, notes
@@ -245,6 +276,24 @@ def prepare(termux_dir: Path) -> dict:
             text, align_notes = align_versions(text, termux_dir)
             for n in align_notes:
                 print("NOTE:", n)
+            # Maintenance revision override (Round 15): only set when the
+            # caller explicitly passes TERMUX_SANDBOXED_REVISION (empty =
+            # byte-identical to pre-Round-15 behavior, so #31 reproducibility
+            # holds). Chromium upstream version is NEVER touched here —
+            # upstream version and our package revision stay independent.
+            rev = (os.environ.get("TERMUX_SANDBOXED_REVISION") or "").strip()
+            if rev:
+                if not re.fullmatch(r"[0-9]{1,2}", rev):
+                    raise RecipeError(f"invalid TERMUX_SANDBOXED_REVISION: {rev!r}")
+                if re.search(r"^TERMUX_PKG_REVISION=", text, re.M):
+                    text = re.sub(r'^TERMUX_PKG_REVISION=.*$',
+                                  f'TERMUX_PKG_REVISION="{rev}"', text,
+                                  count=1, flags=re.M)
+                else:
+                    text = re.sub(r'^(TERMUX_PKG_VERSION=.*)$',
+                                  r'\1\nTERMUX_PKG_REVISION="%s"' % rev, text,
+                                  count=1, flags=re.M)
+                print("NOTE: TERMUX_PKG_REVISION set to", rev)
             if HOOK_BEGIN not in text:
                 # Chain, NEVER clobber: if the recipe defines its own
                 # termux_step_post_get_source (chromium does — it applies
