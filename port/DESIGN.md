@@ -962,3 +962,60 @@ harness 45/45. Still zero long builds; dry-run dispatch re-verified parse.
    rejection, busy/issues-error regressions: 13/13.
 Totals: engine 46/46, static 36/36 (s35 relink wiring, s36 prefix
 normalization), revision 4/4, integration 13/13, harness 46/46.
+
+### Round 15.4 — final acceptance & operational readiness (close of dev rounds)
+
+Boundary fix (approval vs lost state): the retry-approved consumption now
+lives on GITHUB ITSELF — the outcome job's FIRST mutation step deletes the
+`retry-approved` label from the approving issue before classify/apply/push.
+One approval = one attempt is therefore durable even when the maintenance-
+state push fails (iF1b: push lost + label consumed -> next run blocked).
+If label removal fails, apply+push still record consumption (backstop); a
+re-attempt then requires BOTH the GitHub API and the state push to fail
+persistently — bounded and documented (iF1c shows the sole fallback path,
+which still creates exactly one more attempt, never an unbounded daily
+loop, because removal succeeds on the next outcome run). Manual re-approval
+(still works: re-add label. No new approval system was introduced.
+
+Integration suite extended to the full operational matrix (file-based,
+CLI subprocess — identical dataflow to Actions jobs): new-version build,
+identical-skip, port-input-change revision build, success->candidate,
+failure->issue+block, infra exactly-one-retry (iF2a-d), approval exactly-
+one (iA/iF1), approval-fail+push-lost -> blocked (iF1b), issue-created+
+ledger-lost -> no duplicate (iF6), lost-state relink (iB), SHA/version
+mismatch -> verify rejection (iD1/iF5), dry-run guards (static s13/s35),
+validated block byte-identical across every scenario (iF7). Static s37-s39
+verify the WORKFLOW SHELL semantics themselves: non-404 state errors abort,
+classify covers success/cancelled/failure|timed_out/skipped/* and hard-
+requires a non-empty result.json, label-consume precedes classify.
+
+Operational settings review (design KEPT as-is):
+- permissions: evaluate = read-only trio; build = none (inherits file);
+  outcome = issues:write + contents:write (single hardcoded Contents-API
+  path/branch) + actions:read. No pull-requests, no deployments.
+- maintenance-state: bot-only branch; pushes carry GITHUB_TOKEN (cannot
+  self-trigger). Recommend (owner) branch protection = admin-only pushes
+  with the Actions actor allowed; history is the audit ledger.
+- labels auto-provisioned (auto-build-blocked + classification/*) with a
+  hard existence check before any issue write.
+- duplicate builds impossible: daily concurrency group + build-chromium
+  serial group + evaluate busy-check (actions API, fail-closed as busy).
+- manual vs automatic share the SAME serial group — never overlap; a
+  running ~1h build is never cancelled.
+- retention: recommend 90 days (owner setting). Expired artifacts keep the
+  state ledger (ci_url + sha remain); rebuild = human dispatch.
+- usage: daily probe+decide = minutes; one full build only when inputs
+  actually change (signature-gated) — typically once per upstream release.
+- seed consistency: #31 recorded with its REAL plain version and full
+  identity fields (static s18/s18b/s19/s20 cross-check port.toml).
+
+Transition plan:
+  Phase A (this round): all code/test/state-transfer verification COMPLETE.
+  Phase B (separate approval): ONE non-dry-run dispatch on the PR branch
+    (or post-merge) exercising probe -> decide -> real build -> outcome ->
+    candidate ledger end to end. validated 156 stays untouched by design.
+  Phase C (separate approval): merge PR #1; the 09:23 KST schedule becomes
+    live on the default branch.
+
+Totals: engine 46/46, static 39/39, integration 25/25, revision 4/4,
+harness 46/46. Verdict: GO (see final report).

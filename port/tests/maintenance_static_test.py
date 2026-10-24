@@ -104,5 +104,18 @@ check('[s35] relink-only repair path wired (evaluate output + outcome if)',
       and "relink == 'true'" in _dwj['outcome']['if'])
 check('[s36] failed job names prefix-normalized (split at space)',
       _dwt.count('split') > 0 and ('" ")[0]' in _dwt))
+_steps_out={st.get('name',''):st.get('run','') for st in _dwj['outcome']['steps']}
+_steps_ev={st.get('name',''):st.get('run','') for st in _dwj['evaluate']['steps']}
+_cl=[v for k,v in _steps_out.items() if 'Classify' in k]
+check('[s37] state-load fail-closed semantics (non-404 aborts)',
+      any('::error::state API failure' in v and 'exit 1' in v and
+          'No commit found for the ref' in v for v in _steps_ev.values()))
+check('[s38] classify covers all result branches + guarantees result.json',
+      _cl and all(k in _cl[0] for k in ('success)','cancelled)','failure|timed_out)','skipped)','*)'))
+      and 'test -s result.json' in _cl[0])
+check('[s39] durable label-consume step present before classify',
+      any('Consume retry-approved label' in k for k in _steps_out)
+      and list(_steps_out).index(next(k for k in _steps_out if 'Consume retry-approved' in k))
+          < list(_steps_out).index(next(k for k in _steps_out if 'Classify' in k)))
 print(f'MAINTENANCE-STATIC PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)

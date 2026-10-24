@@ -162,6 +162,27 @@ jobs:
         with:
           name: maintenance-plan-${{ github.run_id }}
 
+      - name: "Consume retry-approved label (durable one-shot)"
+        # Round 15.4 #1: the consumption record lives in GitHub ITSELF, not
+        # only in maintenance-state — removing the label before any further
+        # mutation makes the approval one-shot even if the later state push
+        # fails. Removal failure is a warning only: apply+push still record
+        # consumption (backstop); a re-attempt then requires BOTH failures.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          issue=$(python3 -c "import json;print((json.load(open('plan.json')).get('approval') or {}).get('issue',''))")
+          case "$issue" in
+            ''|dispatch) echo "no issue-based approval to consume"; exit 0 ;;
+          esac
+          if gh api -X DELETE "repos/${{ github.repository }}/issues/$issue/labels/retry-approved" 2>label.err; then
+            echo "retry-approved consumed on issue $issue (one-shot recorded on GitHub)"
+          else
+            echo "::warning::label removal failed — relying on state backstop; repeated auto-retry needs persistent API+push failure"
+            tail -2 label.err || true
+          fi
+
       - name: Classify called-build result
         env:
           GH_TOKEN: ${{ github.token }}

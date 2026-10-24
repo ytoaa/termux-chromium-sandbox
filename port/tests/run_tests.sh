@@ -329,8 +329,8 @@ python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS
   || fail "[35] maintenance engine scenarios"
 
 # [36] Round 15 workflow/seed static verification.
-python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=36 FAIL=0$' \
-  && pass "[36] maintenance static workflow+seed 36/36" \
+python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=39 FAIL=0$' \
+  && pass "[36] maintenance static workflow+seed 39/39" \
   || fail "[36] maintenance static checks"
 
 # [37] TERMUX_PKG_REVISION injection behavior (default-off reproducibility).
@@ -341,8 +341,8 @@ else
 fi
 
 # [38] Round 15.3 Actions-equivalent integration simulation (file round-trips).
-python3 "port/tests/maintenance_integration_test.py" 2>&1 | grep -q '^MAINTENANCE-INTEGRATION PASS=13 FAIL=0$' \
-  && pass "[38] maintenance integration simulation 13/13" \
+python3 "port/tests/maintenance_integration_test.py" 2>&1 | grep -q '^MAINTENANCE-INTEGRATION PASS=25 FAIL=0$' \
+  && pass "[38] maintenance integration simulation 25/25" \
   || fail "[38] maintenance integration simulation"
 
 exit $rc
