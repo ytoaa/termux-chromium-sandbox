@@ -195,21 +195,50 @@ jobs:
             termux-pin.txt
           if-no-files-found: warn
 
+  publishmode:
+    name: Decide publish eligibility (no inputs-context in job if:)
+    needs: build
+    if: needs.build.result == 'success' && needs.build.outputs.deb_sha256 != ''
+        && needs.build.outputs.deb_version != ''
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      want: ${{ steps.d.outputs.want }}
+    steps:
+      - id: d
+        # The `inputs` named-value is unavailable in job-level `if:` for
+        # ordinary (workflow_dispatch) runs — resolve it in bash instead:
+        # schedule/dispatch event-safety pattern, exact string matches,
+        # fail-closed default want=false.
+        env:
+          SRC: ${{ inputs.source }}
+          PUB: ${{ github.event.inputs.publish }}
+        run: |
+          want=false
+          case "$SRC" in
+            maintenance|'') : ;;  # called-by-maintenance or absent: DEFER
+            *) case "$PUB" in
+                 false|False|FALSE) : ;;
+                 true|True|TRUE) want=true ;;
+                 *) want=false ;;  # unknown string -> fail closed
+               esac ;;
+          esac
+          echo "want=$want" >> "$GITHUB_OUTPUT"
+          echo "publishmode: src=[$SRC] want=$want"
+
   publish:
     name: Pre-release (direct builds only)
-    needs: build
+    needs: [build, publishmode]
     # Round 17 — a DIRECT manual build publishes on success (CI VERIFIED —
-    # DEVICE NOT VERIFIED). When this workflow is CALLED by
-    # daily-maintenance, inputs.source stays 'maintenance' and publishing
-    # is DEFERRED to the maintenance ledger-gated publish job (which also
-    # requires the recorded candidate) — no duplicate publishing, no
-    # publish-before-ledger. Re-running a failed publish job re-downloads
-    # the artifact only: this job always re-checks needs.build.result of
-    # THIS run, so an artifact can never be published without the build
-    # having succeeded in this run. Opt-out: publish=false.
-    if: needs.build.result == 'success' && inputs.source != 'maintenance'
-        && needs.build.outputs.deb_sha256 != '' && needs.build.outputs.deb_version != ''
-        && github.event.inputs.publish != 'false'
+    # DEVICE NOT VERIFIED). When CALLED by daily-maintenance the mode job
+    # returns want=false and publishing DEFERS to the maintenance
+    # ledger-gated publish job (which also requires the recorded candidate)
+    # — no duplicate publishing, no publish-before-ledger. Re-running a
+    # failed publish job re-downloads the artifact only: build success of
+    # THIS run is a hard need. Opt-out: publish=false.
+    if: needs.publishmode.result == 'success' && needs.publishmode.outputs.want == 'true'
+        && needs.build.result == 'success'
     uses: ./.github/workflows/publish-release.yml
     with:
       source: manual
