@@ -169,5 +169,34 @@ kv,rc=_run_mode('workflow_dispatch','false','true'); check('[s44d] approve_retry
 kv,rc=_run_mode('schedule','true','true'); check('[s44e] schedule IGNORES stray input strings (approve never true on schedule)', rc==0 and kv.get('approve')=='false', str(kv))
 check('[s45] no implicit GHK boolean coercion patterns remain',
       'inputs.dry_run !=' not in _dwt and 'inputs.approve_retry }}" = ' not in _dwt)
+# s46: YAML duplicate-key guard (GHK/GitHub rejects duplicates; pyyaml
+# silently last-wins — this exact defect escaped review once at activation)
+def _no_dup_loader():
+    import yaml as _y
+    class L(_y.SafeLoader): pass
+    def _ctor(loader, node, deep=False):
+        mapping=set()
+        for k,_n in node.value:
+            key=loader.construct_object(k, deep=deep)
+            if key in mapping:
+                raise _y.constructor.ConstructorError('mapping','duplicate key %r'%(key,),node.start_mark)
+            mapping.add(key)
+        return _y.SafeLoader.construct_mapping(loader,node,deep)
+    L.add_constructor(_y.resolver.BaseResolver.DEFAULT_MAPPING_TAG,_ctor)
+    return L
+try:
+    import subprocess as _sp2
+    _src=(ROOT+'/../.github/workflows/daily-maintenance.yml')
+    _r=_sp2.run([sys.executable,'-c',
+        'import yaml,sys\n'
+        'class L(yaml.SafeLoader):\n    pass\n'
+        'def c(l,n,d=False):\n    m=set()\n    for k,_ in n.value:\n        key=l.construct_object(k,deep=d)\n        if key in m: raise yaml.constructor.ConstructorError("mapping","duplicate key %r"%(key,),n.start_mark)\n        m.add(key)\n    return yaml.SafeLoader.construct_mapping(l,n,d)\n'
+        'L.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,c)\n'
+        'yaml.load(open(sys.argv[1]),Loader=L)\nprint("NODUP-OK")', _src],
+        capture_output=True,text=True)
+    check('[s46] workflows contain no duplicate YAML keys (activation dup-key regression)',
+          _r.returncode==0 and 'NODUP-OK' in _r.stdout, (_r.stdout+_r.stderr)[:150])
+except Exception as _ex:
+    check('[s46] workflows contain no duplicate YAML keys', False, repr(_ex))
 print(f'MAINTENANCE-STATIC PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)
