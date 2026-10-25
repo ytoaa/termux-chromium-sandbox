@@ -236,10 +236,3 @@ jobs:
       source: manual
     permissions:
       contents: write
-  publishb:
-    name: Probe B called job
-    needs: publishmode
-    if: needs.publishmode.outputs.want == 'true'
-    uses: ./.github/workflows/probe-b.yml
-    with:
-      source: manual
