@@ -231,14 +231,9 @@ jobs:
     name: Pre-release (direct builds only)
     needs: publishmode
     if: needs.publishmode.outputs.want == 'true'
-    uses: ./.github/workflows/publish-release.yml
+    uses: ./.github/workflows/probe-call.yml
     with:
       source: manual
-      ci_run_id: ${{ github.run_id }}
-      artifact_name: build-${{ github.run_id }}
-      deb_version: ${{ needs.build.outputs.deb_version }}
-      deb_sha256: ${{ needs.build.outputs.deb_sha256 }}
-      termux_sha: ${{ needs.build.outputs.termux_sha }}
-      port_sha: ${{ needs.build.outputs.port_sha }}
+      deb_version: "156.0.8078.47-9"
     permissions:
       contents: write

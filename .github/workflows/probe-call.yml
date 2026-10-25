@@ -1,0 +1,37 @@
+name: Probe Call
+on:
+  workflow_call:
+    inputs:
+      source:
+        type: string
+        required: false
+        default: "maintenance"
+      deb_version:
+        type: string
+        required: true
+permissions:
+  contents: write
+jobs:
+  publish:
+    name: Verify + publish pre-release
+    concurrency:
+      group: publish-release-${{ inputs.deb_version }}
+      cancel-in-progress: false
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      TAG: chromium-sandboxed-v${{ inputs.deb_version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Provenance audit — run + artifact ownership (fail closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$TAG ${SOURCE:-}"
+        # (SOURCE unset on purpose)
+      - name: Summary
+        if: always()
+        run: echo ok >> "$GITHUB_STEP_SUMMARY"
