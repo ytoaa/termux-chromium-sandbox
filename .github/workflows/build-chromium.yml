@@ -231,9 +231,13 @@ jobs:
     name: Pre-release (direct builds only)
     needs: publishmode
     if: needs.publishmode.outputs.want == 'true'
-    uses: ./.github/workflows/probe-call.yml
+    uses: ./.github/workflows/probe-a.yml
     with:
       source: manual
-      deb_version: "156.0.8078.47-9"
-    permissions:
-      contents: write
+  publishb:
+    name: Probe B called job
+    needs: publishmode
+    if: needs.publishmode.outputs.want == 'true'
+    uses: ./.github/workflows/probe-b.yml
+    with:
+      source: manual

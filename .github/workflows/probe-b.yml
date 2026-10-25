@@ -1,0 +1,23 @@
+name: Probe B
+on:
+  workflow_call:
+    inputs:
+      source:
+        type: string
+        required: false
+        default: "maintenance"
+jobs:
+  publish:
+    name: Verify + publish pre-release
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Provenance audit — run + artifact ownership (fail closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo ok
+      - name: Summary
+        if: always()
+        run: echo ok >> "$GITHUB_STEP_SUMMARY"
