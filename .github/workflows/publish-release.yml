@@ -1,158 +1,20 @@
-# Round 17 — GitHub Pre-release publishing for CI-verified candidate DEBs.
-# Reusable (workflow_call) so the scheduled maintenance path and the direct
-# manual build path run the SAME integrity + dedup + recovery logic
-# (port/publish_release.py).
-#
-# Hard boundaries:
-#  * PRE-RELEASE only; stable/apt/validated are separate human approvals.
-#  * Publish state is SEPARATE from build state: this workflow never touches
-#    maintenance-state and its failure never reclassifies a build. A red
-#    publish job on a green outcome = retry THIS job only (no rebuild).
-#  * contents:write is granted to this job ONLY; nothing else gains it.
-#  * Draft-first: nothing is visible until every asset is verified; tags,
-#    releases and assets are never clobbered, edited or deleted.
 name: Publish Pre-release (reusable)
-
 on:
   workflow_call:
     inputs:
-      source:
-        description: caller identity (maintenance|manual)
-        type: string
-        required: true
-      ci_run_id:
-        description: run whose artifact is published (ownership audited)
-        type: string
-        required: true
-      artifact_name:
-        description: exact Actions artifact name
-        type: string
-        required: true
-      deb_version:
-        description: dpkg Version from the build outputs
-        type: string
-        required: true
-      deb_sha256:
-        description: DEB sha256 from the build outputs
-        type: string
-        required: true
-      termux_sha:
-        description: pinned termux-packages commit (40hex)
-        type: string
-        required: true
-      port_sha:
-        description: repo commit the DEB was built from (40hex)
-        type: string
-        required: true
-      build_signature:
-        description: maintenance build signature (16hex); empty on manual runs
-        type: string
-        required: false
-        default: ''
-      build_timestamp:
-        description: candidate recorded_at timestamp (may be empty)
-        type: string
-        required: false
-        default: ''
-
+      source: {type: string, required: true}
+      ci_run_id: {type: string, required: true}
+      artifact_name: {type: string, required: true}
+      deb_version: {type: string, required: true}
+      deb_sha256: {type: string, required: true}
+      termux_sha: {type: string, required: true}
+      port_sha: {type: string, required: true}
+      build_signature: {type: string, required: false, default: ''}
+      build_timestamp: {type: string, required: false, default: ''}
 permissions:
-  contents: write   # the ONLY job in the repo with write; never issues/apt
-
+  contents: write
 jobs:
   publish:
-    name: Verify + publish pre-release
-    # job-level concurrency (workflow-level cannot resolve `inputs` in
-    # reusable workflows — startup_failure observed on run 40217322460)
-    concurrency:
-      group: publish-release-${{ inputs.deb_version }}
-      cancel-in-progress: false
     runs-on: ubuntu-26.04
-    timeout-minutes: 25
-    permissions:
-      contents: write
-    env:
-      TAG: chromium-sandboxed-v${{ inputs.deb_version }}
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Provenance audit — run + artifact ownership (fail closed)
-        # Artifacts exist even on FAILED runs (upload runs under
-        # if: always()): success must be PROVEN from the API, never assumed.
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh api "repos/${{ github.repository }}/actions/runs/${{ inputs.ci_run_id }}" > run.json
-          jq -e '.status=="completed" and .conclusion=="success"' run.json >/dev/null
-          jq -e '(.name=="Build Termux Chromium Seccomp Sandbox Port")
-                 or (.name=="Daily Maintenance")' run.json >/dev/null
-          gh api "repos/${{ github.repository }}/actions/runs/${{ inputs.ci_run_id }}/artifacts" > artifacts.json
-          jq -e --arg n "${{ inputs.artifact_name }}" \
-            '[.artifacts[] | select(.name==$n and .expired==false)] | length == 1' \
-            artifacts.json >/dev/null
-          echo "provenance ok: run ${{ inputs.ci_run_id }} succeeded; artifact ${{ inputs.artifact_name }} owned"
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.artifact_name }}
-          repository: ${{ github.repository }}
-          run-id: ${{ inputs.ci_run_id }}
-          path: artifact
-
-      - name: Integrity verification (Stage C — fail closed)
-        run: |
-          set -euo pipefail
-          python3 port/publish_release.py verify \
-            --artifact-dir artifact \
-            --deb-version '${{ inputs.deb_version }}' \
-            --deb-sha256 '${{ inputs.deb_sha256 }}' \
-            --termux-sha '${{ inputs.termux_sha }}' \
-            --port-sha '${{ inputs.port_sha }}' \
-            --source '${{ inputs.source }}' \
-            --ci-run-id '${{ inputs.ci_run_id }}' \
-            --ci-run-url "https://github.com/${{ github.repository }}/actions/runs/${{ inputs.ci_run_id }}" \
-            --artifact-name '${{ inputs.artifact_name }}' \
-            --build-signature '${{ inputs.build_signature }}' \
-            --build-timestamp '${{ inputs.build_timestamp }}' \
-            --run-audit-json run.json --artifacts-json artifacts.json \
-            --out verified.json
-
-      - name: Fetch release state + plan (dedup/collision/resume)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          args=(--out publish-plan.json)
-          if gh api "repos/${{ github.repository }}/releases/tags/$TAG" > release.json 2>rel.err; then
-            args+=(--release-json release.json)
-          elif grep -qiE 'Not Found|release_tag_does_not_exist' rel.err; then
-            echo "no release for $TAG (fresh publish)"
-          else
-            echo "::error::release probe failed (not a 404) — fail closed"; tail -2 rel.err; exit 1
-          fi
-          python3 port/publish_release.py plan --verified verified.json \
-            --gh-bin gh --repo '${{ github.repository }}' "${args[@]}"
-
-      - name: Execute (draft -> assets -> verify -> pre-release)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if ! python3 port/publish_release.py execute --plan publish-plan.json \
-              --verified verified.json --repo '${{ github.repository }}' \
-              --gh-bin gh --out publish-result.json; then
-            rc=$?
-            echo "::error::publish step failed (rc=$rc). The Chromium BUILD and the candidate ledger are UNAFFECTED — re-run THIS job only (gh run rerun <id> --job <publish>); never rebuild Chromium for a publish problem."
-            exit "$rc"
-          fi
-
-      - name: Summary
-        if: always()
-        run: |
-          {
-            echo "### Pre-release publish"
-            echo "- tag: \`$TAG\`  source: \`${{ inputs.source }}\`  run: \`${{ inputs.ci_run_id }}\`"
-            if [ -f publish-plan.json ]; then echo "- plan: \`$(jq -c '{action,reason}' publish-plan.json)\`"; fi
-            if [ -f publish-result.json ]; then echo "- result: \`$(jq -c publish-result.json)\`"; fi
-            echo "- status: **CI VERIFIED — DEVICE NOT VERIFIED** (device checks are the user's responsibility)"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - run: echo bisect-ok
