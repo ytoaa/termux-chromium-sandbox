@@ -215,6 +215,14 @@ jobs:
       contents: write   # ONLY the maintenance/state.json Contents-API commit
       issues: write     # deduplicated block issues
       actions: read     # job-level classification of the called workflow
+    outputs:
+      # Round 17 publish-gate facts: a verified candidate recorded for THIS
+      # run, exactly as the ledger says (never inferred by the publisher).
+      recorded: ${{ steps.gatefacts.outputs.recorded }}
+      deb_version: ${{ steps.gatefacts.outputs.deb_version }}
+      deb_sha256: ${{ steps.gatefacts.outputs.deb_sha256 }}
+      signature: ${{ steps.gatefacts.outputs.signature }}
+      recorded_at: ${{ steps.gatefacts.outputs.recorded_at }}
     steps:
       - uses: actions/checkout@v7
 
@@ -402,6 +410,31 @@ jobs:
           fi
           echo "state pushed"
 
+      - name: Export publish-gate facts
+        id: gatefacts
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "recorded=false" >> "$GITHUB_OUTPUT"
+          [ -f result.json ] && [ -f state2.json ] || exit 0
+          [ "$(jq -r '.success' result.json)" = "true" ] || exit 0
+          ok=$(jq -r --argjson run "${{ github.run_id }}" '
+            (.last_successful_build // {}) as $b
+            | if ($b.ci_run == $run
+                  and ($b.status // "") == "BUILD_VERIFIED_CANDIDATE"
+                  and (($b.deb_sha256 // "") | test("^[0-9a-f]{64}$"))
+                  and (($b.deb_version // "") | length > 0)
+                  and (($b.signature // "") | test("^[0-9a-f]{16}$")))
+              then "true" else "false" end' state2.json)
+          [ "$ok" = "true" ] || exit 0
+          {
+            echo "recorded=true"
+            echo "deb_version=$(jq -r '.last_successful_build.deb_version' state2.json)"
+            echo "deb_sha256=$(jq -r '.last_successful_build.deb_sha256' state2.json)"
+            echo "signature=$(jq -r '.last_successful_build.signature' state2.json)"
+            echo "recorded_at=$(jq -r '.last_successful_build.recorded_at // ""' state2.json)"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Summary
         if: always()
         run: |
@@ -412,3 +445,46 @@ jobs:
             if [ -f result.json ]; then echo "- classified: \`$(jq -c '{success,stage}' result.json)\`"; fi
             if [ -f ops.json ]; then echo "- issues created: $(jq '.create_issues|length' ops.json), comments: $(jq '.comment_issues|length' ops.json)"; fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  trigger:
+    name: Trigger pre-release publication (ledger-gated)
+    needs: [evaluate, build, outcome]
+    # Round 17 v2 — ledger-gated TRIGGER (an ordinary job: this instance
+    # rejects caller-side `permissions:` on `uses:` jobs — startup_failure
+    # bisection in revert PR #8 — so the publisher runs as its own
+    # top-level workflow with contents:write declared inside it). ALL must
+    # hold: a REAL (non-dry) decided build, the called build succeeded, the
+    # outcome job succeeded AND the LEDGER recorded a verified candidate for
+    # this run, and ledger metadata matches the build outputs byte-for-byte.
+    # action=skip / blocked-dedup / dry-run / failures / unrecorded -> no
+    # trigger, no publish. The publisher RE-VERIFIES everything fail-closed
+    # (provenance audit, SHA, dpkg identity); a publish failure never
+    # touches the build verdict or maintenance-state — recovery is re-
+    # running Publish-Pre-release ONLY (or waiting for the nightly), never
+    # a Chromium rebuild.
+    if: needs.evaluate.result == 'success' && needs.evaluate.outputs.action == 'build'
+        && needs.evaluate.outputs.dry == 'false' && needs.build.result == 'success'
+        && needs.outcome.result == 'success' && needs.outcome.outputs.recorded == 'true'
+        && needs.build.outputs.deb_sha256 == needs.outcome.outputs.deb_sha256
+        && needs.build.outputs.deb_version == needs.outcome.outputs.deb_version
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      actions: write    # dispatch the Publish-Pre-release workflow ONLY
+    steps:
+      - name: Dispatch publish-release (publisher re-verifies everything)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run publish-release.yml --ref "${{ github.ref_name }}" \
+            -f source=maintenance \
+            -f ci_run_id="${{ github.run_id }}" \
+            -f artifact_name="build-${{ github.run_id }}" \
+            -f deb_version="${{ needs.outcome.outputs.deb_version }}" \
+            -f deb_sha256="${{ needs.outcome.outputs.deb_sha256 }}" \
+            -f termux_sha="${{ needs.build.outputs.termux_sha }}" \
+            -f port_sha="${{ needs.build.outputs.port_sha }}" \
+            -f build_signature="${{ needs.outcome.outputs.signature }}" \
+            -f build_timestamp="${{ needs.outcome.outputs.recorded_at }}"
+          echo "publish-release dispatched for ${{ needs.outcome.outputs.deb_version }} (its own run result is authoritative; publish failures do not affect the build or the ledger)"

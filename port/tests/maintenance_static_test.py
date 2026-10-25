@@ -203,16 +203,22 @@ def _no_dup_loader():
     return L
 try:
     import subprocess as _sp2
-    _src=(ROOT+'/../.github/workflows/daily-maintenance.yml')
-    _r=_sp2.run([sys.executable,'-c',
-        'import yaml,sys\n'
-        'class L(yaml.SafeLoader):\n    pass\n'
-        'def c(l,n,d=False):\n    m=set()\n    for k,_ in n.value:\n        key=l.construct_object(k,deep=d)\n        if key in m: raise yaml.constructor.ConstructorError("mapping","duplicate key %r"%(key,),n.start_mark)\n        m.add(key)\n    return yaml.SafeLoader.construct_mapping(l,n,d)\n'
-        'L.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,c)\n'
-        'yaml.load(open(sys.argv[1]),Loader=L)\nprint("NODUP-OK")', _src],
-        capture_output=True,text=True)
-    check('[s46] workflows contain no duplicate YAML keys (activation dup-key regression)',
-          _r.returncode==0 and 'NODUP-OK' in _r.stdout, (_r.stdout+_r.stderr)[:150])
+    _wfs=(ROOT+'/../.github/workflows/daily-maintenance.yml',
+          ROOT+'/../.github/workflows/build-chromium.yml',
+          ROOT+'/../.github/workflows/publish-release.yml')
+    _allok=True; _last=''
+    for _src in _wfs:
+        _r=_sp2.run([sys.executable,'-c',
+            'import yaml,sys\n'
+            'class L(yaml.SafeLoader):\n    pass\n'
+            'def c(l,n,d=False):\n    m=set()\n    for k,_ in n.value:\n        key=l.construct_object(k,deep=d)\n        if key in m: raise yaml.constructor.ConstructorError("mapping","duplicate key %r"%(key,),n.start_mark)\n        m.add(key)\n    return yaml.SafeLoader.construct_mapping(l,n,d)\n'
+            'L.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,c)\n'
+            'yaml.load(open(sys.argv[1]),Loader=L)\nprint("NODUP-OK")', _src],
+            capture_output=True,text=True)
+        _allok=_allok and _r.returncode==0 and 'NODUP-OK' in _r.stdout
+        _last=(_r.stdout+_r.stderr)[:150]
+    check('[s46] ALL workflows contain no duplicate YAML keys (activation dup-key regression)',
+          _allok, _last)
 except Exception as _ex:
     check('[s46] workflows contain no duplicate YAML keys', False, repr(_ex))
 # s48 (Round 16): signature-schema v2 wiring — semantic port-input hash +
@@ -252,5 +258,75 @@ check('[s48c] engine denylist is EXACT (new keys hash by default) and documented
 check('[s48d] engine keeps v1 frozen (sig_version=1 path) and tags v2 payload',
       "if sig_version == 1" in _msrc and "'sigv2'" in _msrc
       and "unsupported signature schema" in _msrc)
+# ---- s50..s54 (Round 17): pre-release publishing — boundaries, permissions,
+# separation from build/state classification.
+_pw=(ROOT+'/../.github/workflows/publish-release.yml')
+_psrc=open(_pw).read()
+_pj=yaml.safe_load(open(_pw))
+check('[s50] publisher workflow: top-level contents:write ONLY scope, no per-job overrides, no issues/admin',
+      _pj['permissions']=={'contents':'write'}
+      and all('permissions' not in spec for spec in _pj['jobs'].values())
+      and 'issues:' not in _psrc and 'admin:' not in _psrc)
+_pub=open(ROOT+'/publish_release.py').read()
+_both=_psrc+_pub
+check('[s50b] no --clobber anywhere, no --latest, never deletes releases/tags/assets',
+      '--clobber' not in _both and '--latest' not in _both
+      and 'release delete' not in _both and 'git tag -d' not in _both
+      and '--draft=false' in _both and "'release', 'create'" in _both
+      and '--draft' in _both and '--prerelease' in _both)
+check('[s50c] provenance audit BEFORE publish: run conclusion+workflow+artifact uniqueness+run-id pin',
+      'conclusion=="success"' in _psrc and 'name=="Build Termux Chromium Seccomp Sandbox Port"' in _psrc
+      and 'length == 1' in _psrc and 'run-id: ${{ steps.in.outputs.ci_run_id }}' in _psrc
+      and 'github.event.inputs.' in _psrc and '|| inputs.' in _psrc)
+check('[s50d] draft-first order enforced: verify -> plan -> execute steps in sequence',
+      _psrc.index('Integrity verification') < _psrc.index('+ plan (dedup')
+      < _psrc.index('Execute (draft'))
+_dj=_dwj['trigger']
+check('[s51] maintenance trigger is ledger-gated (dry false + action build + build success + outcome recorded + sha/version equality), actions:write ONLY, dispatches publisher',
+      _dj['needs']==['evaluate','build','outcome']
+      and "needs.evaluate.outputs.dry == 'false'" in _dj['if']
+      and "needs.evaluate.outputs.action == 'build'" in _dj['if']
+      and "needs.build.result == 'success'" in _dj['if']
+      and "needs.outcome.result == 'success'" in _dj['if']
+      and "needs.outcome.outputs.recorded == 'true'" in _dj['if']
+      and 'needs.build.outputs.deb_sha256 == needs.outcome.outputs.deb_sha256' in _dj['if']
+      and 'needs.build.outputs.deb_version == needs.outcome.outputs.deb_version' in _dj['if']
+      and _dj['permissions']=={'actions':'write'}
+      and 'workflow run publish-release.yml' in _dj['steps'][0]['run']
+      and all(('-f '+k) in _dj['steps'][0]['run'] for k in
+              ('source=maintenance','ci_run_id=','artifact_name=','deb_version=',
+               'deb_sha256=','termux_sha=','port_sha=','build_signature=')))
+check('[s51b] outcome exports gate facts from the LEDGER (state2.json), never from the build step',
+      'steps.gatefacts.outputs.recorded' in str(_dwj['outcome'].get('outputs'))
+      and 'state2.json' in [st.get('run','') for st in _dwj['outcome']['steps']
+                            if st.get('id')=='gatefacts'][0])
+_bj=yaml.safe_load(open(ROOT+'/../.github/workflows/build-chromium.yml'))['jobs']['trigger-publish']
+check('[s52] direct-build trigger: build-success+outputs gate, actions:write only, defers to maintenance when called, fail-closed want resolver',
+      "needs.build.result == 'success'" in _bj['if']
+      and "needs.build.outputs.deb_sha256 != ''" in _bj['if']
+      and _bj['permissions']=={'actions':'write'}
+      and '$SRC" = "maintenance"' in str(_bj['steps'][0]['run'])
+      and 'true|True|TRUE) want=true' in str(_bj['steps'][0]['run'])
+      and "want=false" in str(_bj['steps'][0]['run'])
+      and 'workflow run publish-release.yml' in str(_bj['steps'][1]['run'])
+      and _bj['steps'][1]['if'] == "steps.want.outputs.want == 'true'")
+check('[s52b] manual dispatch gained publish input (default true); existing job perms unchanged',
+      yaml.safe_load(open(ROOT+'/../.github/workflows/build-chromium.yml'))
+        [True if True in yaml.safe_load(open(ROOT+'/../.github/workflows/build-chromium.yml')) else 'on']
+        ['workflow_dispatch']['inputs']['publish']['default'] is True
+      and yaml.safe_load(open(ROOT+'/../.github/workflows/build-chromium.yml'))['permissions']=={'contents':'read'})
+_pub=open(ROOT+'/publish_release.py').read()
+check('[s53] publisher is ISOLATED from build/state classification (no maintenance import/state writes)',
+      'import maintenance' not in _pub and 'maintenance-state' not in _pub
+      and 'state.json' not in _pub and 'state2' not in _pub
+      and 'apply_result' not in _pub and 'retry_approved' not in _pub
+      and 'BLOCKED_LABEL' not in _pub and 'blocked-dedup' not in _pub)
+check('[s54] notes/manifest: CI VERIFIED — DEVICE NOT VERIFIED, device never claimed, signature never fabricated, secret scanner present',
+      'CI VERIFIED — DEVICE NOT VERIFIED' in _pub
+      and 'NOT VERIFIED FOR THIS BUILD' in _pub
+      and "v.get('build_signature')" in _pub
+      and "if v.get('build_signature')" in _pub
+      and 'not fabricated' in _pub
+      and 'TOKEN_PATTERNS' in _pub and 'add-mask' in _pub)
 print(f'MAINTENANCE-STATIC PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)

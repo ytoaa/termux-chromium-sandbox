@@ -1,0 +1,229 @@
+# Round 17 (v2) — GitHub Pre-release publishing for CI-verified candidate DEBs.
+#
+# WHY A SEPARATE TOP-LEVEL WORKFLOW: this GitHub instance rejects ANY caller
+# job that carries `permissions:` while using `uses:` (startup_failure —
+# proven by bisection runs 40217322460..40218784660, revert PR #8). So both
+# entry points TRIGGER this workflow via `gh workflow run` from ordinary
+# jobs (actions:write is a legitimate ordinary-job scope) and the publisher
+# runs with its OWN top-level `permissions: contents: write` — granted
+# inside this file only, the single write scope in the repo.
+#
+# Hard boundaries (unchanged from Round 17 spec):
+#  * PRE-RELEASE only; stable/apt/validated are separate human approvals.
+#  * Publish state is SEPARATE from build state: never touches
+#    maintenance-state; its failure never reclassifies a build. Re-run THIS
+#    workflow (or wait for the next nightly) — never a Chromium rebuild.
+#  * Draft-first; tags/releases/assets are never clobbered, edited or deleted.
+#  * Event safety: workflow_dispatch inputs are ALL string-typed and
+#    required (except two optional metadata strings); every value is
+#    re-validated fail-closed by port/publish_release.py (exact string
+#    matching, no implicit coercion) — a caller that forgets an input gets
+#    an integrity refusal, never a publish.
+name: Publish Pre-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: caller identity (maintenance|manual)
+        required: true
+        type: choice
+        options: [maintenance, manual]
+      ci_run_id:
+        description: run whose artifact is published (ownership audited)
+        required: true
+        type: string
+      artifact_name:
+        description: exact Actions artifact name
+        required: true
+        type: string
+      deb_version:
+        description: dpkg Version from the build outputs
+        required: true
+        type: string
+      deb_sha256:
+        description: DEB sha256 from the build outputs
+        required: true
+        type: string
+      termux_sha:
+        description: pinned termux-packages commit (40hex)
+        required: true
+        type: string
+      port_sha:
+        description: repo commit the DEB was built from (40hex)
+        required: true
+        type: string
+      build_signature:
+        description: maintenance build signature (16hex); empty on manual runs
+        required: false
+        type: string
+        default: ''
+      build_timestamp:
+        description: candidate recorded_at timestamp (may be empty)
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      source:
+        type: string
+        required: true
+      ci_run_id:
+        type: string
+        required: true
+      artifact_name:
+        type: string
+        required: true
+      deb_version:
+        type: string
+        required: true
+      deb_sha256:
+        type: string
+        required: true
+      termux_sha:
+        type: string
+        required: true
+      port_sha:
+        type: string
+        required: true
+      build_signature:
+        type: string
+        required: false
+        default: ''
+      build_timestamp:
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # the ONLY write scope in the repo; never issues/apt
+
+concurrency:
+  group: publish-release-queue
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify + publish pre-release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve inputs (fail-closed explicit strings; workflow-level env cannot read inputs)
+        id: in
+        env:
+          I_SOURCE: ${{ github.event.inputs.source || inputs.source }}
+          I_CI_RUN_ID: ${{ github.event.inputs.ci_run_id || inputs.ci_run_id }}
+          I_ARTIFACT_NAME: ${{ github.event.inputs.artifact_name || inputs.artifact_name }}
+          I_DEB_VERSION: ${{ github.event.inputs.deb_version || inputs.deb_version }}
+          I_DEB_SHA256: ${{ github.event.inputs.deb_sha256 || inputs.deb_sha256 }}
+          I_TERMUX_SHA: ${{ github.event.inputs.termux_sha || inputs.termux_sha }}
+          I_PORT_SHA: ${{ github.event.inputs.port_sha || inputs.port_sha }}
+          I_BUILD_SIGNATURE: ${{ github.event.inputs.build_signature || inputs.build_signature }}
+          I_BUILD_TIMESTAMP: ${{ github.event.inputs.build_timestamp || inputs.build_timestamp }}
+        run: |
+          set -euo pipefail
+          # workflow_call runs expose the same values via the inputs
+          # context rendered into these env vars by GitHub; for
+          # workflow_dispatch this is exact string passthrough.
+          {
+            echo "source=${I_SOURCE:-}"
+            echo "ci_run_id=${I_CI_RUN_ID:-}"
+            echo "artifact_name=${I_ARTIFACT_NAME:-}"
+            echo "deb_version=${I_DEB_VERSION:-}"
+            echo "deb_sha256=${I_DEB_SHA256:-}"
+            echo "termux_sha=${I_TERMUX_SHA:-}"
+            echo "port_sha=${I_PORT_SHA:-}"
+            echo "build_signature=${I_BUILD_SIGNATURE:-}"
+            echo "build_timestamp=${I_BUILD_TIMESTAMP:-}"
+            echo "tag=chromium-sandboxed-v${I_DEB_VERSION:-}"
+          } >> "$GITHUB_OUTPUT"
+          # minimal shape guards (the publisher owns full integrity)
+          case "${I_DEB_VERSION:-}" in
+            ''|*[!0-9A-Za-z.-]*) echo "::error::deb_version malformed"; exit 1 ;;
+          esac
+          case "${I_CI_RUN_ID:-}" in
+            ''|*[!0-9]*) echo "::error::ci_run_id malformed"; exit 1 ;;
+          esac
+
+      - name: Provenance audit — run + artifact ownership (fail closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/actions/runs/${{ steps.in.outputs.ci_run_id }}" > run.json
+          jq -e '.status=="completed" and .conclusion=="success"' run.json >/dev/null
+          jq -e '(.name=="Build Termux Chromium Seccomp Sandbox Port")
+                 or (.name=="Daily Maintenance")' run.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/runs/${{ steps.in.outputs.ci_run_id }}/artifacts" > artifacts.json
+          jq -e --arg n "${{ steps.in.outputs.artifact_name }}" \
+            '[.artifacts[] | select(.name==$n and .expired==false)] | length == 1' \
+            artifacts.json >/dev/null
+          echo "provenance ok: run ${{ steps.in.outputs.ci_run_id }} succeeded; artifact ${{ steps.in.outputs.artifact_name }} owned"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.in.outputs.artifact_name }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.in.outputs.ci_run_id }}
+          path: artifact
+
+      - name: Integrity verification (Stage C — fail closed)
+        run: |
+          set -euo pipefail
+          python3 port/publish_release.py verify \
+            --artifact-dir artifact \
+            --deb-version '${{ steps.in.outputs.deb_version }}' \
+            --deb-sha256 '${{ steps.in.outputs.deb_sha256 }}' \
+            --termux-sha '${{ steps.in.outputs.termux_sha }}' \
+            --port-sha '${{ steps.in.outputs.port_sha }}' \
+            --source '${{ steps.in.outputs.source }}' \
+            --ci-run-id '${{ steps.in.outputs.ci_run_id }}' \
+            --ci-run-url "https://github.com/${{ github.repository }}/actions/runs/${{ steps.in.outputs.ci_run_id }}" \
+            --artifact-name '${{ steps.in.outputs.artifact_name }}' \
+            --build-signature '${{ steps.in.outputs.build_signature }}' \
+            --build-timestamp '${{ steps.in.outputs.build_timestamp }}' \
+            --run-audit-json run.json --artifacts-json artifacts.json \
+            --out verified.json
+
+      - name: Fetch release state + plan (dedup/collision/resume)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.in.outputs.tag }}"
+          args=(--out publish-plan.json)
+          if gh api "repos/${{ github.repository }}/releases/tags/$TAG" > release.json 2>rel.err; then
+            args+=(--release-json release.json)
+          elif grep -qiE 'Not Found|release_tag_does_not_exist' rel.err; then
+            echo "no release for $TAG (fresh publish)"
+          else
+            echo "::error::release probe failed (not a 404) — fail closed"; tail -2 rel.err; exit 1
+          fi
+          python3 port/publish_release.py plan --verified verified.json \
+            --gh-bin gh --repo '${{ github.repository }}' "${args[@]}"
+
+      - name: Execute (draft -> assets -> verify -> pre-release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! python3 port/publish_release.py execute --plan publish-plan.json \
+              --verified verified.json --repo '${{ github.repository }}' \
+              --gh-bin gh --out publish-result.json; then
+            rc=$?
+            echo "::error::publish step failed (rc=$rc). The Chromium BUILD and the candidate ledger are UNAFFECTED — re-run THIS workflow (gh workflow run publish-release.yml -f ... same inputs) or wait for the nightly; never rebuild Chromium for a publish problem."
+            exit "$rc"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Pre-release publish"
+            echo "- tag: \`${{ steps.in.outputs.tag }}\`  source: \`${{ steps.in.outputs.source }}\`  run: \`${{ steps.in.outputs.ci_run_id }}\`"
+            if [ -f publish-plan.json ]; then echo "- plan: \`$(jq -c '{action,reason}' publish-plan.json)\`"; fi
+            if [ -f publish-result.json ]; then echo "- result: \`$(jq -c publish-result.json)\`"; fi
+            echo "- status: **CI VERIFIED — DEVICE NOT VERIFIED** (device checks are the user's responsibility)"
+          } >> "$GITHUB_STEP_SUMMARY"
