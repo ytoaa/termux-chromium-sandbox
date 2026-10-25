@@ -231,8 +231,8 @@ jobs:
     name: Pre-release (direct builds only)
     needs: publishmode
     if: needs.publishmode.outputs.want == 'true'
+    permissions:
+      contents: write
     uses: ./.github/workflows/probe-a.yml
     with:
       source: manual
-    permissions:
-      contents: write
