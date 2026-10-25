@@ -237,8 +237,7 @@ jobs:
     # — no duplicate publishing, no publish-before-ledger. Re-running a
     # failed publish job re-downloads the artifact only: build success of
     # THIS run is a hard need. Opt-out: publish=false.
-    if: needs.publishmode.result == 'success' && needs.publishmode.outputs.want == 'true'
-        && needs.build.result == 'success'
+    if: needs.publishmode.outputs.want == 'true'
     uses: ./.github/workflows/publish-release.yml
     with:
       source: manual
