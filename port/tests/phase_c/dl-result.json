@@ -1,0 +1,20 @@
+{
+ "verdict": "PASS",
+ "reason": "CDP download completed (event=True); final file stable, no .crdownload, sha256 match",
+ "events": {
+  "Browser.downloadWillBegin": {
+   "guid": "bf3e2281-6116-42b1-bf50-acac16186510"
+  },
+  "Browser.downloadProgress": {
+   "guid": "bf3e2281-6116-42b1-bf50-acac16186510",
+   "totalBytes": 1048576,
+   "state": "completed"
+  }
+ },
+ "partial_files_present": [],
+ "final_path": "/data/data/com.termux/files/usr/tmp/phc-dl-_6ebxmm5/downloads/big.bin",
+ "final_name": "big.bin",
+ "size": 1048576,
+ "expected_sha256": "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83",
+ "actual_sha256": "fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83"
+}
