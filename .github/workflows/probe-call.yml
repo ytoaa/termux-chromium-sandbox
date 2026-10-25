@@ -14,15 +14,12 @@ permissions:
 jobs:
   publish:
     name: Verify + publish pre-release
-    concurrency:
-      group: publish-release-${{ inputs.deb_version }}
-      cancel-in-progress: false
     runs-on: ubuntu-26.04
     timeout-minutes: 25
     permissions:
       contents: write
     env:
-      TAG: chromium-sandboxed-v${{ inputs.deb_version }}
+      TAG: hardcoded-no-expression
     steps:
       - uses: actions/checkout@v7
       - name: Provenance audit — run + artifact ownership (fail closed)
