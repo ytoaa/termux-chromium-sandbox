@@ -34,9 +34,22 @@ cases.append(('chooser-fail', mk(**{'file-chooser-window': {'pass': False}}), 'F
 # 8 optional failures never flip
 c8 = mk(); c8['gpu-info-page'] = {'pass': False}
 cases.append(('optional-gpu-info-fail-ok', c8, 'PASS', 0))
-c9 = mk(); c9['downloads-list-item'] = {'pass': True,
-       'status': 'INCONCLUSIVE-allowed'}
-cases.append(('optional-list-inconclusive-ok', c9, 'PASS', 0))
+# page-reached true + item true == PASS (explicit)
+cases.append(('page-and-item-present', mk(**{
+    'downloads-page-reached': {'pass': True},
+    'downloads-list-item': {'pass': True, 'detail': {'item-hits': 5}}}),
+    'PASS', 0))
+# downloads-list-item is now REQUIRED: page-only (item missing) FAILs
+cases.append(('list-item-missing-key',
+              dict(((k, {'pass': True}) for k in REQUIRED_CHECKS
+                    if k != 'downloads-list-item')), 'FAIL', 1))
+c10 = mk(); c10['downloads-list-item'] = {'pass': False,
+       'detail': {'item-hits': 0}}
+cases.append(('list-item-absent', c10, 'FAIL', 1))
+c11 = mk(); c11['downloads-list-item'] = {'pass': False,
+       'status': 'INCOMPLETE-unreadable'}
+cases.append(('list-unreadable-incomplete', c11, 'FAIL', 1))
+# page shown + item present == all-pass case already covers PASS
 # 9 pass=None counts as failure (no exception/timeout PASS)
 cases.append(('pass-none-fails', mk(**{'file-api-setinput': {'pass': None}}),
               'FAIL', 1))

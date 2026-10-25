@@ -24,6 +24,8 @@ def main():
     debugport = 9450 + (os.getpid() % 40)
     # local http server: page with <input type=file> + download link + audio
     BODY = bytes(range(256)) * 4096
+    DL_NAME = 'big-%d.bin' % os.getpid()  # session-unique: never matches
+                                         # historical download entries
     import hashlib
     EXPECT = hashlib.sha256(BODY).hexdigest()
     sel_file = os.path.join(tmp, 'upload-me.txt')
@@ -31,7 +33,7 @@ def main():
     page = ('<html><head><title>PHCX</title></head><body>'
             '<h1 id=h>hi</h1>'
             '<input type="file" id=f>'
-            '<a id=d href="/big.bin" download="big.bin">dl</a>'
+            '<a id=d href="/big.bin" download="' + DL_NAME + '">dl</a>'
             '<audio id=a src="/tone.wav"></audio>'
             '<script>'
             'window.RESULTS={};'
@@ -212,10 +214,29 @@ def main():
                 done = got.get('Browser.downloadProgress', {}).get(
                     'state') == 'completed'
             import hashlib as _h
-            fp = os.path.join(dldir, 'big.bin')
-            sha = _h.sha256(open(fp, 'rb').read()).hexdigest() if os.path.exists(fp) else None
-            ok('download-gui-cdp', done and sha == EXPECT,
-               {'done': done, 'sha_ok': sha == EXPECT})
+            # the <a download> attribute wins over Content-Disposition for
+            # the on-disk name; identify the file by CONTENT sha (robust),
+            # while the downloads LIST item is keyed on the unique name.
+            fp = None
+            sha = None
+            for fn in sorted(os.listdir(dldir)):
+                p = os.path.join(dldir, fn)
+                if not os.path.isfile(p) or fn.endswith('.crdownload'):
+                    continue
+                cand = _h.sha256(open(p, 'rb').read()).hexdigest()
+                if cand == EXPECT:
+                    fp, sha = p, cand
+                    break
+            if fp is None:
+                # fall back to expected name (if content differed we still
+                # record its sha for diagnosis)
+                p = os.path.join(dldir, DL_NAME)
+                if os.path.exists(p):
+                    fp = p
+                    sha = _h.sha256(open(p, 'rb').read()).hexdigest()
+            ok('download-gui-cdp', bool(done and sha == EXPECT),
+               {'done': done, 'sha_ok': sha == EXPECT,
+                'final_name': os.path.basename(fp) if fp else None})
             utid = cdp.new_tab('chrome://downloads')
             time.sleep(3)
             dtxt = cdp.eval(utid, 'document.title') or ''
@@ -239,18 +260,20 @@ def main():
             except CDPError as ex3:
                 listed = None
                 R['notes'].append('downloads DOM probe error: %s' % ex3)
+            # Final gate: the list item is REQUIRED (Release Readiness).
+            # Unreadable WebUI == mandatory verification INCOMPLETE => FAIL
+            # (rc nonzero); never a silent PASS. Item match is keyed on the
+            # session-unique file name to exclude historical downloads.
             if probe_ok:
                 ok('downloads-list-item', (listed or 0) > 0,
-                   {'nodes': len(nodes) if probe_ok else 0,
-                    'big.bin-hits': listed})
+                   {'nodes': len(nodes), 'item-hits': listed,
+                    'expected-name': DL_NAME})
             else:
-                # documented: unreadable WebUI == INCONCLUSIVE (optional),
-                # never a silent PASS; download itself proven by
-                # download-gui-cdp (event+sha)
                 R['checks']['downloads-list-item'] = {
-                    'pass': True, 'status': 'INCONCLUSIVE-allowed',
+                    'pass': False, 'status': 'INCOMPLETE-unreadable',
                     'detail': 'chrome://downloads DOM unreadable via '
-                              'getFlattenedDocument(pierce)'}
+                              'getFlattenedDocument(pierce); item proof is '
+                              'mandatory at the final gate'}
             cdp.close_tab(utid)
         except (CDPError, OSError) as ex:
             ok('download-gui-cdp', False, ex)
@@ -372,10 +395,10 @@ def main():
 
 REQUIRED_CHECKS = ('gui-window-present', 'webgl-default',
                    'process-census-gui', 'download-gui-cdp',
-                   'downloads-page-reached',
+                   'downloads-page-reached', 'downloads-list-item',
                    'file-chooser-window', 'file-api-setinput',
                    'audio-element-playing', 'audio-sink-input-pactl')
-OPTIONAL_CHECKS = ('gpu-info-page', 'downloads-list-item')
+OPTIONAL_CHECKS = ('gpu-info-page',)
 
 
 def evaluate_verdict(checks):

@@ -17,10 +17,10 @@
    "pass": true,
    "detail": {
     "by_type": {
-     "zygote": 2,
      "utility": 2,
-     "browser": 1,
-     "sandboxed-spawn": 6
+     "zygote": 2,
+     "sandboxed-spawn": 6,
+     "browser": 1
     },
     "sandboxed_spawn_filters2": 5,
     "note": "gpu/renderer share zygote-spawn class (no-execv); GPU HW liveness = webgl ANGLE check"
@@ -38,7 +38,7 @@
   },
   "download-gui-cdp": {
    "pass": true,
-   "detail": "{'done': True, 'sha_ok': True}"
+   "detail": "{'done': True, 'sha_ok': True, 'final_name': 'big.bin'}"
   },
   "downloads-page-reached": {
    "pass": true,
@@ -46,11 +46,11 @@
   },
   "downloads-list-item": {
    "pass": true,
-   "detail": "{'nodes': 377, 'big.bin-hits': 5}"
+   "detail": "{'nodes': 377, 'item-hits': 5, 'expected-name': 'big-26533.bin'}"
   },
   "file-chooser-window": {
    "pass": true,
-   "detail": "58720263|\ud30c\uc77c \uc5f4\uae30|32704"
+   "detail": "58720263|\ud30c\uc77c \uc5f4\uae30|26536"
   },
   "file-api-setinput": {
    "pass": true,
@@ -62,7 +62,7 @@
   },
   "audio-sink-input-pactl": {
    "pass": true,
-   "detail": "{'pactl': ['Sink Input #443'], 'audio_fd_inode': None, 'fd_path_connected': False}"
+   "detail": "{'pactl': ['Sink Input #447'], 'audio_fd_inode': None, 'fd_path_connected': False}"
   }
  },
  "notes": [
@@ -71,92 +71,92 @@
  ],
  "census_rows": [
   {
-   "pid": "300",
-   "type": "sandboxed-spawn",
-   "seccomp": "2",
-   "filters": "1",
-   "nnp": "1",
-   "ppid": "32716"
-  },
-  {
-   "pid": "302",
-   "type": "utility",
-   "seccomp": "2",
-   "filters": "1",
-   "nnp": "1",
-   "ppid": "32704"
-  },
-  {
-   "pid": "306",
-   "type": "sandboxed-spawn",
-   "seccomp": "2",
-   "filters": "2",
-   "nnp": "1",
-   "ppid": "32717"
-  },
-  {
-   "pid": "405",
-   "type": "sandboxed-spawn",
-   "seccomp": "2",
-   "filters": "2",
-   "nnp": "1",
-   "ppid": "32717"
-  },
-  {
-   "pid": "419",
-   "type": "sandboxed-spawn",
-   "seccomp": "2",
-   "filters": "2",
-   "nnp": "1",
-   "ppid": "32717"
-  },
-  {
-   "pid": "420",
-   "type": "sandboxed-spawn",
-   "seccomp": "2",
-   "filters": "2",
-   "nnp": "1",
-   "ppid": "32717"
-  },
-  {
-   "pid": "474",
-   "type": "sandboxed-spawn",
-   "seccomp": "2",
-   "filters": "2",
-   "nnp": "1",
-   "ppid": "32717"
-  },
-  {
-   "pid": "476",
-   "type": "utility",
-   "seccomp": "2",
-   "filters": "1",
-   "nnp": "1",
-   "ppid": "32704"
-  },
-  {
-   "pid": "32704",
+   "pid": "26536",
    "type": "browser",
    "seccomp": "2",
    "filters": "1",
    "nnp": "0",
-   "ppid": "32700"
+   "ppid": "26533"
   },
   {
-   "pid": "32716",
+   "pid": "26548",
    "type": "zygote",
    "seccomp": "2",
    "filters": "1",
    "nnp": "1",
-   "ppid": "32704"
+   "ppid": "26536"
   },
   {
-   "pid": "32717",
+   "pid": "26550",
    "type": "zygote",
    "seccomp": "2",
    "filters": "1",
    "nnp": "1",
-   "ppid": "32704"
+   "ppid": "26536"
+  },
+  {
+   "pid": "26590",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "1",
+   "nnp": "1",
+   "ppid": "26548"
+  },
+  {
+   "pid": "26593",
+   "type": "utility",
+   "seccomp": "2",
+   "filters": "1",
+   "nnp": "1",
+   "ppid": "26536"
+  },
+  {
+   "pid": "26595",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "2",
+   "nnp": "1",
+   "ppid": "26550"
+  },
+  {
+   "pid": "26677",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "2",
+   "nnp": "1",
+   "ppid": "26550"
+  },
+  {
+   "pid": "26718",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "2",
+   "nnp": "1",
+   "ppid": "26550"
+  },
+  {
+   "pid": "26719",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "2",
+   "nnp": "1",
+   "ppid": "26550"
+  },
+  {
+   "pid": "26766",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "2",
+   "nnp": "1",
+   "ppid": "26550"
+  },
+  {
+   "pid": "26798",
+   "type": "utility",
+   "seccomp": "2",
+   "filters": "1",
+   "nnp": "1",
+   "ppid": "26536"
   }
  ],
  "missing_required": [],
@@ -165,10 +165,6 @@
   "gpu-info-page": {
    "pass": false,
    "status": "recorded-fail"
-  },
-  "downloads-list-item": {
-   "pass": true,
-   "status": "ok"
   }
  }
 }
