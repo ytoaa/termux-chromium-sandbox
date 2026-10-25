@@ -1,0 +1,16 @@
+name: Probe Call
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  a:
+    runs-on: ubuntu-26.04
+    steps:
+      - run: echo normal-ok
+  b:
+    runs-on: ubuntu-26.04
+    permissions:
+      actions: write
+    steps:
+      - run: echo elevated-ordinary
