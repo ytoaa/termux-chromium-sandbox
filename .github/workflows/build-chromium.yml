@@ -1,8 +1,7 @@
 # Cloud build of the seccomp-only sandbox port (Phase 2a).
-# Scope: build + gates + artifacts (+ Round 17: CI-verified direct builds
-# publish a GitHub PRE-RELEASE through the shared publisher, never apt,
-# never stable, never validated promotion — those remain separate human
-# approvals). No merge authority (per the 2026-10 incident lessons).
+# Scope: build + gates + artifacts ONLY. No apt publish, no releases, no
+# merge authority (that surface arrives in Phase 2b behind its own review,
+# per the 2026-10 incident lessons).
 name: Build Termux Chromium Seccomp Sandbox Port
 
 on:
@@ -19,10 +18,6 @@ on:
         description: TERMUX_PKG_REVISION override (empty = unchanged; used by maintenance revision builds)
         type: string
         default: ""
-      publish:
-        description: Publish successful direct builds as GitHub Pre-release
-        type: boolean
-        default: true
   workflow_call:
     inputs:
       termux_ref:
@@ -194,30 +189,3 @@ jobs:
             termux-packages/**/port-apply-chromium.log
             termux-pin.txt
           if-no-files-found: warn
-
-  publish:
-    name: Pre-release (direct builds only)
-    needs: build
-    # Round 17 — a DIRECT manual build publishes on success (CI VERIFIED —
-    # DEVICE NOT VERIFIED). When this workflow is CALLED by
-    # daily-maintenance, inputs.source stays 'maintenance' and publishing
-    # is DEFERRED to the maintenance ledger-gated publish job (which also
-    # requires the recorded candidate) — no duplicate publishing, no
-    # publish-before-ledger. Re-running a failed publish job re-downloads
-    # the artifact only: this job always re-checks needs.build.result of
-    # THIS run, so an artifact can never be published without the build
-    # having succeeded in this run. Opt-out: publish=false.
-    if: needs.build.result == 'success' && inputs.source != 'maintenance'
-        && needs.build.outputs.deb_sha256 != '' && needs.build.outputs.deb_version != ''
-        && github.event.inputs.publish != 'false'
-    uses: ./.github/workflows/publish-release.yml
-    with:
-      source: manual
-      ci_run_id: ${{ github.run_id }}
-      artifact_name: build-${{ github.run_id }}
-      deb_version: ${{ needs.build.outputs.deb_version }}
-      deb_sha256: ${{ needs.build.outputs.deb_sha256 }}
-      termux_sha: ${{ needs.build.outputs.termux_sha }}
-      port_sha: ${{ needs.build.outputs.port_sha }}
-    permissions:
-      contents: write
