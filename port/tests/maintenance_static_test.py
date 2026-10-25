@@ -283,12 +283,32 @@ check('[s50d] step order: classify -> ledger gate -> download -> verify -> plan 
       _psrc.index('Classify trigger event') < _psrc.index('ledger gate')
       < _psrc.index('Download candidate artifact') < _psrc.index('Integrity verification')
       < _psrc.index('+ plan (dedup') < _psrc.index('Execute (draft'))
-_li=_psrc.index('ok=$(jq -r --argjson id'); _ai=_psrc.index('actions/runs/$RUN_ID/artifacts')
-check('[s50g] ORDER: ledger no-op check precedes artifact-existence (dry/skip runs have no build-<id> artifact -> must be green no-op, never red)',
-      _li < _ai and 'SKIP_REMAIN=true' in _psrc[_li:_ai] and 'exit 0' in _psrc[_li:_ai])
-check('[s50e] ledger gate re-executed in publisher (BUILD_VERIFIED_CANDIDATE + 64hex sha + 16hex sig for THIS run)',
-      'BUILD_VERIFIED_CANDIDATE' in _psrc and 'test("^' in _psrc
-      and '[0-9a-f]{64}' in _psrc and '[0-9a-f]{16}' in _psrc and 'SKIP_REMAIN' in _psrc)
+_li=_psrc.index('port/publish_release.py ledger-lookup'); _ai=_psrc.index('actions/runs/$RUN_ID/artifacts')
+check('[s50g] ORDER: ledger-lookup no-op path precedes artifact-existence (dry/skip runs lack build-<id> -> green no-op, never red)',
+      _li < _ai and 'SKIP_REMAIN=true' in _psrc[_li:_ai] and 'exit 0' in _psrc[_li:_ai]
+      and 'case "$lrc" in' in _psrc[_li:_ai] and '4)' in _psrc[_li:_ai])
+check('[s57] Stage A: execute step uses POSITIVE if/else with FIRST-statement rc capture; the negated wrapper is banned',
+      'if python3 port/publish_release.py execute' in _psrc
+      and 'if ! python3 port/publish_release.py execute' not in _psrc
+      and _re.search(r"else\n\s+rc=\$\?", _psrc) is not None)
+check('[s58] execute failure propagates the EXACT code (exit "$rc") and no unescaped backticks in executable step code',
+      'exit "$rc"' in _psrc and 'lrc=$?' in _psrc and 'exit "$lrc"' in _psrc
+      and all('`' not in l.replace('\\`','') for l in _psrc.splitlines()
+              if not l.strip().startswith('#') and 'jq' not in l))
+check('[s59] ledger-lookup is READ-ONLY (no state writes in the lookup code path)',
+      'def ledger_lookup' in _pub and
+      'write_text' not in _pub[_pub.index('def ledger_lookup'):_pub.index('# ================================================================ verify ==')]
+      and 'open(' not in _pub[_pub.index('def ledger_lookup'):_pub.index('def cmd_ledger_lookup')])
+check('[s60] publisher NEVER writes state or creates issues (build/ledger contracts untouched)',
+      'gh api -X PUT' not in _psrc and 'gh issue create' not in _psrc
+      and '-X PUT' not in _psrc and 'retry_approved' not in _psrc)
+check('[s50e] ledger gate re-executed via ENGINE ledger-lookup (BUILD_VERIFIED_CANDIDATE + shape contract lives in publish_release.py)',
+      'port/publish_release.py ledger-lookup' in _psrc
+      and 'def ledger_lookup' in _pub
+      and 'BUILD_VERIFIED_CANDIDATE' in _pub[_pub.index('def ledger_lookup'):]
+      and 'HEX64.fullmatch' in _pub[_pub.index('def ledger_lookup'):]
+      and "[0-9a-f]{16}" in _pub[_pub.index('def ledger_lookup'):]
+      and 'HEX40.fullmatch' in _pub[_pub.index('def ledger_lookup'):])
 check('[s50f] dry-run/skip/blocked/unrecorded => no-op (SKIP_REMAIN=true, never publish)',
       'no-op' in _psrc and 'SKIP_REMAIN=true' in _psrc)
 # s51/s52: caller workflows must NOT have gained any publisher wiring or elevated perms (Round 17 keeps them at Round-16 baseline; only build-chromium gained a dispatch opt-out input)

@@ -62,7 +62,13 @@ and invites a PR. This project is that attempt.
   exact run publishes; dry-run/skip/blocked/failed runs no-op), re-verifies
   the artifact fail-closed (provenance, exactly one DEB, SHA256,
   `dpkg-deb` identity, shield members, pins; signature required on the
-  maintenance path, never fabricated on manual), then publishes a GitHub
+  maintenance path, never fabricated on manual). The ledger lookup scans
+  BOTH `last_successful_build` and `candidates[]` for a verified record
+  claiming the triggering run (late publishers after consecutive builds
+  miss nothing); contradictory/malformed claims and currently blocked
+  signatures refuse RED instead of hiding behind a no-op. The Execute
+  step propagates the publisher's exact exit code (0/1/2/3) — bash
+  negation masking is test-enforced. Then publishes a GitHub
   **Pre-release** `chromium-sandboxed-v<version>` (draft-first: DEB +
   `SHA256SUMS.txt` + `build-manifest.json` + secret-scanned logs; flipped
   public only after byte-level asset re-verification and a post-publish API

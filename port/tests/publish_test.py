@@ -370,35 +370,127 @@ check('[g6] malformed run id -> step fails (fail closed)', rc != 0)
 kv, rc = _run_cls(WF='Daily Maintenance', RUN_HEAD='zzz')
 check('[g7] malformed head sha -> step fails', rc != 0)
 
-# ---- ledger gate (jq extracted from the workflow itself)
-import re as _re2
-_src = open(ROOT / '.github/workflows/publish-release.yml').read()
-_m = _re2.search(r"ok=\$\(jq -r --argjson id " + chr(34) + r"\$RUN_ID" + chr(34) + r" '(.*?)' state.json\)", _src, _re2.S)
-LED = _m.group(1)
-def _ledger_ok(state_doc, run_id=999):
-    p = ROOT / '._led_state.json'
-    p.write_text(json.dumps(state_doc))
-    r = subprocess.run(['jq', '-r', '--argjson', 'id', str(run_id), LED, str(p)],
-                       capture_output=True, text=True)
+# ---- ledger lookup (engine CLI; covers defect B: candidates[] scan)
+def _lk(state_doc, run_id):
+    p = ROOT / '._lk_state.json'; p.write_text(json.dumps(state_doc))
+    o = ROOT / '._lk_out.json'
+    if o.exists(): o.unlink()
+    rc = P.main(['ledger-lookup', '--state', str(p), '--run-id', str(run_id),
+                 '--out', str(o)])
     p.unlink()
-    return r.stdout.strip()
-def _recorded_state(**over):
-    b = {'ci_run': 999, 'status': 'BUILD_VERIFIED_CANDIDATE',
-         'deb_sha256': 'a' * 64, 'deb_version': '156.0.8078.47-4',
-         'signature': 'a' * 16}
-    b.update(over)
-    return {'last_successful_build': b}
-check('[g8] ledger candidate recorded for THIS run -> gate OPEN',
-      _ledger_ok(_recorded_state()) == 'true')
-check('[g9] dry-run/skip (ledger still references an OLD run id) -> gate CLOSED',
-      _ledger_ok(_recorded_state(ci_run=555)) == 'false')
-check('[g10] failed/unrecorded (status missing) -> CLOSED',
-      _ledger_ok(_recorded_state(status='BUILD_FAILED')) == 'false')
-check('[g11] malformed ledger sha/sig -> CLOSED (never publish on weak metadata)',
-      _ledger_ok(_recorded_state(deb_sha256='abc')) == 'false'
-      and _ledger_ok(_recorded_state(signature='zz')) == 'false')
-check('[g12] no last_successful_build at all -> CLOSED',
-      _ledger_ok({'last_successful_build': {}}) == 'false')
+    rec = json.loads(o.read_text()) if o.exists() else None
+    if o.exists(): o.unlink()
+    return rc, rec
+TSHA_OK = 'd' * 40
+def _cand(ci, ver, sha_c, sig_c, **over):
+    r = {'ci_run': ci, 'status': 'BUILD_VERIFIED_CANDIDATE', 'deb_version': ver,
+         'deb_sha256': sha_c * 64, 'signature': sig_c * 16, 'termux_sha': TSHA_OK}
+    r.update(over); return r
+A = _cand(101, '156.0.8078.47-3', 'a', '1')
+B = _cand(102, '156.0.8078.47-4', 'b', '2')
+st_ab = {'last_successful_build': dict(B), 'candidates': [dict(A), dict(B)], 'blocked': {}}
+rc, rec = _lk(st_ab, 101)
+check('[l1] Run A still publishable when last_successful_build already moved to B (defect B)',
+      rc == 0 and rec and rec['deb_sha256'] == 'a' * 64
+      and 'candidates[0]' in rec['claim_sources'], f'rc={rc} {rec}')
+rc, rec = _lk(st_ab, 102)
+check('[l2] Run B (current) found via last+candidates', rc == 0 and rec['deb_version'] == '156.0.8078.47-4')
+rc, rec = _lk(st_ab, 999)
+check('[l3] unclaimed run id -> code 4 (normal no-op, NEVER fabricate)', rc == 4 and rec is None)
+st_dup = {'last_successful_build': dict(B), 'candidates': [dict(A), dict(A), dict(B)], 'blocked': {}}
+rc, _ = _lk(st_dup, 101)
+check('[l4] duplicate IDENTICAL records -> tolerated (found once)', rc == 0)
+st_con = {'last_successful_build': dict(B), 'candidates': [dict(A), dict(A, deb_sha256='f' * 64)], 'blocked': {}}
+rc, _ = _lk(st_con, 101)
+check('[l5] same run id, contradicting records -> FAIL-CLOSED rc1 (never silent pick)', rc == 1)
+st_bad = {'last_successful_build': dict(A, status='BUILD_FAILED'), 'candidates': [], 'blocked': {}}
+rc, _ = _lk(st_bad, 101)
+check('[l6] claim with non-VERIFIED status -> refused rc1 (CI-failure records never pass)', rc == 1)
+st_mal = {'last_successful_build': dict(A, signature='seed-manual'), 'candidates': [], 'blocked': {}}
+rc, _ = _lk(st_mal, 101)
+check('[l7] claim with malformed signature -> refused rc1 (not downgraded to no-op)', rc == 1)
+st_blk = json.loads(json.dumps(st_ab)); st_blk['blocked'] = {'1' * 16: {'issue': 2, 'classification': 'port'}}
+rc, _ = _lk(st_blk, 101)
+check('[l8] claim whose signature is currently blocked -> refused rc1 (blocked never auto-publishes)', rc == 1)
+st_noval = {'last_successful_build': dict(A, validated=False), 'candidates': [], 'blocked': {}}
+rc, _ = _lk(st_noval, 101)
+check('[l9] validated flag NOT required for CI-candidate publishing', rc == 0)
+st_nt = {'last_successful_build': {k: v for k, v in A.items() if k != 'termux_sha'}, 'candidates': [], 'blocked': {}}
+rc, _ = _lk(st_nt, 101)
+check('[l10] claim without 40hex termux_sha -> refused rc1', rc == 1)
+rc, _ = _lk({}, 101)
+check('[l11] empty state -> code 4 no-claim (no crash)', rc == 4)
+
+# ---- ledger-vs-artifact cross-check (derive step; closes defect-B loop:
+# a candidates[] hit must still byte-match the audited run's artifact)
+_der=[st for st in _STEPS if st.get('name','').startswith('Integrity verification')][0]['run']
+_der_head=_der[:_der.index('python3 port/publish_release.py verify')]
+w = Path(tempfile.mkdtemp(prefix='dmatch.'))
+adir, deb = make_artifact(w)
+def _derive_body():
+    d=_der.split('python3 port/publish_release.py verify')[0]
+    return d
+def _derive_run(exp_ver,exp_sha,srcdir):
+    env=dict(os.environ,GITHUB_OUTPUT=str(srcdir/'o'),GITHUB_ENV=str(srcdir/'e'),
+             EXPECT_VERSION=exp_ver,EXPECT_SHA=exp_sha,EXPECT_TERMUX='',EXPECT_SIG='',EXPECT_TS='')
+    (srcdir/'o').write_text(''); (srcdir/'e').write_text('')
+    os.environ['PWD']=str(srcdir)
+    cwd=os.getcwd(); os.chdir(srcdir)
+    r=subprocess.run(['bash','-c','set -euo pipefail\n'+_derive_body()],capture_output=True,text=True,env=env)
+    os.chdir(cwd)
+    return r.returncode,(r.stdout+r.stderr)
+wsub=w/'sub'; (wsub/'artifact').mkdir(parents=True)
+import shutil as _sh
+_sh.copy2(deb, wsub/'artifact'/deb.name)
+(wsub/'artifact'/'termux-pin.txt').write_text('d'*40+'\n')
+rc,out=_derive_run(VERSION, P.sha256_file(deb), wsub)
+check('[x1] ledger-matching artifact passes the derive cross-check (maintenance path)', rc==0 and f'deb_version={VERSION}' in open(wsub/'o').read(), f'rc={rc} {out[-160:]}')
+rc,out=_derive_run(VERSION, 'f'*64, wsub)
+check('[x2] ledger SHA != artifact SHA -> refuse (never publish a run whose bytes disagree with its record)', rc!=0 and 'refusing' in out.lower())
+rc,out=_derive_run('9.9.9.9-1', P.sha256_file(deb), wsub)
+check('[x3] ledger VERSION != artifact VERSION -> refuse', rc!=0)
+
+# ---- e-series: EXECUTE STEP bash exit-code fidelity (defect A)
+_exec = [st for st in _STEPS if st.get('name', '').startswith('Execute (draft')][0]['run']
+def _run_exec(rc_inject, legacy_negated=False):
+    stub = str(ROOT / 'port/tests/fixtures/rc_stub.py')
+    body = _exec.replace("${{ github.repository }}", 'r/p').replace('${{ github.run_id }}', '999')
+    body = body.replace("python3 port/publish_release.py execute",
+                        f"python3 {stub}")
+    if legacy_negated:
+        # reconstruct the PRE-fix shape to PROVE it masked failures
+        NL = chr(10)
+        body = ('set -euo pipefail' + NL + 'if ! python3 ' + stub
+                + ' --plan x --out ./_exec_result.json; then rc=$?; exit "$rc"; fi' + NL)
+    summ = tempfile.mktemp(); open(summ, 'w').close()
+    argf = tempfile.mktemp()
+    env = dict(os.environ, STUB_RC=str(rc_inject), STUB_ARGS=argf,
+               STUB_OUT_FILE='._exec_result.json', GITHUB_STEP_SUMMARY=summ)
+    for junk in ('._exec_result.json',):
+        if os.path.exists(junk): os.unlink(junk)
+    r = subprocess.run(['bash', '-c', body], capture_output=True, text=True, env=env)
+    called = os.path.exists(argf) and 'ledger' not in open(argf).read()
+    for f in (summ, argf):
+        try: os.unlink(f)
+        except OSError: pass
+    if os.path.exists('._exec_result.json'): os.unlink('._exec_result.json')
+    return r.returncode, (r.stdout + r.stderr), called
+rc_out, out, called = _run_exec(0)
+check('[e1] publisher rc0 -> step SUCCESS (positive-if, publisher invoked)',
+      rc_out == 0 and called and 'Pre-release publisher completed' in out, f'rc={rc_out}')
+for _rc in (1, 2, 3):
+    rc_out, out, called = _run_exec(_rc)
+    check(f'[e2-e4] publisher rc{_rc} -> step FAILURE with EXACT code (defect A fix)',
+          rc_out == _rc and called and '::error::' in out and f'rc={_rc}' in out,
+          f'observed rc={rc_out}')
+rc_out, out, _ = _run_exec(3, legacy_negated=True)
+check('[e5] LEGACY `if ! cmd` shape PROVEN to mask rc3 as success (regression anchor)',
+      rc_out == 0, f'legacy form returned {rc_out} (must be 0 to document the defect)')
+rc_out, out, _ = _run_exec(2)
+check('[e6] failed publish leaves NO success summary, points to rerun-only recovery',
+      rc_out == 2 and 'Pre-release publisher completed' not in out
+      and 'rerun' in out.lower() and 'never rebuild' in out.lower())
+
 # ---- instance invariants (startup_failure bisection learnings, revert PR #8)
 _WFS = {'daily-maintenance.yml': _yaml.safe_load(open(ROOT / '.github/workflows/daily-maintenance.yml')),
         'build-chromium.yml': _yaml.safe_load(open(ROOT / '.github/workflows/build-chromium.yml')),
@@ -419,6 +511,7 @@ check('[g15] workflow_run restricted to the two build workflows, completed-only,
       and _PR[True if True in _PR else 'on']['workflow_run']['types'] == ['completed']
       and 'github.event.workflow_run.conclusion == \'success\'' in _PR['jobs']['publish']['if']
       and "head_branch == github.event.repository.default_branch" in _PR['jobs']['publish']['if'])
+_src = open(ROOT / '.github/workflows/publish-release.yml').read()
 check('[g16] publisher pinned to default-branch code (supply-chain) + artifact by audited run-id',
       'ref: ${{ github.event.repository.default_branch }}' in _src
       and 'run-id: ${{ steps.cls.outputs.run_id }}' in _src)

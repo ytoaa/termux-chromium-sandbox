@@ -119,25 +119,33 @@ jobs:
               echo "::error::state probe failed (not a 404) — fail closed"; tail -2 state.err; exit 1
             fi
             base64 -d state.b64 > state.json
-            ok=$(jq -r --argjson id "$RUN_ID" '
-              (.last_successful_build // {}) as $b
-              | if ($b.ci_run == $id
-                    and ($b.status // "") == "BUILD_VERIFIED_CANDIDATE"
-                    and (($b.deb_sha256 // "") | test("^[0-9a-f]{64}$"))
-                    and (($b.deb_version // "") | length > 0)
-                    and (($b.signature // "") | test("^[0-9a-f]{16}$")))
-                then "true" else "false" end' state.json)
-            if [ "$ok" != "true" ]; then
-              echo "no verified candidate for run $RUN_ID (dry-run/skip/blocked/unrecorded) — normal no-op" >> "$GITHUB_STEP_SUMMARY"
-              echo "SKIP_REMAIN=true" >> "$GITHUB_ENV"; exit 0
+            # Read-only ledger lookup (port/publish_release.py): checks
+            # last_successful_build AND candidates[] for a verified record
+            # claiming THIS run id (defect B: a later build must not hide an
+            # earlier candidate), enforces status/sha/version/signature/
+            # termux shapes, refuses contradictory claims and currently
+            # blocked signatures fail-closed (rc 1 = red, never a green
+            # no-op), and returns 4 only when NOTHING claims the run.
+            if python3 port/publish_release.py ledger-lookup \
+                 --state state.json --run-id "$RUN_ID" --out ledger.json; then
+              {
+                echo "EXPECT_VERSION=$(jq -r '.deb_version' ledger.json)"
+                echo "EXPECT_SHA=$(jq -r '.deb_sha256' ledger.json)"
+                echo "EXPECT_SIG=$(jq -r '.signature' ledger.json)"
+                echo "EXPECT_TERMUX=$(jq -r '.termux_sha' ledger.json)"
+                echo "EXPECT_TS=$(jq -r '.recorded_at // ""' ledger.json)"
+              } >> "$GITHUB_ENV"
+            else
+              lrc=$?
+              case "$lrc" in
+                4)
+                  echo "no verified candidate for run $RUN_ID (dry-run/skip/blocked/failed/unrecorded) — normal no-op" >> "$GITHUB_STEP_SUMMARY"
+                  echo "SKIP_REMAIN=true" >> "$GITHUB_ENV"; exit 0 ;;
+                *)
+                  echo "::error::ledger lookup refused (rc=$lrc) — contradictory, blocked or malformed claim for run $RUN_ID; fail closed"
+                  exit "$lrc" ;;
+              esac
             fi
-            {
-              echo "EXPECT_VERSION=$(jq -r '.last_successful_build.deb_version' state.json)"
-              echo "EXPECT_SHA=$(jq -r '.last_successful_build.deb_sha256' state.json)"
-              echo "EXPECT_SIG=$(jq -r '.last_successful_build.signature' state.json)"
-              echo "EXPECT_TERMUX=$(jq -r '.last_successful_build.termux_sha // ""' state.json)"
-              echo "EXPECT_TS=$(jq -r '.last_successful_build.recorded_at // ""' state.json)"
-            } >> "$GITHUB_ENV"
           else
             # manual path: no ledger contract — a successful build run MUST
             # own its build-<run> artifact; absence is a real anomaly (red).
@@ -225,11 +233,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if ! python3 port/publish_release.py execute --plan publish-plan.json \
+          # Round 18 (defect A): do NOT wrap the publisher in `if ! cmd` —
+          # bash resets $? to 0 inside a negated-if body, so failures could
+          # exit 0 (GREEN) and hide a publish error. Positive if/else keeps
+          # the publisher's exact exit code (0 ok / 1 integrity / 2
+          # collision / 3 transient), asserted by the e-series tests.
+          if python3 port/publish_release.py execute --plan publish-plan.json \
               --verified verified.json --repo '${{ github.repository }}' \
               --gh-bin gh --out publish-result.json; then
+            echo "Pre-release publisher completed"
+          else
             rc=$?
-            echo "::error::publish step failed (rc=$rc). The Chromium BUILD and the candidate ledger are UNAFFECTED — re-run THIS run (`gh run rerun ${{ github.run_id }}`) or wait for the nightly; never rebuild Chromium for a publish problem."
+            echo "::error::publish step failed (rc=$rc). The Chromium BUILD and the candidate ledger are UNAFFECTED — re-run THIS run (gh run rerun ${{ github.run_id }}) or wait for the nightly; never rebuild Chromium for a publish problem."
             exit "$rc"
           fi
 

@@ -1338,3 +1338,71 @@ logs). Notes: CI VERIFIED — DEVICE NOT VERIFIED + user device checklist
 * Tests: `port/tests/publish_test.py` 49 checks (19-row required table +
   g1–g16 workflow_run classify/ledger/invariants), static s50–s52f +
   s46 across all three workflows, harness 50/50 RC=0, selftest RC=0.
+
+## Round 18 — Pre-release publisher reliability hotfix (exit-code fidelity + candidate lookup)
+
+Independent audit of Round 17 found two reliability defects; both are
+fixed here WITHOUT touching build/ledger/classification contracts.
+
+### Defect A — negated-if masked publisher failures as success
+The Execute step wrapped the publisher in `if ! python3 ... execute; then
+rc=$?; exit "$rc"; fi`. Bash sets `$?` to 0 inside a *negated* if-body, so
+`rc` was always 0 and a failed publish could exit GREEN. Reproduced
+locally (legacy form: injected rc 3 → captured 0; fixed form: captured 3).
+Fix: positive `if cmd; then …ok…; else rc=$?; …exit "$rc"; fi` — `$?` is
+first-statement in the else branch before any other command can clobber
+it. Full exit contract now propagates verbatim to the Actions job:
+0 published/idempotent-skip → SUCCESS; 1 integrity, 2 collision,
+3 transient → FAILURE with the same code. Audit of all workflow/port
+shell for `if !` + `$?` shapes found no other instance (remaining
+`if !` uses are pure branch predicates with hardcoded handling —
+legitimate no-ops, not masking). While testing the REAL step body in
+bash, a second latent defect surfaced: the failure message contained
+unescaped backticks around `gh run rerun …` — inside double quotes bash
+performs command substitution, so the ERROR HANDLER ITSELF would have
+executed gh on every publish failure (and hung tests). Backticks removed.
+Lesson encoded: failure paths must be executed, not grep'd
+(`port/tests/publish_test.py` e-series runs the extracted Execute step
+against an rc-stub: 0→success, 1/2/3→exact-code failure, plus a LEGACY
+negative control proving the old form masked rc 3, and a no-success-summary
++ rerun-only-recovery assertion).
+
+### Defect B — late publishers missed candidates replaced in last_successful_build
+The ledger gate compared only `last_successful_build.ci_run == run-id`.
+With consecutive builds or workflow_run queue delay, run B's success
+overwrites `last_successful_build`, and publisher A (starting late) found
+no match → candidate A silently never published. Fix: read-only
+`port/publish_release.py ledger-lookup --state S --run-id R --out O`
+(collects claims from last_successful_build AND every candidates[] entry
+with ci_run==R):
+* every claim must satisfy the shape contract: status
+  BUILD_VERIFIED_CANDIDATE, concrete deb_version, 64hex deb_sha256,
+  16hex signature, 40hex termux_sha; `validated` is NOT required (CI
+  success ≠ device verification);
+* claims that exist but are malformed or mutually contradictory (same
+  run id, different version/sha/signature/pin) → rc 1 REFUSE (red) — a
+  broken claim is never downgraded to a green no-op;
+* currently blocked signature (blocked map) → rc 1 refuse (blocked builds
+  never auto-publish; Issue #2-style blocks are honoured);
+* NOTHING claims the run → rc 4 = normal no-op (dry-run/skip/failed runs
+  have no claim by contract; absence of a claim is never guessed into a
+  candidate, and artifact existence alone remains insufficient);
+* never writes state; EXPECT_* values flow from the ledger record and the
+  derive step re-checks the downloaded artifact against them (x-series:
+  version or sha mismatch vs ledger → refuse).
+Queue-order independence verified (l-series): A published from candidates[]
+while last=B; both A and B publishable; duplicates tolerated only when
+byte-identical; empty state → 4. Same-version different-bytes A/B still
+ends in the existing collision policy (no overwrite, rc 2).
+
+### Scope discipline
+daily-maintenance.yml, build-chromium.yml, maintenance.py, port.toml,
+state.seed.json and all security/build-contract files: UNCHANGED
+(verified by diff + static s51/s52). Publisher keeps zero caller-side
+permissions and no actions:write (instance startup_failure invariant).
+Round 18 statics: s50g (ledger-lookup precedes artifact probe), s57
+(positive-if enforced, negated wrapper banned, first-statement rc),
+s58 (exact-code propagation, no unescaped backticks in executable step
+code), s59 (lookup is read-only), s60 (publisher never PUTs state or
+creates issues). Suite: publish 64 checks (19-row table + classify +
+l1–l11 + e1–e6 + x1–x3), static 76/76, harness green, selftest RC=0.
