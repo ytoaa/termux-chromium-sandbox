@@ -29,7 +29,6 @@ on:
     # schedules deliver the latest occurrence only.
     - cron: '23 0 * * *'
   workflow_dispatch:
-  workflow_dispatch:
     inputs:
       dry_run:
         description: 'Probe + decide only (no build, no issue writes, no state push)'
