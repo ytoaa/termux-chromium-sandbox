@@ -1,0 +1,356 @@
+# Round 15/15.1 — daily maintenance pipeline: probe -> decide -> (job-level
+# reusable build call) -> outcome/issues/state. Inert until merged to the
+# default branch (cron fires on default branch only).
+#
+# Hard invariants (port/maintenance.py + this file): automation never edits
+# BPF/Broker/syscall policy; never bypasses R1~R9b (build is fail-closed);
+# never mutates last_validated_* (human act on port.toml only); never
+# publishes apt/Release; blocked targets skip unless inputs changed or a
+# human applied `retry-approved`; unknown failures BLOCK; GitHub API errors
+# FAIL CLOSED (no silent seed/empty fallbacks on real errors).
+#
+# STATE: maintenance/state.json on the `maintenance-state` branch (regular branch, created from the default-branch head on first run).
+# Legitimate first run (file absent -> 404) falls back to
+# maintenance/state.seed.json; ANY other API error aborts the run.
+name: Daily Maintenance
+
+# C.2-E: the daily schedule trigger is REMOVED until a separate
+# operational approval. Merging this PR does NOT activate any automation —
+# the pipeline runs only via explicit workflow_dispatch (dry_run default
+# true). Restoring `on.schedule` (00:23 UTC = 09:23 KST, idempotency via
+# signature dedup + concurrency groups) requires a dedicated follow-up PR
+# and owner approval. See port/DESIGN.md "Activation policy".
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Probe + decide only (no build, no issue writes, no state push)'
+        type: boolean
+        default: true
+      approve_retry:
+        description: 'One-shot retry approval for currently blocked signatures (human review prerequisite)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-maintenance
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    name: Probe upstream + decide
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read    # in-progress build detection
+      issues: read     # dedup/retry-label lookup (fail-closed on API error)
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      reason: ${{ steps.decide.outputs.reason }}
+      target: ${{ steps.decide.outputs.target }}
+      relink: ${{ steps.decide.outputs.relink }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Probe upstream (head-pinned termux recipe reads)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 port/maintenance.py fetch --out probes.json --token "${GITHUB_TOKEN}"
+
+      - name: "Load state (FAIL-CLOSED: only a true 404 seeds)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          err=state.err
+          if gh api "repos/${{ github.repository }}/contents/maintenance/state.json?ref=maintenance-state" \
+               --jq .content > state.b64 2>"$err"; then
+            base64 -d state.b64 > state.json
+            echo "STATE_SOURCE=branch" >> "$GITHUB_ENV"
+          elif grep -qiE "Not Found|No commit found for the ref" "$err"; then
+            cp maintenance/state.seed.json state.json
+            echo "STATE_SOURCE=seed (first run, branch/file absent)" >> "$GITHUB_ENV"
+          else
+            echo '::error::state API failure (not a 404) — refusing seed fallback'
+            cat "$err" | tail -3
+            exit 1
+          fi
+          python3 port/maintenance.py validate-state --state state.json
+
+      - name: "Load block-issues + in-progress builds (FAIL-CLOSED)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${{ github.repository }}/issues?state=open&labels=auto-build-blocked&per_page=100" \
+               --jq '[.[] | {number,title,labels:[.labels[].name]}]' > issues.json 2>issues.err; then
+            :
+          else
+            # empty list would silently defeat dedup AND retry-approved checks
+            echo '{"error":true}' > issues.json
+            echo "::warning::issues API unavailable — engine will fail closed"
+          fi
+          if gh api "repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=50" \
+               --jq '[.workflow_runs[] | select(.name=="Build Termux Chromium Seccomp Sandbox Port")] | length' \
+               > runs.count 2>runs.err; then
+            if [ "$(tr -d '"[:space:]' < runs.count)" != "0" ]; then echo '{"signature":"RUNNING-ANY"}' > running.json; else echo 'null' > running.json; fi
+          else
+            echo '{"signature":"API-ERROR"}' > running.json
+            echo "::warning::actions API unavailable — treat as busy (fail closed)"
+          fi
+
+      - name: Decide
+        id: decide
+        run: |
+          set -euo pipefail
+          APPROVE=""
+          if [ "${{ inputs.approve_retry }}" = "true" ]; then APPROVE="--approve-retry"; fi
+          # port build inputs = hash of build-consumed files only (doc-only
+          # commits do NOT change this -> no spurious rebuilds; Round 15.1 #5)
+          PORT_SIG=$(for f in port/chromium_sandbox_port.py port/prepare_recipe.py \
+                     port/port.toml port/gnp_shim.c port/ci.sh; do
+                       git rev-parse "HEAD:$f" 2>/dev/null || echo MISSING:$f; done \
+                     | sha256sum | cut -c1-16)
+          python3 port/maintenance.py decide --state state.json --probes probes.json \
+            --out plan.json --issues issues.json --running running.json \
+            --port-sha "$PORT_SIG" --now "$(date -u +%FT%TZ)" $APPROVE
+          echo "action=$(python3 -c "import json;print(json.load(open('plan.json'))['action'])")" >> "$GITHUB_OUTPUT"
+          echo "reason=$(python3 -c "import json;print(json.load(open('plan.json'))['reason'])")" >> "$GITHUB_OUTPUT"
+          echo "target=$(python3 -c "import json;print(json.dumps((json.load(open('plan.json')).get('target') or {})))")" >> "$GITHUB_OUTPUT"
+          echo "relink=$(python3 -c "import json;print('true' if json.load(open('plan.json')).get('relink') else 'false')")" >> "$GITHUB_OUTPUT"
+          { echo "### Maintenance plan"; echo '```json'; cat plan.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maintenance-plan-${{ github.run_id }}
+          path: |
+            state.json
+            plan.json
+            probes.json
+            issues.json
+
+  build:
+    name: Reusable build (only when decided)
+    needs: evaluate
+    if: needs.evaluate.outputs.action == 'build' && inputs.dry_run != true
+    uses: ./.github/workflows/build-chromium.yml
+    with:
+      termux_ref: ${{ fromJson(needs.evaluate.outputs.target).termux_ref }}
+      pkg_revision: ${{ fromJson(needs.evaluate.outputs.target).pkg_revision_env }}
+
+  outcome:
+    name: Classify outcome + issues + state
+    needs: [evaluate, build]
+    # always(): collect failures AND cancellations of the called build.
+    # Round 15.3 #2: also run for relink-only repairs (no build performed).
+    if: always() && needs.evaluate.result == 'success'
+        && (needs.evaluate.outputs.action == 'build'
+            || needs.evaluate.outputs.relink == 'true')
+        && inputs.dry_run != true
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: write   # ONLY the maintenance/state.json Contents-API commit
+      issues: write     # deduplicated block issues
+      actions: read     # job-level classification of the called workflow
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: maintenance-plan-${{ github.run_id }}
+
+      - name: "Consume retry-approved label (durable one-shot)"
+        # Round 15.4 #1: the consumption record lives in GitHub ITSELF, not
+        # only in maintenance-state — removing the label before any further
+        # mutation makes the approval one-shot even if the later state push
+        # fails. Removal failure is a warning only: apply+push still record
+        # consumption (backstop); a re-attempt then requires BOTH failures.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          issue=$(python3 -c "import json;print((json.load(open('plan.json')).get('approval') or {}).get('issue',''))")
+          case "$issue" in
+            ''|dispatch) echo "no issue-based approval to consume"; exit 0 ;;
+          esac
+          if gh api -X DELETE "repos/${{ github.repository }}/issues/$issue/labels/retry-approved" 2>label.err; then
+            echo "retry-approved consumed on issue $issue (one-shot recorded on GitHub)"
+          else
+            echo "::warning::label removal failed — relying on state backstop; repeated auto-retry needs persistent API+push failure"
+            tail -2 label.err || true
+          fi
+
+      - name: Classify called-build result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          res="${{ needs.build.result }}"
+          echo "called build job result: $res"
+          : > tail.log
+          case "$res" in
+            success)
+              # Round 15.2 #1: raw result; the ENGINE validates shape
+              # (deb sha 64hex, deb_version == expected package_version,
+              # termux_sha 40hex, ci_run>0, ci_url https, artifact) and
+              # downgrades malformed success to a 'verify' failure itself.
+              echo '{"success":true,"stage":"ok"}' \
+                | jq --arg d "${{ needs.build.outputs.deb_sha256 }}" \
+                     --arg v "${{ needs.build.outputs.deb_version }}" \
+                     --arg t "${{ needs.build.outputs.termux_sha }}" \
+                     --arg url "$CI_URL" --arg art "build-${{ github.run_id }}" \
+                     --argjson run "${{ github.run_id }}" \
+                     '. + {deb_sha256:$d, deb_version:$v, termux_sha:$t,
+                           ci_url:$url, ci_run:$run, artifact:$art}' \
+                     > result.json ;;
+            cancelled)
+              jq -n --arg url "$CI_URL" --argjson run "${{ github.run_id }}" \
+                '{success:false, stage:"cancelled",
+                  log_tail:"run cancelled (user or timeout) — not counted as build failure",
+                  failure_jobs:"", ci_url:$url, ci_run:$run}' > result.json ;;
+            failure|timed_out)
+              # Round 15.2 #2: ALWAYS produce result.json on failure paths,
+              # preserving failed job names, stage, log excerpt, run url.
+              # Phase B remediation D: called-workflow jobs appear as
+              # '<caller job name> / <called job name>' — extract the segment
+              # after the LAST '/' so 'gate'/'build' classify correctly
+              # regardless of prefix or spaces. Errors surface, never hidden.
+              jobs_json=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '[.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | {id,name,conclusion}]' || echo '[]')
+              failed_names=$(echo "$jobs_json" | jq -r '[.[].name | split("/") | last | ltrimstr(" ") | split(" ")[0]] | join(",")')
+              stage=unknown
+              echo "$failed_names" | grep -qw 'gate' && stage=gate || true
+              echo "$failed_names" | grep -qw 'build' && stage=build || true
+              jid=$(echo "$jobs_json" | jq -r '.[-1].id // empty')
+              if [ -n "${jid:-}" ] && [ "$jid" != "null" ]; then
+                if gh api "repos/${{ github.repository }}/actions/jobs/$jid/logs" > full.log 2>log.err; then
+                  tail -c 4000 full.log > tail.log
+                else
+                  { echo "log download failed (job id $jid): $(tail -2 log.err)"; } > tail.log
+                fi
+              else
+                echo "no failed job id retrievable (result=$res; api may have errored)" > tail.log
+              fi
+              jq -n --arg stage "$stage" --arg jobs "$failed_names" --rawfile tail tail.log \
+                --arg url "$CI_URL" --argjson run "${{ github.run_id }}" --arg res "$res" \
+                '{success:false, stage:$stage, log_tail:$tail,
+                  failure_jobs:($jobs + " (result=" + $res + ")"),
+                  ci_url:$url, ci_run:$run}' > result.json ;;
+            skipped)
+              jq -n --arg url "$CI_URL" --argjson run "${{ github.run_id }}" \
+                '{success:false, stage:"skipped-anomaly",
+                  log_tail:"build job skipped despite decided build (orchestration) — recorded, not blocking",
+                  failure_jobs:"", ci_url:$url, ci_run:$run}' > result.json ;;
+            *)
+              jq -n --arg r "$res" --arg url "$CI_URL" --argjson run "${{ github.run_id }}" \
+                '{success:false, stage:"unknown", log_tail:("unexpected result: "+$r),
+                  failure_jobs:$r, ci_url:$url, ci_run:$run}' > result.json ;;
+          esac
+          test -s result.json
+          jq -c '{success,stage,ci_run,deb_sha256:(.deb_sha256//null)}' result.json
+
+      - name: Ensure labels exist (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create auto-build-blocked --color B60205 \
+            --description "auto-maintenance blocked target; human investigation required" >/dev/null 2>&1 || true
+          for c in port infra unknown; do
+            gh label create "classification/$c" --color 5319E7 >/dev/null 2>&1 || true
+          done
+          gh label list --limit 200 | grep -q '^auto-build-blocked' \
+            || { echo "::error::required label unavailable"; exit 1; }
+
+      - name: Apply result to state
+        run: |
+          set -euo pipefail
+          [ -f result.json ] || echo '{"success":false,"stage":"unknown","log_tail":"no result collected","ci_run":0,"ci_url":""}' > result.json
+          python3 port/maintenance.py apply --state state.json --plan plan.json \
+            --result result.json --out state2.json --issues-out ops.json
+
+      - name: Create/comment block issues (engine-deduplicated, fail-closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ -f ops.json ] || echo '{"create_issues":[],"comment_issues":[]}' > ops.json
+          if [ "$(jq -r 'if type=="object" then (.error // false) else false end' issues.json)" = "true" ]; then
+            echo '::error::issues API was unavailable at decide-time; refusing issue writes to avoid duplicates'
+            exit 1
+          fi
+          n=$(jq '.create_issues | length' ops.json); i=0
+          while [ "$i" -lt "$n" ]; do
+            title=$(jq -r ".create_issues[$i].title" ops.json)
+            jq -r ".create_issues[$i].body" ops.json > issue-body.md
+            labels=$(jq -r ".create_issues[$i].labels | join(\",\")" ops.json)
+            num=$(gh issue create --title "$title" --body-file issue-body.md --label "$labels" | grep -oE '[0-9]+$')
+            jq --argjson i "$i" --argjson num "$num" '.create_issues[$i].issue=$num' ops.json > o.json && mv o.json ops.json
+            i=$((i+1))
+          done
+          m=$(jq '.comment_issues | length' ops.json); i=0
+          while [ "$i" -lt "$m" ]; do
+            num=$(jq -r ".comment_issues[$i].issue" ops.json)
+            jq -r ".comment_issues[$i].body" ops.json > cbody.md
+            gh issue comment "$num" --body-file cbody.md || true
+            i=$((i+1))
+          done
+          python3 port/maintenance.py stamp --state state2.json --ops ops.json
+
+      - name: Push state to maintenance-state branch (failure = loud)
+        # Round 15.4-C remediation: never swallow git/refs errors; verify
+        # the branch exists BEFORE the PUT; split create vs update paths.
+        # NOTE: maintenance-state is a REGULAR branch created from the
+        # default-branch head on first run (not an orphan).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ -f state2.json ] || { echo "no state change"; exit 0; }
+          msg="maintenance state: $(jq -r '.last_successful_build.package_version // "n/a"' state2.json)"
+          content=$(base64 -w0 state2.json)
+          if ! gh api "repos/${{ github.repository }}/git/ref/heads/maintenance-state" --jq .object.sha >/dev/null 2>ref.err; then
+            if ! grep -qiE 'Not Found|Reference does not exist' ref.err; then
+              echo "::error::branch probe failed: $(tail -2 ref.err)"; exit 1
+            fi
+            # Contract: maintenance-state ALWAYS bootstraps from the
+            # REPOSITORY DEFAULT BRANCH head (never the dispatch/work ref —
+            # a PR-branch dispatch must not fork state off a feature head).
+            default_branch=$(gh api "repos/${{ github.repository }}" --jq .default_branch)
+            echo "creating maintenance-state from default branch $default_branch"
+            base=$(gh api "repos/${{ github.repository }}/git/ref/heads/$default_branch" --jq .object.sha)
+            gh api -X POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/heads/maintenance-state" -f sha="$base" > ref-create.json
+            gh api "repos/${{ github.repository }}/git/ref/heads/maintenance-state" --jq .object.sha >/dev/null
+          fi
+          sha=$(gh api "repos/${{ github.repository }}/contents/maintenance/state.json?ref=maintenance-state" --jq .sha 2>file.err || true)
+          if [ ! -s file.err ] && [ -n "$sha" ]; then
+            echo "updating existing state file (sha $sha)"
+            gh api -X PUT "repos/${{ github.repository }}/contents/maintenance/state.json" \
+              -f message="$msg" -f content="$content" -f sha="$sha" \
+              -f branch="maintenance-state" > /dev/null
+          elif grep -qiE 'Not Found' file.err 2>/dev/null; then
+            echo "creating initial state file"
+            gh api -X PUT "repos/${{ github.repository }}/contents/maintenance/state.json" \
+              -f message="$msg" -f content="$content" \
+              -f branch="maintenance-state" > /dev/null
+          else
+            echo "::error::state file probe failed: $(tail -2 file.err)"; exit 1
+          fi
+          echo "state pushed"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Maintenance outcome"
+            echo "- decision: \`${{ needs.evaluate.outputs.action }} — ${{ needs.evaluate.outputs.reason }}\`"
+            echo "- build job result: \`${{ needs.build.result }}\`  dry_run: \`${{ inputs.dry_run }}\`"
+            if [ -f result.json ]; then echo "- classified: \`$(jq -c '{success,stage}' result.json)\`"; fi
+            if [ -f ops.json ]; then echo "- issues created: $(jq '.create_issues|length' ops.json), comments: $(jq '.comment_issues|length' ops.json)"; fi
+          } >> "$GITHUB_STEP_SUMMARY"

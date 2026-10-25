@@ -22,10 +22,16 @@ PROC_ROOT=${PROC_ROOT:-/proc}
 
 usage() { echo "usage: bpf_evidence.sh <chrome-bin> [--ws DIR] | bpf_evidence.sh selftest"; exit 2; }
 
-census() { # $1=bin $2=outfile  → lines: "type filters seccomp nnp ppid extra"
+census() { # $1=bin(exe-verified) $2=out-file
+  # Phase C measurement fix: Linux zygote children fork WITHOUT execv, so
+  # sandboxed renderer children keep --type=zygote in cmdline. Two-pass:
+  # collect rows + zygote pid set, then reclassify rows whose PPid is a
+  # zygote as renderer (the sandboxed spawn class). Real zygotes (parent =
+  # browser) stay zygote. Pure classification; no policy involvement.
   local bin=$1 out=$2
-  : > "$out"
   local pid exe t f s n pp cmd
+  local -a rows=()
+  local zypids=" "
   for pid in $(ls "$PROC_ROOT" 2>/dev/null | grep -E '^[0-9]+$'); do
     exe=$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null) || continue
     [ "$exe" = "$bin" ] || continue
@@ -35,7 +41,16 @@ census() { # $1=bin $2=outfile  → lines: "type filters seccomp nnp ppid extra"
     s=$(awk '/^Seccomp:/{print $2}' "$PROC_ROOT/$pid/status" 2>/dev/null)
     n=$(awk '/^NoNewPrivs:/{print $2}' "$PROC_ROOT/$pid/status" 2>/dev/null)
     pp=$(awk '/^PPid:/{print $2}' "$PROC_ROOT/$pid/status" 2>/dev/null)
-    echo "${t:-browser} ${f:-0} ${s:-0} ${n:-0} ${pp:-0} $(printf '%s\n' "$cmd" | grep -c -- '--no-sandbox')" >> "$out"
+    rows+=("$pid|${t:-browser}|${f:-0}|${s:-0}|${n:-0}|${pp:-0}|$(printf '%s\n' "$cmd" | grep -c -- '--no-sandbox')")
+    [ "${t:-}" = zygote ] && zypids="$zypids$pid "
+  done
+  local r rp rt rf rs rn rpp rnsb
+  for r in "${rows[@]}"; do
+    IFS='|' read -r rp rt rf rs rn rpp rnsb <<<"$r"
+    if [ "$rt" = zygote ] && [ "$rp" != "$rpp" ] && case "$zypids" in *" $rpp "*) true;; *) false;; esac; then
+      rt=renderer
+    fi
+    echo "$rt $rf $rs $rn $rpp $rnsb" >> "$out"
   done
 }
 
@@ -62,7 +77,11 @@ pids_of() { # $1=bin $2=type → pids
     exe=$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null) || continue
     [ "$exe" = "$1" ] || continue
     cmd=$(tr '\0' '\n' < "$PROC_ROOT/$pid/cmdline" 2>/dev/null | sed -n 's/^--type=\(.*\)/\1/p' | head -1)
-    [ "$cmd" = "$2" ] && echo "$pid"
+    if [ "$cmd" = "$2" ]; then echo "$pid"; continue; fi
+    if [ "$2" = renderer ] && [ "$cmd" = zygote ]; then
+      ppid=$(awk '/^PPid:/{print $2}' "$PROC_ROOT/$pid/status" 2>/dev/null)
+      for z in $(pids_of "$1" zygote); do [ "$ppid" = "$z" ] && { echo "$pid"; break; }; done
+    fi
   done
 }
 
@@ -84,13 +103,22 @@ max_field() { # $1=file $2=type $3=field(2..6)
 
 run_gate() { # $1=chrome bin, $2=ws
   local bin=$1 ws=$2 rc=0
+  # Phase C adaptation (R9b packaged form): the SUPPORTED launch path is the
+  # shield wrapper; census identity must match the REAL chrome exe. When bin
+  # resolves to a script, target <dir-of-wrapper>/chrome. Spawn still uses
+  # the given bin (never bypass the wrapper); marker check uses the exe.
+  local match=$bin
+  local realbin; realbin=$(readlink -f "$bin")
+  case "$realbin" in
+    *.sh) match="$(dirname "$realbin")/chrome" ;;
+  esac
   mkdir -p "$ws"
   echo "=== P0 marker/tripwire ==="
-  if grep -aq 'Termux seccomp-only' "$bin"; then echo "[ok] R1/R2 marker string in binary"; else echo "[FAIL] no port marker in binary (built without port?)"; rc=1; fi
+  if grep -aq 'Termux seccomp-only' "$match"; then echo "[ok] R1/R2 marker string in binary"; else echo "[FAIL] no port marker in binary (built without port?)"; rc=1; fi
 
   echo "=== P2 renderer census ==="
   spawn_probe "$bin" ported "$ws"
-  census "$bin" "$ws/census-ported.txt"; stop_probe
+  census "$match" "$ws/census-ported.txt"; stop_probe
   local ren ren_s ren_n zyg bro inj
   ren=$(max_field "$ws/census-ported.txt" renderer 2)
   ren_s=$(max_field "$ws/census-ported.txt" renderer 3)
@@ -114,7 +142,7 @@ run_gate() { # $1=chrome bin, $2=ws
 
   echo "=== P2b causality control (--disable-seccomp-filter-sandbox) ==="
   spawn_probe "$bin" noflt "$ws" --disable-seccomp-filter-sandbox
-  census "$bin" "$ws/census-noflt.txt"; stop_probe
+  census "$match" "$ws/census-noflt.txt"; stop_probe
   local ren_off; ren_off=$(max_field "$ws/census-noflt.txt" renderer 2)
   echo "  renderer filters with switch OFF: $ren_off (expect < $ren)"
   [ "$ren_off" -lt "$ren" ] || echo "[WARN] filter count did not drop — 2nd filter may not be Chromium's (or switch inert)"
@@ -185,7 +213,8 @@ case ${1:-} in
   _internal_census) census "$2" "$3" ;;
   --noop) exit 0 ;;
   "") usage ;;
-  *) CHROME=$1; shift; WS=. ; [ "${1:-}" = --ws ] && { WS=$2; shift 2; }
-     [ -x "$CHROME" ] || { echo "no exec at $CHROME"; exit 1; }
-     run_gate "$CHROME" "$WS" ;;
+  *) CHROME=$1; LAUNCH=$1; shift; WS=. ; [ "${1:-}" = --ws ] && { WS=$2; shift 2; }
+     [ -x "$LAUNCH" ] || { echo "no exec at $LAUNCH"; exit 1; }
+     _rb=$(readlink -f "$LAUNCH"); case "$_rb" in *.sh) CHROME="$(dirname "$_rb")/chrome" ;; esac
+     run_gate "$LAUNCH" "$WS" ;;
 esac

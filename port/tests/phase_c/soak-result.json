@@ -1,0 +1,10 @@
+{
+ "verdict": "PASS",
+ "rounds": 45,
+ "failures": [],
+ "tabs_ok": 540,
+ "distinct_renderer_pids": 17,
+ "max_rss_kb": 234144,
+ "seccomp_mode2_violations": 0,
+ "residual_procs": []
+}

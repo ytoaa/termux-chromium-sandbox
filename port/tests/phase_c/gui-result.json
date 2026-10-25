@@ -1,0 +1,4 @@
+{
+ "ok":["window-created","wid=54525955","title=PHC-GUI-T1","-","Chromium","resize-geometry:Window","54525955","Position:","40,60","(screen:","0)","Geometry:","800x600","move-geometry:Window","54525955","Position:","40,60","(screen:","0)","Geometry:","800x600","address-navigation:PHC-GUI-T2","-","Chromium","tab-close-issued","kbd-input-no-crash","proc-count=15","graceful-quit-cdp","residual=0"],
+ "bad":[""]
+}

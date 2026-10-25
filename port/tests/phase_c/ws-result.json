@@ -1,0 +1,9 @@
+{
+ "verdict": "PASS",
+ "sent_by_page_verified": 20,
+ "contents_exact_match": true,
+ "server_echoed": 20,
+ "page_msgs_received": 20,
+ "errors": [],
+ "note": "server->client frames unmasked per RFC6455; client frames unmasked after mask check"
+}

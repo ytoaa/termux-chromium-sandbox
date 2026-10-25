@@ -1,0 +1,170 @@
+{
+ "verdict": "PASS",
+ "checks": {
+  "gui-window-present": {
+   "pass": true,
+   "detail": "{'wid': ['54525955'], 'document.title': 'PHCX'}"
+  },
+  "webgl-default": {
+   "pass": true,
+   "detail": {
+    "ver": "WebGL 2.0 (OpenGL ES 3.0 Chromium)",
+    "renderer": "ANGLE (Mesa, zink Vulkan 1.4(Turnip Adreno (TM) 750 (MESA_TURNIP)), OpenGL 4.6)",
+    "vendor": "Google Inc. (Mesa)"
+   }
+  },
+  "process-census-gui": {
+   "pass": true,
+   "detail": {
+    "by_type": {
+     "utility": 2,
+     "zygote": 2,
+     "sandboxed-spawn": 6,
+     "browser": 1
+    },
+    "sandboxed_spawn_filters2": 5,
+    "note": "gpu/renderer share zygote-spawn class (no-execv); GPU HW liveness = webgl ANGLE check"
+   }
+  },
+  "gpu-info-page": {
+   "pass": false,
+   "detail": {
+    "Hardware accelerated": false,
+    "SwiftShader": false,
+    "Software only": false,
+    "GL Implementation": false,
+    "Vulkan": false
+   }
+  },
+  "download-gui-cdp": {
+   "pass": true,
+   "detail": "{'done': True, 'sha_ok': True, 'final_name': 'big.bin'}"
+  },
+  "downloads-page-reached": {
+   "pass": true,
+   "detail": "\ub2e4\uc6b4\ub85c\ub4dc \uae30\ub85d"
+  },
+  "downloads-list-item": {
+   "pass": true,
+   "detail": "{'nodes': 377, 'item-hits': 5, 'expected-name': 'big-26533.bin'}"
+  },
+  "file-chooser-window": {
+   "pass": true,
+   "detail": "58720263|\ud30c\uc77c \uc5f4\uae30|26536"
+  },
+  "file-api-setinput": {
+   "pass": true,
+   "detail": "UPLOAD-OK-42"
+  },
+  "audio-element-playing": {
+   "pass": true,
+   "detail": "PLAYING"
+  },
+  "audio-sink-input-pactl": {
+   "pass": true,
+   "detail": "{'pactl': ['Sink Input #447'], 'audio_fd_inode': None, 'fd_path_connected': False}"
+  }
+ },
+ "notes": [
+  "swiftshader flag NOT used in this ctx",
+  "gpu-page-snippet: "
+ ],
+ "census_rows": [
+  {
+   "pid": "26536",
+   "type": "browser",
+   "seccomp": "2",
+   "filters": "1",
+   "nnp": "0",
+   "ppid": "26533"
+  },
+  {
+   "pid": "26548",
+   "type": "zygote",
+   "seccomp": "2",
+   "filters": "1",
+   "nnp": "1",
+   "ppid": "26536"
+  },
+  {
+   "pid": "26550",
+   "type": "zygote",
+   "seccomp": "2",
+   "filters": "1",
+   "nnp": "1",
+   "ppid": "26536"
+  },
+  {
+   "pid": "26590",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "1",
+   "nnp": "1",
+   "ppid": "26548"
+  },
+  {
+   "pid": "26593",
+   "type": "utility",
+   "seccomp": "2",
+   "filters": "1",
+   "nnp": "1",
+   "ppid": "26536"
+  },
+  {
+   "pid": "26595",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "2",
+   "nnp": "1",
+   "ppid": "26550"
+  },
+  {
+   "pid": "26677",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "2",
+   "nnp": "1",
+   "ppid": "26550"
+  },
+  {
+   "pid": "26718",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "2",
+   "nnp": "1",
+   "ppid": "26550"
+  },
+  {
+   "pid": "26719",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "2",
+   "nnp": "1",
+   "ppid": "26550"
+  },
+  {
+   "pid": "26766",
+   "type": "sandboxed-spawn",
+   "seccomp": "2",
+   "filters": "2",
+   "nnp": "1",
+   "ppid": "26550"
+  },
+  {
+   "pid": "26798",
+   "type": "utility",
+   "seccomp": "2",
+   "filters": "1",
+   "nnp": "1",
+   "ppid": "26536"
+  }
+ ],
+ "missing_required": [],
+ "failed_required": [],
+ "optional": {
+  "gpu-info-page": {
+   "pass": false,
+   "status": "recorded-fail"
+  }
+ }
+}
