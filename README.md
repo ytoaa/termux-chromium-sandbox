@@ -36,8 +36,8 @@ and invites a PR. This project is that attempt.
   NEVER publishes. Schedule fires only after PR merge (default-branch
   cron) — merge and activation are separate approvals.
 
-- **Maintenance automation (LIVE — AUTOMATED MAINTENANCE / MANUAL
-  PROMOTION):** the daily workflow runs on schedule at **09:23 KST**
+- **Maintenance automation (LIVE — AUTOMATED MAINTENANCE / AUTO PRE-RELEASE
+  / MANUAL PROMOTION):** the daily workflow runs on schedule at **09:23 KST**
   (00:23 UTC; GitHub may delay — timing is an expectation, not a gate).
   Automated per run: upstream/recipe detection, validated/state compare,
   changed-input detection, build-signature computation (schema v2: the four
@@ -49,9 +49,34 @@ and invites a PR. This project is that attempt.
   equivalence for the validated rev-2 baseline is re-proven every run from
   the audited `maintenance/signature-migrations.json`), duplicate skip,
   R1~R9b security gate, conditional CANDIDATE CI build, artifact capture,
-  failure classification, deduplicated block Issues, candidate recording.
+  failure classification, deduplicated block Issues, candidate recording,
+  and — for a CI-verified candidate recorded in the ledger — automatic
+  GitHub **Pre-release** publishing (see below).
   NEVER automated: device installation/gates, validated promotion,
-  port.toml writes, policy changes, Releases, apt, product-code merges.
+  port.toml writes, policy changes, STABLE releases, apt publishing,
+  product-code merges.
+
+- **Pre-release publishing (Round 17):** when a build (scheduled maintenance
+  OR direct manual `build-chromium.yml` dispatch) succeeds AND every
+  integrity check passes, `port/publish_release.py` publishes the DEB as a
+  GitHub **Pre-release** (`chromium-sandboxed-v<version>`, title
+  `Chromium Sandbox <version> (CI Candidate)`) with `SHA256SUMS.txt`,
+  `build-manifest.json` and (secret-scanned) build logs. Assets are staged
+  as a **draft** and only flipped to public after byte-level re-verification;
+  success is claimed only from a post-publish API re-read. Tags/releases/
+  assets are never clobbered, edited or deleted: same version + same sha =
+  idempotent skip, same tag + different sha = collision stop for human
+  review, partial/failed uploads keep the draft unpublished and are retried
+  by re-running the PUBLISH JOB ONLY (the build and the candidate ledger are
+  already committed and are never reclassified — publish state is separate
+  from build state). Each release states **CI VERIFIED — DEVICE NOT
+  VERIFIED**: install/run checks on real Android/Termux devices are the
+  downloading user's responsibility (`Seccomp_filters`/`NoNewPrivs`, GUI/X11,
+  GPU/WebGL, downloads, audio, restart). Publishing never promotes
+  `validated`, never touches apt, and never advises `--no-sandbox`. The
+  publisher's `contents: write` is scoped to the publish jobs only.
+  Existing builds (incl. validated `156.0.8078.47-2`) are NOT back-published:
+  publishing applies to builds that succeed after activation.
   **Emergency stop:** `gh workflow disable daily-maintenance.yml` (runtime
   kill-switch) or revert the schedule trigger via PR. **Resume:**
   `gh workflow enable daily-maintenance.yml`. Blocked signatures retry
