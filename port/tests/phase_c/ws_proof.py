@@ -26,10 +26,10 @@ WRAPPER = os.environ.get(
     'PHC_WRAPPER',
     '/data/data/com.termux/files/home/Project/.phc-main/data/data/'
     'com.termux/files/usr/bin/chromium-sandboxed')
-CHROME = os.environ.get(
-    'PHC_CHROME',
-    '/data/data/com.termux/files/home/Project/.phc-main/data/data/'
-    'com.termux/files/usr/lib/chromium-sandboxed/chrome')
+# residual-scan identity: real chrome inside the packaged prefix the
+# wrapper resolves to (derived from the wrapper, never executed directly)
+CHROME = os.path.realpath(os.path.join(
+    os.path.dirname(os.path.realpath(WRAPPER)), 'chrome'))
 N = 20
 proof = {'sent_by_page': [], 'page_msgs_received': None,
          'server_echoed': 0, 'close_code_seen': False, 'errors': []}
@@ -149,15 +149,14 @@ def main():
         ws_srv.bind(('127.0.0.1', 8297))
         ws_srv.listen(4)
         ws_srv.settimeout(60)
-        env = dict(os.environ)
-        preload = os.path.join(os.path.dirname(CHROME), 'libtermux-gnp-fix.so')
-        if os.path.exists(preload):
-            env['LD_PRELOAD'] = preload
+        # C.2-B: launch through the OFFICIAL packaged shield wrapper
+        # (no direct chrome exec, no hand-rolled LD_PRELOAD). The wrapper
+        # supplies the gnp preload, PULSE wiring and launcher checks.
         proc = subprocess.Popen(
-            [CHROME, '--headless=new', '--user-data-dir=' + tmp + '/udd',
+            [WRAPPER, '--headless=new', '--user-data-dir=' + tmp + '/udd',
              '--no-first-run', 'file://' + pagef],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid, env=env)
+            preexec_fn=os.setsid)
         try:
             c, _ = ws_srv.accept()
         except socket.timeout:

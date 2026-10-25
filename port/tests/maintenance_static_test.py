@@ -24,7 +24,8 @@ check('[s7] gate self-test intact', 'port/ci.sh selftest' in steps)
 
 dw=yaml.safe_load(open(os.path.join(ROOT,'..','.github/workflows/daily-maintenance.yml')))
 don=dw[True] if True in dw else dw['on']
-check('[s8] daily cron 00:23 UTC (09:23 KST)', don['schedule'][0]['cron']=='23 0 * * *', str(don.get('schedule')))
+check('[s8] NO schedule trigger (activation requires separate approval); dispatch+dry_run+approve_retry intact',
+      'schedule' not in don and 'workflow_dispatch' in don and 'dry_run' in don['workflow_dispatch']['inputs'] and 'approve_retry' in don['workflow_dispatch']['inputs'], str(list(don.keys())))
 check('[s9] daily dispatch inputs (dry_run/approve_retry)', set(don['workflow_dispatch']['inputs'])=={'dry_run','approve_retry'})
 check('[s10] daily top-level perms minimal (read); writes only per-job', dw['permissions']=={'contents':'read'}, str(dw['permissions']))
 check('[s11] daily concurrency no-cancel', dw['concurrency']=={'group':'daily-maintenance','cancel-in-progress':False})

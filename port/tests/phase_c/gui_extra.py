@@ -218,18 +218,39 @@ def main():
                {'done': done, 'sha_ok': sha == EXPECT})
             utid = cdp.new_tab('chrome://downloads')
             time.sleep(3)
-            dtxt = cdp.eval(utid, "document.title") or ''
-            ax = ''
+            dtxt = cdp.eval(utid, 'document.title') or ''
+            page_ok = bool(dtxt) and (('Download' in dtxt) or
+                                      ('다운로드' in dtxt))
+            ok('downloads-page-reached', page_ok, dtxt)
+            # list content: pierce shadow DOM via the DOM domain (NOT
+            # Runtime.evaluate); title alone never proves the item exists
+            listed = None
+            probe_ok = False
             try:
-                cdp.call('Accessibility.enable', session_id=cdp.targets[utid])
-                nodes = cdp.call('Accessibility.getFullAXTree',
-                                 session_id=cdp.targets[utid], timeout=20)
-                ax = ' '.join(str(n.get('node', {}).get('value', {}).get('value', ''))
-                              for n in nodes.get('nodes', [])[:400])
+                cdp.call('DOM.enable', session_id=cdp.targets[utid])
+                flat = cdp.call('DOM.getFlattenedDocument',
+                                {'depth': -1, 'pierce': True},
+                                session_id=cdp.targets[utid], timeout=25)
+                nodes = flat.get('nodes', [])
+                probe_ok = len(nodes) > 10
+                hits = [n for n in nodes
+                        if 'big.bin' in json.dumps(n, ensure_ascii=False)]
+                listed = len(hits)
             except CDPError as ex3:
-                ax = 'AX-ERR %s' % ex3
-            ok('downloads-ui', ('Download' in dtxt) or ('다운로드' in dtxt) or ('big.bin' in ax),
-               {'title': dtxt, 'ax-hits-big.bin': 'big.bin' in ax})
+                listed = None
+                R['notes'].append('downloads DOM probe error: %s' % ex3)
+            if probe_ok:
+                ok('downloads-list-item', (listed or 0) > 0,
+                   {'nodes': len(nodes) if probe_ok else 0,
+                    'big.bin-hits': listed})
+            else:
+                # documented: unreadable WebUI == INCONCLUSIVE (optional),
+                # never a silent PASS; download itself proven by
+                # download-gui-cdp (event+sha)
+                R['checks']['downloads-list-item'] = {
+                    'pass': True, 'status': 'INCONCLUSIVE-allowed',
+                    'detail': 'chrome://downloads DOM unreadable via '
+                              'getFlattenedDocument(pierce)'}
             cdp.close_tab(utid)
         except (CDPError, OSError) as ex:
             ok('download-gui-cdp', False, ex)
@@ -349,6 +370,29 @@ def main():
         return finish(R, tmp, proc, cdp, srv)
 
 
+REQUIRED_CHECKS = ('gui-window-present', 'webgl-default',
+                   'process-census-gui', 'download-gui-cdp',
+                   'downloads-page-reached',
+                   'file-chooser-window', 'file-api-setinput',
+                   'audio-element-playing', 'audio-sink-input-pactl')
+OPTIONAL_CHECKS = ('gpu-info-page', 'downloads-list-item')
+
+
+def evaluate_verdict(checks):
+    """Pure verdict: PASS only when every REQUIRED check exists and passed.
+    Missing keys count as failures; exceptions/timeouts never PASS.
+    OPTIONAL checks are recorded but never flip the verdict (they carry
+    their own status incl. INCONCLUSIVE)."""
+    missing = [k for k in REQUIRED_CHECKS
+               if k not in checks or not isinstance(checks[k], dict)
+               or 'pass' not in checks[k]]
+    failed = [k for k in REQUIRED_CHECKS
+              if k in checks and isinstance(checks[k], dict)
+              and checks[k].get('pass') is not True]
+    verdict = 'PASS' if not missing and not failed else 'FAIL'
+    return verdict, missing, failed
+
+
 def finish(R, tmp, proc, cdp, srv):
     try:
         if cdp:
@@ -399,18 +443,20 @@ def finish(R, tmp, proc, cdp, srv):
                             break
             except OSError:
                 pass
-    core = [k for k in ('gui-window-present', 'download-gui-cdp',
-                       'downloads-ui', 'file-chooser-window',
-                       'file-api-setinput', 'audio-element-playing',
-                       'audio-sink-input-pactl') if k in R['checks']]
-    R['verdict'] = 'PASS' if all(R['checks'][k]['pass'] for k in core) \
-        and any(R['checks'].get('webgl-default', {}).get('pass')
-                for _ in [0]) else 'PARTIAL-or-FAIL'
+    verdict, missing, failed = evaluate_verdict(R.get('checks', {}))
+    R['verdict'] = verdict
+    R['missing_required'] = missing
+    R['failed_required'] = failed
+    R['optional'] = {k: {'pass': R['checks'].get(k, {}).get('pass'),
+                         'status': R['checks'].get(k, {}).get('status',
+                                   'ok' if R['checks'].get(k, {}).get('pass')
+                                   else 'recorded-fail')}
+                    for k in OPTIONAL_CHECKS if k in R['checks']}
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        'gui-extra-result.json')
     json.dump(R, open(out, 'w'), indent=1)
     print(json.dumps(R, indent=1))
-    return 0
+    return 0 if verdict == 'PASS' else 1
 
 
 if __name__ == '__main__':

@@ -14,11 +14,13 @@
 # maintenance/state.seed.json; ANY other API error aborts the run.
 name: Daily Maintenance
 
+# C.2-E: the daily schedule trigger is REMOVED until a separate
+# operational approval. Merging this PR does NOT activate any automation —
+# the pipeline runs only via explicit workflow_dispatch (dry_run default
+# true). Restoring `on.schedule` (00:23 UTC = 09:23 KST, idempotency via
+# signature dedup + concurrency groups) requires a dedicated follow-up PR
+# and owner approval. See port/DESIGN.md "Activation policy".
 on:
-  schedule:
-    # 00:23 UTC = 09:23 Asia/Seoul. Missed schedules deliver only the latest
-    # occurrence; runs are idempotent (state signature + job-level locks).
-    - cron: '23 0 * * *'
   workflow_dispatch:
     inputs:
       dry_run:

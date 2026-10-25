@@ -350,4 +350,9 @@ bash "port/tests/maintenance_recipe_test.sh" 2>&1 | tail -1 | grep -q '^RECIPE-C
   && pass "[39] recipe/fixtures/classify suite (A/B/D)" \
   || fail "[39] recipe/fixtures/classify suite"
 
+# [40] C.2-A verdict gate matrix (fails must produce nonzero rc; optionals never flip).
+python3 "port/tests/phase_c/gui_extra_verdict_test.py" 2>&1 | tail -1 | grep -q '^VERDICT-TESTS-RC=0$' \
+  && pass "[40] gui_extra verdict matrix 11/11" \
+  || fail "[40] gui_extra verdict matrix"
+
 exit $rc

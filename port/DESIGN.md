@@ -1106,3 +1106,44 @@ PASS total): 10-case table (accept/reject) + per-case EMPIRICAL bash
 assignment comparison (reject set must never be a clean dotted value in
 bash) + comment-preservation rewrite + recipe RecipeError / host-tools
 None. No other logic touched.
+
+## Phase C.2 — final acceptance hardening (test tooling + schedule safety)
+
+A. gui_extra.py verdict integrity: unconditional `return 0` removed. A
+   pure evaluate_verdict(checks) gate (REQUIRED 9 checks; missing keys,
+   pass!=True, exceptions and timeouts all FAIL; OPTIONAL
+   gpu-info-page/downloads-list-item recorded with status and can never
+   flip the verdict) now drives JSON verdict, console output and process
+   exit code identically. Regression matrix (11 scenarios incl. no-window,
+   sha-mismatch, no-completion-event, missing-key, webgl-fail,
+   chooser-fail, optional-only-fail, pass=None) in
+   gui_extra_verdict_test.py, wired as harness [40]; additionally proved
+   LIVE: DISPLAY=:99 injection -> rc=1 with missing_required populated
+   (the pre-fix tool returned 0 there), rerun rc=0.
+B. ws_proof.py now launches through the OFFICIAL packaged shield wrapper
+   (no direct chrome exec, no hand-rolled LD_PRELOAD): 20/20 bidirectional
+   with content-exact m0..m19, PROOF-20 witness, 0 errors, full cleanup.
+   Prior direct-exec results retained only as supplementary.
+C. downloads-ui split into downloads-page-reached (title) and
+   downloads-list-item (REAL item proof): DOM.getFlattenedDocument
+   depth=-1 pierce=True over the WebUI shadow DOM — big.bin hit x5 of 377
+   nodes. If the DOM domain were unreadable the check is recorded
+   INCONCLUSIVE (optional), never a silent PASS; title alone can no
+   longer satisfy any gate. File-level download-gui-cdp (completion event
+   + sha256) remains the transport proof.
+D. Consistency audit of Phase C/C.1 evidence (census rows, causality
+   cohort, broker inodes, soak 45r/540, ANGLE/Vulkan strings) — verdicts
+   match raw files; no overstated PASS found beyond the two defects fixed
+   in A (exit code) and C (title-only UI claim).
+E. ACTIVATION POLICY: on.schedule REMOVED from daily-maintenance.yml.
+   Merging PR #1 activates NO automation — workflow_dispatch only
+   (dry_run default true, approve_retry retained). Restoring the
+   09:23 KST cron requires a dedicated follow-up PR with owner approval.
+   Static s8 now asserts the ABSENCE of any schedule trigger and the
+   presence of both dispatch inputs.
+F. Regression: static 43/43 (s8 rewritten), engine 46/46, integration
+   25/25, recipe 13/13, revision 4/4, verdict 11/11 (new [40]),
+   harness 48/48, ci.sh selftest green. No new Chromium build; device
+   evidence regenerated via the official wrapper (ws + gui-extra PASS,
+   downloads list item proven). main-device symlink removed after tests
+   (extract retained).
