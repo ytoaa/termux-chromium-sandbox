@@ -9,6 +9,8 @@ Commands:
   fetch   --out probes.json                  (network: probes only)
   decide  --state S --probes P --out plan.json [--issues I] [--running R]
                                               [--port-sha SHA] [--now ISO]
+                                              [--migrations FILE]
+  port-input-hash --root REPO [--at REF]   (v2 port-input hash from a commit)
   apply   --state S --plan P --result RESULT --out S2 --issues-out OPS
 """
 from __future__ import annotations
@@ -18,6 +20,7 @@ import hashlib
 import json
 import re
 import sys
+import tomllib
 import urllib.request
 from pathlib import Path
 
@@ -53,10 +56,199 @@ def blob_sha(text: str) -> str:
 
 
 def build_signature(upstream: str, recipe_sha: str, host_sha: str,
-                    port_sha: str) -> str:
+                    port_sha: str, sig_version: int = 2) -> str:
+    """Build-identity signature.
+
+    v1 (legacy, frozen): sha256(json([upstream, recipe, host, port]))[:16].
+      Existing ledger entries (candidates, validated, blocked) keep their
+      original v1 signature FOREVER — history is never rewritten.
+    v2: adds an explicit schema tag so a scheme switch can never be confused
+      with a semantic input change (Round 16 safety hotfix). v2 equivalence
+      against v1 history is granted ONLY through the audited migration file
+      (maintenance/signature-migrations.json), never by re-hashing history.
+    """
+    if sig_version == 1:
+        payload = [upstream, recipe_sha, host_sha, port_sha]
+    elif sig_version == 2:
+        payload = ['sigv2', upstream, recipe_sha, host_sha, port_sha]
+    else:
+        raise ValueError(f'unsupported signature schema {sig_version!r}')
     return hashlib.sha256(json.dumps(
-        [upstream, recipe_sha, host_sha, port_sha],
-        sort_keys=True).encode()).hexdigest()[:16]
+        payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+# ------------------------------------------------ signature schema v2 ----
+# Round 16 (Automated Maintenance Safety Hotfix), Stage B:
+#
+# port.toml carries BOTH build-contract ledgers ([port] version/phase/
+# policy_mode, [termux], [sandbox], [rules] r1..r9b, [gates] *contracts*,
+# [forbidden]) AND human audit records ([port].last_validated_* promotion
+# evidence, [gates].device_gate / device_gate_history results). Hashing the
+# raw blob made audit-only edits schedule spurious Chromium rebuilds.
+#
+# Proven zero-build-impact of the excluded keys: the ONLY consumer of
+# port.toml inside the build chain is prepare_recipe.py's audit copy
+# (shutil.copy2 -> recipe BUILDER_DIR); the port hook, the transformer and
+# ci.sh never parse it, and BUILDER_DIR files are not packaged into the DEB.
+#
+# v2 therefore hashes the four RAW contract files by content fingerprint
+# (sha256[:40] of the file bytes — every byte counts, any edit fails safe
+# toward BUILD) and port.toml SEMANTICALLY:
+# every key/value is included EXCEPT the explicit audit-record denylist
+# below. NEW or unclassified keys are included by default (conservative):
+# adding a contract field can never be silently ignored. If a future human
+# adds a new audit-only key it will (fail-safe) count as a build input until
+# it is proven build-irrelevant and added here under code review.
+PORT_INPUTS_SCHEMA = 2
+PORT_RAW_FILES = ('port/chromium_sandbox_port.py', 'port/prepare_recipe.py',
+                  'port/gnp_shim.c', 'port/ci.sh')
+PORT_TOML_FILE = 'port/port.toml'
+TOML_METADATA_ONLY = {
+    'port': frozenset(('last_validated_port',
+                       'last_validated_chromium',
+                       'last_validated_deb_version',
+                       'last_validated_deb_sha256',
+                       'last_validated_ci_run',
+                       'last_validated_termux_sha',
+                       'last_validated_build_signature',
+                       'last_validated_port_commit',
+                       'last_validated_promoted')),
+    'gates': frozenset(('device_gate', 'device_gate_history')),
+}
+SIG16 = re.compile(r'^[0-9a-f]{16}$')
+
+
+def port_toml_semantic_sha(toml_text: str) -> str:
+    """Deterministic semantic hash over port.toml build-contract content.
+
+    Canonicalization: parse TOML -> drop ONLY the exact audit-record keys in
+    TOML_METADATA_ONLY -> json.dumps(sort_keys, compact separators, ASCII).
+    Same meaningful inputs => same hash (byte layout / comments / key order /
+    excluded audit text are irrelevant). Raises on invalid TOML (fail closed).
+    """
+    data = tomllib.loads(toml_text)
+    filtered = {}
+    for section, values in data.items():
+        deny = TOML_METADATA_ONLY.get(section, frozenset())
+        if isinstance(values, dict):
+            keep = {k: v for k, v in values.items() if k not in deny}
+            if keep:  # an all-metadata section contributes nothing
+                filtered[section] = keep
+        else:
+            filtered[section] = values  # top-level scalars: always contract
+    canon = json.dumps(filtered, sort_keys=True, separators=(',', ':'),
+                       ensure_ascii=True)
+    return hashlib.sha256(('port-toml-v2:' + canon).encode()).hexdigest()[:16]
+
+
+def port_inputs_hash(blob_ids: dict, toml_text: str) -> str:
+    """v2 port-input hash: content fingerprints for raw files + semantic TOML.
+
+    Deterministic given the committed tree; MISSING entries are hashed as
+    explicit MISSING:<path> sentinels so a deleted input still changes the
+    signature (never silently collapses to the same digest).
+    """
+    parts = ['sigv2']
+    for f in PORT_RAW_FILES:
+        parts.append(blob_ids.get(f) or f'MISSING:{f}')
+    parts.append('port.toml@semantic-v2:' + port_toml_semantic_sha(toml_text))
+    return hashlib.sha256(("\n".join(parts) + "\n").encode()).hexdigest()[:16]
+
+
+def cmd_port_input_hash(args) -> int:
+    """CLI: compute the v2 port-input hash from a checked-out tree.
+
+    Pure-filesystem (the engine keeps ZERO exec surface — s22 invariant):
+    the ephemeral runner checked out exactly the commit being decided, so
+    the worktree IS the tree. Raw fingerprint = sha256(file bytes)[:40].
+    Fail closed: a missing input file or malformed TOML exits non-zero —
+    the workflow then aborts BEFORE deciding, so a broken tree can never
+    produce a silent build.
+    """
+    root = Path(args.root)
+    raw = {}
+    for f in PORT_RAW_FILES:
+        p = root / f
+        if not p.is_file():
+            print(f'port-input-hash: missing build input {f}', file=sys.stderr)
+            return 1
+        raw[f] = hashlib.sha256(p.read_bytes()).hexdigest()[:40]
+    toml_path = root / PORT_TOML_FILE
+    if not toml_path.is_file():
+        print(f'port-input-hash: missing {PORT_TOML_FILE}', file=sys.stderr)
+        return 1
+    try:
+        print(port_inputs_hash(raw, toml_path.read_text(encoding='utf-8')))
+    except Exception as exc:  # invalid TOML must not silently sign a build
+        print(f'port-input-hash: port.toml parse failure — {exc}',
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+# ------------------------------------------------ signature migrations ----
+# v1 -> v2 equivalence is granted ONLY by this audited, human-reviewed file.
+# Rules enforced here (fail closed):
+#   * original history (v1 signature, ci_run, sha256, provenance) is NEVER
+#     rewritten — equivalence is recomputed on EVERY run from CURRENT inputs;
+#   * an entry activates only when status is 'approved' AND every pinned
+#     semantic component (aligned version, recipe/host blobs, v2 port-input
+#     hash) matches what this run actually measured;
+#   * malformed JSON aborts the run; a malformed/unsigned entry is rejected
+#     with a diagnostic (no equivalence => normal decide path => build),
+#     never silently trusted.
+def load_migrations(path: str | None):
+    """-> (list, error). error non-None means fail-closed (caller aborts)."""
+    if not path:
+        return [], None
+    p = Path(path)
+    if not p.is_file():
+        return [], None  # absent = no equivalence granted (safe: builds)
+    try:
+        doc = json.loads(p.read_text())
+    except (OSError, ValueError) as exc:
+        return [], f'migration file unreadable/malformed: {exc}'
+    if not isinstance(doc, dict) or not isinstance(doc.get('migrations'),
+                                                   list):
+        return [], 'migration file malformed: missing migrations list'
+    ok = []
+    for m in doc['migrations']:
+        if not isinstance(m, dict):
+            continue
+        need_str = ('id', 'status', 'from_sig', 'aligned_version',
+                    'recipe_sha', 'host_sha', 'port_inputs_hash_v2')
+        if any(not isinstance(m.get(k), str) or not m.get(k)
+               for k in need_str):
+            continue
+        if not (SIG16.fullmatch(m['from_sig'])
+                and SIG16.fullmatch(m['recipe_sha'])
+                and SIG16.fullmatch(m['host_sha'])
+                and SIG16.fullmatch(m['port_inputs_hash_v2'])):
+            continue
+        if m.get('from_sig_version', 1) != 1 or \
+                m.get('to_sig_version', 2) != PORT_INPUTS_SCHEMA:
+            continue
+        ok.append(m)
+    return ok, None
+
+
+def active_migrations(migrations: list, comps: dict) -> list:
+    """Entries whose pinned semantic inputs match THIS run's measurements."""
+    out = []
+    for m in migrations:
+        if m.get('status') != 'approved':
+            continue
+        if (m['aligned_version'] == comps['aligned_version']
+                and m['recipe_sha'] == comps['recipe_sha']
+                and m['host_sha'] == comps['host_sha']
+                and m['port_inputs_hash_v2'] == comps['port_sha']):
+            out.append(m)
+    return out
+
+
+def equivalent_v1_sigs(migrations: list, comps: dict) -> set:
+    """v1 signatures that provably denote the SAME semantic build inputs."""
+    return {m['from_sig'] for m in active_migrations(migrations, comps)}
 
 
 # ---------------------------------------------------------------- fetch ----
@@ -159,6 +351,13 @@ def issue_matches_sig(title: str, sig: str) -> bool:
     return f'sig {sig}' in (title or '')
 
 
+def issue_sig_match(title: str, sig: str, eq_sigs=()) -> bool:
+    """Round 16: match the current sig OR any migration-equivalent v1 sig."""
+    if issue_matches_sig(title, sig):
+        return True
+    return any(issue_matches_sig(title, s) for s in eq_sigs)
+
+
 def issue_title(target: dict, reason: str) -> str:
     return (f"[auto-build] Chromium {target['upstream_version']} "
             f"revision {target['revision']} blocked ({reason}, "
@@ -202,7 +401,8 @@ def render_issue(target: dict, probes: dict, last: dict, stage: str,
 
 
 def decide(state: dict, probes: dict, port_sha: str, now: str,
-           issues: list | None, running: dict | None) -> dict:
+           issues: list | None, running: dict | None,
+           migrations: list | None = None) -> dict:
     diag = []
     plan = {'action': 'skip', 'reason': '', 'target': None,
             'issues_to_create': [], 'diagnostics': diag, 'now': now,
@@ -235,7 +435,22 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
     last = state.get('last_successful_build') or {}
     sig = build_signature(buildable, recipe['recipe_sha'],
                           recipe['host_sha'], port_sha)
+    # Round 16: v1 history is honoured via audited migration entries ONLY
+    # when their pinned semantic inputs match what THIS run measured — the
+    # equivalence is recomputed every time, never asserted from history.
+    comps = {'aligned_version': buildable,
+             'recipe_sha': recipe['recipe_sha'],
+             'host_sha': recipe['host_sha'], 'port_sha': port_sha}
+    act = active_migrations(migrations or [], comps)
+    eq_v1 = {m['from_sig'] for m in act}
+    if act:
+        diag.append('v1→v2 signature migration active: '
+                    + ', '.join(m['id'] for m in act)
+                    + ' (semantic inputs re-proven against current probes)')
     candidates = state.get('candidates') or []
+
+    def sig_match(stored) -> bool:
+        return stored == sig or (stored in eq_v1 if stored else False)
 
     def mk_target(rev):
         # Round 15.1 #7: revision 1 = PLAIN upstream version (no
@@ -249,6 +464,7 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
                 'pkg_revision_env': '' if rev <= 1 else str(rev),
                 'termux_ref': probes['termux_head'],
                 'port_sha': port_sha, 'signature': sig,
+                'signature_schema': PORT_INPUTS_SCHEMA,
                 'recipe_sha': recipe['recipe_sha'],
                 'host_sha': recipe['host_sha'],
                 'is_revision': (last.get('upstream_version') == buildable)}
@@ -265,10 +481,10 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
         target = mk_target(1)
         plan['reason'] = 'new-upstream-version'
     elif buildable == last['upstream_version']:
-        if sig == last.get('signature'):
+        if sig_match(last.get('signature')):
             plan['reason'] = 'identical-inputs-already-built'
             return plan
-        if any(c.get('signature') == sig and
+        if any(sig_match(c.get('signature')) and
                c.get('status') == 'BUILD_VERIFIED_CANDIDATE'
                for c in candidates):
             plan['reason'] = 'identical-candidate-already-built'
@@ -289,12 +505,22 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
         return plan
     # Round 15.1 #4: honor a real `retry-approved` LABEL on the open issue
     # for this exact signature (in addition to state flag / dispatch).
-    blocked = (state.get('blocked') or {}).get(sig)
+    blocked_map = state.get('blocked') or {}
+    blocked = blocked_map.get(sig)
+    if blocked is None:
+        # Round 16: a v1-keyed block that migration-equivalence proves to be
+        # THIS same semantic build still blocks (fail-safe: honour it).
+        for vs in sorted(eq_v1):
+            if vs in blocked_map:
+                blocked = blocked_map[vs]
+                diag.append(f'blocked entry (v1 sig {vs}) applies via '
+                            'migration equivalence — honoured')
+                break
     consumed = set((blocked or {}).get('approval_consumed_issues') or [])
     if blocked and not blocked.get('retry_approved'):
         for i in (issues or []):
             if 'retry-approved' in (i.get('labels') or []) and \
-                    issue_matches_sig(i.get('title', ''), sig) and \
+                    issue_sig_match(i.get('title', ''), sig, eq_v1) and \
                     i.get('number') not in consumed:
                 blocked['retry_approved'] = True
                 # Round 15.3 #1: the approval ORIGIN must survive
@@ -326,10 +552,10 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
     # state.blocked is absent — and re-links the ledger to it. Approvals are
     # evaluated in the blocked branch above; with no state block, no approval
     # exists, so skipping here can never swallow a human-authorized retry.
-    if not (state.get('blocked') or {}).get(sig):
+    if blocked is None:
         for i in (issues or []):
             if BLOCKED_LABEL in (i.get('labels') or []) and \
-                    issue_matches_sig(i.get('title', ''), sig):
+                    issue_sig_match(i.get('title', ''), sig, eq_v1):
                 stb = (state.setdefault('blocked', {})).setdefault(sig, {
                     'classification': 'port', 'at': now,
                     'inputs': {'recipe_sha': recipe['recipe_sha'],
@@ -356,7 +582,7 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
     plan['target'] = target
     for i in (issues or []):
         if BLOCKED_LABEL in (i.get('labels') or []) and \
-                issue_matches_sig(i.get('title', ''), sig):
+                issue_sig_match(i.get('title', ''), sig, eq_v1):
             plan['pending_issue'] = i.get('number')
             break
     return plan
@@ -523,6 +749,11 @@ def main(argv=None) -> int:
     d.add_argument('--port-sha', required=True)
     d.add_argument('--now', default='(unset)')
     d.add_argument('--approve-retry', action='store_true')
+    d.add_argument('--migrations', default=None,
+                   help='audited v1->v2 signature-equivalence file '
+                        '(malformed JSON fails the run closed)')
+    h = sub.add_parser('port-input-hash')
+    h.add_argument('--root', default='.')
     v = sub.add_parser('validate-state')
     v.add_argument('--state', required=True)
     st = sub.add_parser('stamp')
@@ -555,17 +786,31 @@ def main(argv=None) -> int:
         Path(args.state).write_text(json.dumps(stt, indent=1) + '\n')
         print('STAMPED', len(created))
         return 0
+    if args.cmd == 'port-input-hash':
+        return cmd_port_input_hash(args)
     if args.cmd == 'decide':
-        state = json.loads(Path(args.state).read_text())
+        def _load(path, what):
+            try:
+                return json.loads(Path(path).read_text())
+            except (OSError, ValueError) as exc:
+                # FAIL CLOSED with a clean report (non-zero rc aborts the
+                # workflow step; never proceed on a half-read input).
+                raise SystemExit(f'FATAL: {what} unreadable/malformed: {exc}')
+        state = _load(args.state, 'state')
         if getattr(args, 'approve_retry', False):
             for v in (state.get('blocked') or {}).values():
                 v['retry_approved'] = True
-        probes = json.loads(Path(args.probes).read_text())
-        issues = (json.loads(Path(args.issues).read_text())
-                  if args.issues else [])
-        running = (json.loads(Path(args.running).read_text())
-                   if args.running else None)
-        plan = decide(state, probes, args.port_sha, args.now, issues, running)
+        probes = _load(args.probes, 'probes')
+        issues = (_load(args.issues, 'issues') if args.issues else [])
+        running = (_load(args.running, 'running') if args.running else None)
+        migrations, mig_err = load_migrations(args.migrations)
+        if mig_err:
+            # FAIL CLOSED: a corrupt migration file must not silently grant
+            # (or silently deny, in a re-run race) equivalence — abort.
+            print(f'FATAL: signature migrations — {mig_err}', file=sys.stderr)
+            return 1
+        plan = decide(state, probes, args.port_sha, args.now, issues,
+                      running, migrations)
         Path(args.out).write_text(json.dumps(plan, indent=1) + '\n')
         print(f"MAINTENANCE decide: action={plan['action']} "
               f"reason={plan['reason']}")
