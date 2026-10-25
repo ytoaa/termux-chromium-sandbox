@@ -126,6 +126,104 @@ def _read(path: str):
     return json.loads(Path(path).read_text())
 
 
+# ====================================================== ledger lookup ==
+# Round 18 (Stage C): read-only candidate lookup for a workflow_run id.
+# The OLD gate (jq on last_successful_build.ci_run == run) could MISS an
+# earlier successful candidate once a LATER build had replaced
+# last_successful_build (queue delay / consecutive builds). Lookup now:
+#   1) collects every record CLAIMING this run (last_successful_build and
+#      every candidates[] entry with ci_run == run id);
+#   2) requires, for each claim: status == BUILD_VERIFIED_CANDIDATE,
+#      concrete deb_version, 64hex deb_sha256, 16hex build signature,
+#      40hex termux_sha  (validated flag is NOT required - CI success is
+#      not device verification and vice versa);
+#   3) FAILS CLOSED (code 1) on contradictory claims (same run id,
+#      different version/sha/signature/termux pin) or malformed claims -
+#      a claim that exists but is broken is never downgraded to "not
+#      found" (that would hide ledger corruption behind a green no-op);
+#   4) FAILS CLOSED if the signature is currently blocked (blocked map) -
+#      blocked builds never auto-publish;
+#   5) returns code 4 (normal no-op) ONLY when NOTHING claims the run
+#      (dry-run/skip/failed/unrecorded runs have no claim by contract).
+# NEVER writes the state file; never fabricates a candidate; the presence
+# of an artifact alone remains insufficient (the caller must pass THIS
+# ledger record's metadata through verify's SHA comparison afterwards).
+def ledger_lookup(state: dict, run_id: int):
+    """-> (record|None, exit_code, why). Codes: 0 found, 4 no-claim, 1 refuse."""
+    claims = []
+    last = state.get('last_successful_build')
+    if isinstance(last, dict) and last.get('ci_run') == run_id:
+        claims.append(('last_successful_build', last))
+    for i, c in enumerate(state.get('candidates') or []):
+        if isinstance(c, dict) and c.get('ci_run') == run_id:
+            claims.append((f'candidates[{i}]', c))
+    if not claims:
+        return None, 4, 'no ledger record claims this run id'
+    agreed = None
+    for where, rec in claims:
+        if rec.get('status') != 'BUILD_VERIFIED_CANDIDATE':
+            return None, 1, (f'{where} claims run {run_id} but '
+                             f'status={rec.get("status")!r} is not '
+                             'BUILD_VERIFIED_CANDIDATE')
+        ver = str(rec.get('deb_version') or '')
+        sha = str(rec.get('deb_sha256') or '')
+        sig = str(rec.get('signature') or '')
+        tsha = str(rec.get('termux_sha') or '')
+        if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){3}(?:-[0-9]+)?', ver):
+            return None, 1, f'{where} claims run {run_id} with malformed deb_version {ver!r}'
+        if not HEX64.fullmatch(sha):
+            return None, 1, f'{where} claims run {run_id} with malformed deb_sha256 {sha[:16]!r}'
+        if not re.fullmatch(r'[0-9a-f]{16}', sig):
+            return None, 1, f'{where} claims run {run_id} with malformed signature {sig[:20]!r}'
+        if not HEX40.fullmatch(tsha):
+            return None, 1, f'{where} claims run {run_id} with malformed termux_sha {tsha[:16]!r}'
+        key = (ver, sha, sig, tsha)
+        if agreed is None:
+            agreed = key
+        elif agreed != key:
+            return None, 1, (f'contradictory candidate records for run {run_id} '
+                             f'({agreed[0]}/{agreed[1][:8]}... vs '
+                             f'{key[0]}/{key[1][:8]}...) - human review required')
+    blocked = state.get('blocked') or {}
+    b = blocked.get(agreed[2])
+    if isinstance(b, dict):
+        return None, 1, (f'signature {agreed[2]} is currently blocked '
+                         f'(issue {b.get("issue")}) - blocked builds never '
+                         'auto-publish')
+    src, rec = claims[0]
+    return {'ci_run': run_id, 'deb_version': agreed[0], 'deb_sha256': agreed[1],
+            'signature': agreed[2], 'termux_sha': agreed[3],
+            'recorded_at': rec.get('recorded_at'),
+            'claim_sources': [w for w, _ in claims]}, 0, 'found'
+
+
+def cmd_ledger_lookup(args) -> int:
+    try:
+        rid = int(args.run_id)
+    except (TypeError, ValueError):
+        print(f'LEDGER-REFUSE[1]: run id {args.run_id!r} is not numeric',
+              file=sys.stderr)
+        return 1
+    try:
+        st = json.loads(Path(args.state).read_text())
+    except (OSError, ValueError) as exc:
+        print(f'LEDGER-REFUSE[1]: state unreadable: {exc}', file=sys.stderr)
+        return 1
+    if not isinstance(st, dict):
+        st = {}
+    rec, code, why = ledger_lookup(st, rid)
+    if code == 0:
+        _write(args.out, {'found': True, **rec})
+        print(f'LEDGER-FOUND run {rid}: {rec["deb_version"]} '
+              f'{rec["deb_sha256"][:16]}... via '
+              f'{",".join(rec["claim_sources"])}')
+    elif code == 4:
+        print(f'LEDGER-NO-CLAIM run {rid}: {why}')
+    else:
+        print(f'LEDGER-REFUSE[1] run {rid}: {why}', file=sys.stderr)
+    return code
+
+
 # ================================================================ verify ==
 
 def cmd_verify(args) -> int:
@@ -569,6 +667,10 @@ def main(argv=None) -> int:
     pl.add_argument('--gh-bin', default='gh')
     pl.add_argument('--repo', required=True)
     pl.add_argument('--out', required=True)
+    ll = sub.add_parser('ledger-lookup')
+    ll.add_argument('--state', required=True)
+    ll.add_argument('--run-id', required=True)
+    ll.add_argument('--out', required=True)
     e = sub.add_parser('execute')
     e.add_argument('--plan', required=True)
     e.add_argument('--verified', required=True)
@@ -577,6 +679,8 @@ def main(argv=None) -> int:
     e.add_argument('--out', required=True)
     args = p.parse_args(argv)
     try:
+        if args.cmd == 'ledger-lookup':
+            return cmd_ledger_lookup(args)
         if args.cmd == 'verify':
             return cmd_verify(args)
         if args.cmd == 'plan':
