@@ -1,0 +1,20 @@
+name: Probe Call
+on:
+  workflow_call:
+    inputs:
+      termux_ref:
+        type: string
+        required: true
+      pkg_revision:
+        type: string
+        required: false
+        default: ""
+      source:
+        type: string
+        required: false
+        default: "maintenance"
+jobs:
+  probe:
+    runs-on: ubuntu-26.04
+    steps:
+      - run: echo probe-ok "${{ inputs.termux_ref }}"

@@ -230,20 +230,9 @@ jobs:
   publish:
     name: Pre-release (direct builds only)
     needs: publishmode
-    # Round 17 — a DIRECT manual build publishes on success (CI VERIFIED —
-    # DEVICE NOT VERIFIED). When CALLED by daily-maintenance the mode job
-    # returns want=false and publishing DEFERS to the maintenance
-    # ledger-gated publish job (which also requires the recorded candidate)
-    # — no duplicate publishing, no publish-before-ledger. Re-running a
-    # failed publish job re-downloads the artifact only: build success of
-    # THIS run is a hard need. Opt-out: publish=false.
     if: needs.publishmode.outputs.want == 'true'
-    uses: ./.github/workflows/publish-release.yml
+    uses: ./.github/workflows/probe-call.yml
     with:
+      termux_ref: de1dd3d18e239ef514e5c55ad744e6485e408c65
+      pkg_revision: "2"
       source: manual
-      ci_run_id: ${{ github.run_id }}
-      artifact_name: build-${{ github.run_id }}
-      deb_version: ${{ needs.build.outputs.deb_version }}
-      deb_sha256: ${{ needs.build.outputs.deb_sha256 }}
-      termux_sha: ${{ needs.build.outputs.termux_sha }}
-      port_sha: ${{ needs.build.outputs.port_sha }}
