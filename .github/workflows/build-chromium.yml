@@ -229,7 +229,7 @@ jobs:
 
   publish:
     name: Pre-release (direct builds only)
-    needs: [build, publishmode]
+    needs: publishmode
     # Round 17 — a DIRECT manual build publishes on success (CI VERIFIED —
     # DEVICE NOT VERIFIED). When CALLED by daily-maintenance the mode job
     # returns want=false and publishing DEFERS to the maintenance
