@@ -283,6 +283,9 @@ check('[s50d] step order: classify -> ledger gate -> download -> verify -> plan 
       _psrc.index('Classify trigger event') < _psrc.index('ledger gate')
       < _psrc.index('Download candidate artifact') < _psrc.index('Integrity verification')
       < _psrc.index('+ plan (dedup') < _psrc.index('Execute (draft'))
+_li=_psrc.index('ok=$(jq -r --argjson id'); _ai=_psrc.index('actions/runs/$RUN_ID/artifacts')
+check('[s50g] ORDER: ledger no-op check precedes artifact-existence (dry/skip runs have no build-<id> artifact -> must be green no-op, never red)',
+      _li < _ai and 'SKIP_REMAIN=true' in _psrc[_li:_ai] and 'exit 0' in _psrc[_li:_ai])
 check('[s50e] ledger gate re-executed in publisher (BUILD_VERIFIED_CANDIDATE + 64hex sha + 16hex sig for THIS run)',
       'BUILD_VERIFIED_CANDIDATE' in _psrc and 'test("^' in _psrc
       and '[0-9a-f]{64}' in _psrc and '[0-9a-f]{16}' in _psrc and 'SKIP_REMAIN' in _psrc)

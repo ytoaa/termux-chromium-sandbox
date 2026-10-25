@@ -104,18 +104,16 @@ jobs:
           set -euo pipefail
           gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID" > run.json
           jq -e '.status=="completed" and .conclusion=="success"' run.json >/dev/null
-          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" > artifacts.json
-          jq -e --arg n "build-$RUN_ID" \
-            '[.artifacts[] | select(.name==$n and .expired==false)] | length == 1' \
-            artifacts.json >/dev/null
           if [ "$SOURCE" = "maintenance" ]; then
-            # THE LEDGER IS THE GATE: the outcome job has already pushed a
-            # BUILD_VERIFIED_CANDIDATE for this exact run id (dry-run/skip/
-            # blocked/failed/lost-push all fail this check -> no-op).
+            # THE LEDGER IS THE GATE — evaluated BEFORE any artifact check so
+            # dry-run/skip/blocked runs (which never upload build-<id>)
+            # end as normal no-op SUCCESS, not red failures. Only a
+            # BUILD_VERIFIED_CANDIDATE recorded for this exact run id
+            # (ci_run==id, 64hex sha, 16hex sig) may proceed.
             if ! gh api "repos/${{ github.repository }}/contents/maintenance/state.json?ref=maintenance-state" \
                  --jq .content > state.b64 2>state.err; then
               if grep -qiE 'Not Found|No commit found' state.err; then
-                echo "no maintenance-state yet — nothing published" >> "$GITHUB_STEP_SUMMARY"
+                echo "no maintenance-state yet — nothing to publish" >> "$GITHUB_STEP_SUMMARY"
                 echo "SKIP_REMAIN=true" >> "$GITHUB_ENV"; exit 0
               fi
               echo "::error::state probe failed (not a 404) — fail closed"; tail -2 state.err; exit 1
@@ -130,7 +128,7 @@ jobs:
                     and (($b.signature // "") | test("^[0-9a-f]{16}$")))
                 then "true" else "false" end' state.json)
             if [ "$ok" != "true" ]; then
-              echo "no verified candidate for run $RUN_ID (dry-run/skip/unrecorded) — no-op" >> "$GITHUB_STEP_SUMMARY"
+              echo "no verified candidate for run $RUN_ID (dry-run/skip/blocked/unrecorded) — normal no-op" >> "$GITHUB_STEP_SUMMARY"
               echo "SKIP_REMAIN=true" >> "$GITHUB_ENV"; exit 0
             fi
             {
@@ -141,8 +139,8 @@ jobs:
               echo "EXPECT_TS=$(jq -r '.last_successful_build.recorded_at // ""' state.json)"
             } >> "$GITHUB_ENV"
           else
-            # manual path: no ledger contract; expectations derive from the
-            # artifact itself (dpkg identity + measured sha) during verify.
+            # manual path: no ledger contract — a successful build run MUST
+            # own its build-<run> artifact; absence is a real anomaly (red).
             echo "SKIP_REMAIN=false" >> "$GITHUB_ENV"
             echo "EXPECT_VERSION=" >> "$GITHUB_ENV"
             echo "EXPECT_SHA=" >> "$GITHUB_ENV"
@@ -150,7 +148,13 @@ jobs:
             echo "EXPECT_TERMUX=" >> "$GITHUB_ENV"
             echo "EXPECT_TS=" >> "$GITHUB_ENV"
           fi
+          # artifact ownership (both paths, AFTER the ledger no-op above)
+          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" > artifacts.json
+          jq -e --arg n "build-$RUN_ID" \
+            '[.artifacts[] | select(.name==$n and .expired==false)] | length == 1' \
+            artifacts.json >/dev/null
           echo "SKIP_REMAIN=false" >> "$GITHUB_ENV"
+          echo "provenance ok: run $RUN_ID succeeded; artifact build-$RUN_ID owned"
 
       - name: Download candidate artifact (pinned to the audited run)
         if: env.SKIP_REMAIN != 'true'
