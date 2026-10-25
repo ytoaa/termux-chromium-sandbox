@@ -1256,3 +1256,85 @@ Engine guarantees (decide time, every run):
   anything real (BPF rules, patches, shim, recipe, host pin, upstream)
   remains fully active (verified by engine tests R3/R3b/R4/R10 and the
   Stage C simulation matrix).
+
+## Round 17 — Automated GitHub Pre-release publishing (v2: self-contained workflow_run)
+
+Policy: CI-verified candidate DEBs publish automatically as GitHub
+**Pre-releases**; device validation is the downloading user's
+responsibility (CI VERIFIED — DEVICE NOT VERIFIED); stable/apt/validated
+promotions remain separate human approvals. Existing builds (incl.
+validated rev-2) are NOT back-published — only runs completing after
+activation can publish.
+
+### Instance constraint discovered (why NOT a called reusable job)
+The first design (PR #7) made the publisher a reusable workflow called
+with `uses:` + caller `permissions: contents: write`. On this GitHub
+instance that produced **startup_failure** on every dispatch; bisection
+(runs 40217322460…40220026845, revert PR #8) proved: caller-side
+`permissions:` on `uses:` jobs and elevated `actions: write` on ordinary
+jobs are both REJECTED at workflow start, while `contents: write` at the
+TOP of a standalone workflow is accepted (and outcome's historic
+job-level contents/issues write keeps working). Round 17 v2 therefore
+uses ZERO caller-side wiring:
+
+* `.github/workflows/publish-release.yml` — a standalone **workflow_run**
+  workflow (`on: workflow_run: [Daily Maintenance, Build Termux Chromium
+  Seccomp Sandbox Port] types:[completed]`), top-level
+  `permissions: contents: write` (the repo's only write scope), constant
+  concurrency group serializing publishes. Job-level condition:
+  `conclusion=='success' && head_branch==default_branch`.
+* `daily-maintenance.yml` — UNCHANGED from Round 16 (proven by static
+  s51: no publisher references, no elevated permissions, no
+  `gh workflow run`).
+* `build-chromium.yml` — gained ONLY a `publish` boolean dispatch input
+  (opt-out). No permissions, no publisher wiring (static s52).
+
+### Decision flow (all fail-closed, publisher-side)
+1. **classify** (real bash, tested via env injection g1–g7): workflow name
+   decides `source=maintenance|manual`; unknown workflow / manual
+   `publish=false` opt-out / malformed run-id/head ⇒ no-op or step fail.
+2. **provenance audit** via API: run `completed+success`, artifact
+   `build-<run>` uniquely present & non-expired; artifact downloaded
+   BY RUN-ID (uploads run under `if: always()`, so existence proves
+   nothing — success must be PROVEN).
+3. **ledger gate re-executed** for maintenance (jq tested g8–g12):
+   maintenance-state `last_successful_build` must show
+   `ci_run==<this run>`, `BUILD_VERIFIED_CANDIDATE`, 64hex sha, 16hex
+   signature — dry-run/skip/blocked/failed/lost-push → `SKIP_REMAIN=true`
+   no-op SUCCESS (never an accidental release). Manual path has no ledger
+   contract: expectations derive from the artifact itself (dpkg identity +
+   measured sha), and the signature stays null — NEVER fabricated.
+4. **verify** (15 integrity checks incl. dpkg-deb -f/-I/-c shield members,
+   pins, basename-dedup) → **plan** (dedup/collision/resume) → **execute**
+   (draft → assets → byte-verify → flip `--draft=false --prerelease` →
+   post-publish API re-read; success claimed only from the re-read).
+5. Publisher code is checked out from the DEFAULT branch (supply-chain),
+   not the triggered run's head.
+
+### Build vs publish separation (core requirement)
+The publisher never imports maintenance.py, never writes
+maintenance-state, and cannot reclassify builds (static s53). A red
+publish run leaves build verdict + candidate ledger intact; recovery is
+`gh run rerun <publish-run>` (or the next nightly) — artifact-only,
+NEVER a Chromium rebuild. Exit-code contract: 0 published / already
+-published, 1 integrity refusal, 2 collision/foreign-ownership (human
+review; existing objects untouched), 3 transient (draft kept unpublished).
+
+### Dedup & naming (unchanged from v1)
+Tag `chromium-sandboxed-v<dpkg Version>` on the repo build commit;
+title `Chromium Sandbox <version> (CI Candidate)`. Same tag+sha →
+idempotent skip; same tag different sha → collision stop; foreign draft →
+untouched; owned draft (`tcs-publish-run` marker) → safe resume.
+Assets: DEB + `SHA256SUMS.txt` + `build-manifest.json` (+ secret-scanned
+logs). Notes: CI VERIFIED — DEVICE NOT VERIFIED + user device checklist
++ no-`--no-sandbox` advice.
+
+### Operations
+* Emergency stop of publishing only: `gh workflow disable
+  publish-release.yml` (nightly builds/ledger unaffected).
+* Manual (re)publish for a specific successful default-branch build:
+  `gh workflow run build-chromium.yml` already triggers via workflow_run;
+  or re-run the failed publish run directly.
+* Tests: `port/tests/publish_test.py` 49 checks (19-row required table +
+  g1–g16 workflow_run classify/ledger/invariants), static s50–s52f +
+  s46 across all three workflows, harness 50/50 RC=0, selftest RC=0.

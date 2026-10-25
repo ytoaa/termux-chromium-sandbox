@@ -329,8 +329,8 @@ python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS
   || fail "[35] maintenance engine scenarios"
 
 # [36] Round 15/16 static verification (mode fail-closed matrix + migrations).
-python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=61 FAIL=0$' \
-  && pass "[36] maintenance static workflow+seed 61/61" \
+python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=71 FAIL=0$' \
+  && pass "[36] maintenance static workflow+seed 71/71" \
   || fail "[36] maintenance static checks"
 
 # [37] TERMUX_PKG_REVISION injection behavior (default-off reproducibility).
@@ -360,5 +360,11 @@ python3 "port/tests/phase_c/gui_extra_verdict_test.py" 2>&1 | tail -1 | grep -q 
 python3 "port/tests/maintenance_signature_test.py" 2>&1 | grep -q '^MAINTENANCE-SIGNATURE PASS=18 FAIL=0$' \
   && pass "[41] build-signature v2 + migration simulation (13 scenarios, 18 checks)" \
   || fail "[41] build-signature simulation matrix"
+
+# [42] Round 17 pre-release publisher (required 19-row scenario table: publish
+# gating, integrity refusals, dedup/collision, draft-safe recovery, gates).
+python3 "port/tests/publish_test.py" 2>&1 | grep -q '^PUBLISH-TESTS PASS=49 FAIL=0$' \
+  && pass "[42] pre-release publisher scenarios (19-row table + workflow_run classify/ledger gates + instance invariants, 49 checks)" \
+  || fail "[42] pre-release publisher scenarios"
 
 exit $rc

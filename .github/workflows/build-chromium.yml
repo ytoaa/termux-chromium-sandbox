@@ -18,6 +18,10 @@ on:
         description: TERMUX_PKG_REVISION override (empty = unchanged; used by maintenance revision builds)
         type: string
         default: ""
+      publish:
+        description: Publish a successful direct build as GitHub Pre-release (Round 17; opt-out=false)
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       termux_ref:

@@ -36,8 +36,8 @@ and invites a PR. This project is that attempt.
   NEVER publishes. Schedule fires only after PR merge (default-branch
   cron) — merge and activation are separate approvals.
 
-- **Maintenance automation (LIVE — AUTOMATED MAINTENANCE / MANUAL
-  PROMOTION):** the daily workflow runs on schedule at **09:23 KST**
+- **Maintenance automation (LIVE — AUTOMATED MAINTENANCE / AUTO PRE-RELEASE
+  / MANUAL PROMOTION):** the daily workflow runs on schedule at **09:23 KST**
   (00:23 UTC; GitHub may delay — timing is an expectation, not a gate).
   Automated per run: upstream/recipe detection, validated/state compare,
   changed-input detection, build-signature computation (schema v2: the four
@@ -51,7 +51,34 @@ and invites a PR. This project is that attempt.
   R1~R9b security gate, conditional CANDIDATE CI build, artifact capture,
   failure classification, deduplicated block Issues, candidate recording.
   NEVER automated: device installation/gates, validated promotion,
-  port.toml writes, policy changes, Releases, apt, product-code merges.
+  port.toml writes, policy changes, STABLE releases, apt publishing,
+  product-code merges.
+
+- **Pre-release publishing (Round 17 — AUTO PRE-RELEASE):** a standalone
+  `workflow_run`-triggered workflow (`Publish Pre-release`) watches
+  SUCCESSFUL default-branch completions of the nightly maintenance run and
+  direct manual build runs, re-executes the ledger gate from
+  maintenance-state (only a `BUILD_VERIFIED_CANDIDATE` recorded for that
+  exact run publishes; dry-run/skip/blocked/failed runs no-op), re-verifies
+  the artifact fail-closed (provenance, exactly one DEB, SHA256,
+  `dpkg-deb` identity, shield members, pins; signature required on the
+  maintenance path, never fabricated on manual), then publishes a GitHub
+  **Pre-release** `chromium-sandboxed-v<version>` (draft-first: DEB +
+  `SHA256SUMS.txt` + `build-manifest.json` + secret-scanned logs; flipped
+  public only after byte-level asset re-verification and a post-publish API
+  re-read). Same version+sha = idempotent skip; same tag different sha =
+  collision stop for human review; tags/releases/assets are NEVER
+  clobbered. Publishing is SEPARATE from building: a publish failure never
+  reclassifies the build or touches the ledger — recovery is
+  `gh run rerun <publish-run>` (never a rebuild). Emergency stop of
+  publishing only: `gh workflow disable publish-release.yml`. Releases
+  state **CI VERIFIED — DEVICE NOT VERIFIED**: installing users verify on
+  their own devices (Seccomp_filters/NoNewPrivs, GUI/X11, GPU/WebGL,
+  downloads, audio, restart); a CI-green build is no device promise and
+  `--no-sandbox` is never the fix. No back-publishing: builds completed
+  before activation (incl. validated `156.0.8078.47-2`) are not released
+  by this automation; stable conversion/apt remain separate human
+  approvals.
   **Emergency stop:** `gh workflow disable daily-maintenance.yml` (runtime
   kill-switch) or revert the schedule trigger via PR. **Resume:**
   `gh workflow enable daily-maintenance.yml`. Blocked signatures retry
