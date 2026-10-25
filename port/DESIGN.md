@@ -1147,3 +1147,19 @@ F. Regression: static 43/43 (s8 rewritten), engine 46/46, integration
    evidence regenerated via the official wrapper (ws + gui-extra PASS,
    downloads list item proven). main-device symlink removed after tests
    (extract retained).
+
+## Final acceptance (2026-10-25) — VALIDATED — MANUAL MAINTENANCE ONLY
+
+PR #1 merged as 4a4e0585 (no schedule triggers anywhere).
+Validated promoted (separate auditable commit, human-approved): upstream
+156.0.8078.47, deb 156.0.8078.47-2, sha256 cf2cb2a8...abd4151ba8d, run
+40104615699, termux de1dd3d1..., sig ad5b0fdb8c7a9777, port provenance
+554da59a...; #31 baseline preserved (device_gate_history[0], state
+candidates[0]). maintenance-state CAS-promoted to a6417d6a with explicit
+manual-promotion history event; artifact_verified=true (live download
+sha256 match); engine retains ZERO validated-write authority (static
+tests s17-s20 verify the promoted baseline EXACTLY and #31 history).
+Operational policy: schedule OFF, dispatch-only (dry_run default true),
+no builds without explicit approval, Release/apt never automatic; new
+upstream versions require the full CI + device-gate cycle again; failed
+signatures stay blocked (Issue #2 history untouched).

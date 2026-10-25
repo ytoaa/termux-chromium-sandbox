@@ -1,43 +1,77 @@
 {
-  "validated": {
-    "upstream_version": "156.0.8078.47",
-    "port_version": "0.1.0",
-    "port_sha": "403274f29bb288bf81643f0d1772837df49b7dca",
-    "termux_sha": "64e02760c276cb68f514261653baf59aed45d4fd",
-    "deb_sha256": "29c4080d2a849c07eae46a87e44e39231fa92021c1e10e24f363e1e29395b27c",
-    "ci_run": 39976822670,
-    "note": "Round 13 promotion; device-gated (seccomp-BPF census, audio owner, downloads). Auto-maintenance MUST NOT mutate this block; only humans promote via port.toml."
+ "validated": {
+  "upstream_version": "156.0.8078.47",
+  "deb_version": "156.0.8078.47-2",
+  "port_version": "0.1.0",
+  "port_sha": "554da59a8f021bc65f9c3aab4c25841a0768f373",
+  "termux_sha": "de1dd3d18e239ef514e5c55ad744e6485e408c65",
+  "deb_sha256": "cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d",
+  "ci_run": 40104615699,
+  "build_signature": "ad5b0fdb8c7a9777",
+  "note": "Manual human-approved promotion 2026-10-25 (Phase B CI + C/C.1/C.2 gates). Automation MUST NOT mutate; promotions happen via port.toml + this branch by humans. First baseline run #31 (plain 156.0.8078.47, deb 29c4080d..., ci 39976822670) preserved in candidates[0]."
+ },
+ "last_successful_build": {
+  "upstream_version": "156.0.8078.47",
+  "revision": 2,
+  "package_version": "156.0.8078.47-2",
+  "deb_version": "156.0.8078.47-2",
+  "pkg_revision_env": "2",
+  "termux_ref": "de1dd3d18e239ef514e5c55ad744e6485e408c65",
+  "port_sha": "d98814c2a3feee8a",
+  "signature": "ad5b0fdb8c7a9777",
+  "recipe_sha": "7c5c20eb1182e197",
+  "host_sha": "34b799517be2a99a",
+  "is_revision": true,
+  "status": "BUILD_VERIFIED_CANDIDATE",
+  "deb_sha256": "cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d",
+  "termux_sha": "de1dd3d18e239ef514e5c55ad744e6485e408c65",
+  "ci_run": 40104615699,
+  "ci_url": "https://github.com/ytoaa/termux-chromium-sandbox/actions/runs/40104615699",
+  "artifact": "build-40104615699",
+  "artifact_verified": true,
+  "recorded_at": "2026-10-24T14:55:08Z",
+  "validated": true
+ },
+ "candidates": [
+  {
+   "upstream_version": "156.0.8078.47",
+   "revision": 1,
+   "package_version": "156.0.8078.47",
+   "deb_version": "156.0.8078.47",
+   "signature": "seed-manual",
+   "deb_sha256": "29c4080d2a849c07eae46a87e44e39231fa92021c1e10e24f363e1e29395b27c",
+   "ci_run": 39976822670,
+   "status": "BUILD_VERIFIED_CANDIDATE",
+   "validated": true
   },
-  "last_successful_build": {
-    "upstream_version": "156.0.8078.47",
-    "revision": 1,
-    "package_version": "156.0.8078.47",
-    "deb_version": "156.0.8078.47",
-    "termux_ref": "64e02760c276cb68f514261653baf59aed45d4fd",
-    "port_sha": "403274f29bb288bf81643f0d1772837df49b7dca",
-    "signature": "seed-manual",
-    "deb_sha256": "29c4080d2a849c07eae46a87e44e39231fa92021c1e10e24f363e1e29395b27c",
-    "ci_run": 39976822670,
-    "ci_url": "https://github.com/ytoaa/termux-chromium-sandbox/actions/runs/39976822670",
-    "artifact": "build-39976822670",
-    "status": "BUILD_VERIFIED_CANDIDATE",
-    "recorded_at": "2026-10-24T00:00:00+09:00",
-    "validated": true,
-    "note": "Seeded from run #31. The REAL shipped deb version is plain '156.0.8078.47' (no -N suffix; TERMUX_PKG_REVISION unset = plain). Ledger 'revision 1' means first-build semantics; the next input-changed rebuild correctly becomes 156.0.8078.47-2. Signature 'seed-manual' never matches a computed signature; engine dedups against candidates too."
-  },
-  "candidates": [
-    {
-      "upstream_version": "156.0.8078.47",
-      "revision": 1,
-      "package_version": "156.0.8078.47",
-      "deb_version": "156.0.8078.47",
-      "signature": "seed-manual",
-      "deb_sha256": "29c4080d2a849c07eae46a87e44e39231fa92021c1e10e24f363e1e29395b27c",
-      "ci_run": 39976822670,
-      "status": "BUILD_VERIFIED_CANDIDATE",
-      "validated": true
-    }
-  ],
-  "blocked": {},
-  "history": []
+  {
+   "upstream_version": "156.0.8078.47",
+   "revision": 2,
+   "package_version": "156.0.8078.47-2",
+   "deb_version": "156.0.8078.47-2",
+   "pkg_revision_env": "2",
+   "termux_ref": "de1dd3d18e239ef514e5c55ad744e6485e408c65",
+   "port_sha": "d98814c2a3feee8a",
+   "signature": "ad5b0fdb8c7a9777",
+   "recipe_sha": "7c5c20eb1182e197",
+   "host_sha": "34b799517be2a99a",
+   "is_revision": true,
+   "status": "BUILD_VERIFIED_CANDIDATE",
+   "deb_sha256": "cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d",
+   "termux_sha": "de1dd3d18e239ef514e5c55ad744e6485e408c65",
+   "ci_run": 40104615699,
+   "ci_url": "https://github.com/ytoaa/termux-chromium-sandbox/actions/runs/40104615699",
+   "artifact": "build-40104615699",
+   "artifact_verified": true,
+   "recorded_at": "2026-10-24T14:55:08Z",
+   "validated": true
+  }
+ ],
+ "blocked": {},
+ "history": [
+  {
+   "at": "2026-10-25T00:00:00Z",
+   "manual_promotion": "validated -> 156.0.8078.47-2 run 40104615699 (human approval; replaces #31 baseline, #31 kept as history)"
+  }
+ ]
 }

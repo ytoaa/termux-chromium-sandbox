@@ -36,6 +36,26 @@ and invites a PR. This project is that attempt.
   NEVER publishes. Schedule fires only after PR merge (default-branch
   cron) — merge and activation are separate approvals.
 
+- **Maintenance automation (live on main — MANUAL ONLY):** daily-maintenance
+  workflow ships WITHOUT any schedule trigger (removed in Phase C.2).
+  Activation of the daily cron requires a separate approved PR. Until then
+  the ONLY entry point is `gh workflow run daily-maintenance.yml -f
+  dry_run=true|false` (manual; dry_run defaults true). All fail-closed
+  issue/state policies apply. See port/DESIGN.md "Activation policy".
+
+- **Current validated baseline (2026-10-25):** `chromium-sandboxed
+  156.0.8078.47-2` (upstream 156.0.8078.47 + packaging revision 2),
+  DEB sha256 `cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d`,
+  CI run 40104615699, termux pin `de1dd3d18e...`, build signature
+  `ad5b0fdb8c7a9777`, port provenance `554da59a...`. Device-verified on
+  Android 17/kernel 6.1 (BPF census filters=2/NNP=1 with P2b causality,
+  broker inodes=80, official shield-wrapper launches only, GUI/X11 9/9 +
+  cold starts 10/10, hardware WebGL2 via ANGLE zink Vulkan Turnip Adreno
+  750, WS 20/20, downloads sha-verified incl. chrome://downloads pierced
+  item proof, GTK file chooser, audio sink input, 540 concurrent-tab
+  checks) and Android 13/kernel 4.19 testbed (install/purge/residual 0).
+  First baseline run #31 (plain 156.0.8078.47) preserved as history.
+
 - **Phase 0 — feasibility: PASS** (2026-10-19, device: Android 17 / kernel 6.1 GKI / aarch64)
   - `poc/seccomp_probe.c`: a plain Termux process CAN install its own
     seccomp-bpf filter (`prctl PR_SET_SECCOMP` → `PR_GET_SECCOMP=2`), ALLOW

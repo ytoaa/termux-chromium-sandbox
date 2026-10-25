@@ -4,7 +4,14 @@
 version = "0.1.0"
 phase = "validated"            # feasibility | porting | gated-build | validated
 last_validated_port = "0.1.0"
-last_validated_chromium = "156.0.8078.47"
+last_validated_chromium = "156.0.8078.47"   # UPSTREAM version only (never a revision suffix)
+last_validated_deb_version = "156.0.8078.47-2"
+last_validated_deb_sha256 = "cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d"
+last_validated_ci_run = 40104615699
+last_validated_termux_sha = "de1dd3d18e239ef514e5c55ad744e6485e408c65"
+last_validated_build_signature = "ad5b0fdb8c7a9777"
+last_validated_port_commit = "554da59a8f021bc65f9c3aab4c25841a0768f373"   # git provenance (full sha)
+last_validated_promoted = "2026-10-25 manual human-approved promotion (Phase B CI + C/C.1/C.2 device gates)"
 policy_mode = "fail-closed"
 
 [termux]
@@ -75,9 +82,10 @@ binary_markers = [
 ]
 required_media_codecs = ["h264", "vp9", "av1", "aac", "opus"]
 require_bpf_per_process = true   # /proc Seccomp_filters must exceed Android baseline
-device_gate = "PASS 2026-10-24 run #31 deb 156.0.8078.47 (sha256 29c4080d2a84...9395b27c; port 403274f, termux 64e02760): A/B/C/D both devices; D(60m)+D60 soak on kernel 6.1 — 635 ACT-scoped rows Seccomp_filters=2 NoNewPrivs=1 violations 0; audio owner pid in ACT set (no fallback); WS 3602 msgs, YouTube T1-T5, AAC, IDB/LS; browser download manager A+D sha-match; zombie Z-rows 0 + full reap; 10/10 relaunches; CRASHING/SIGSYS/restarting/pa-refused 0; testbed dpkg install->purge residual 0. LMK: NOT_VERIFIED (non-root logcat; absence of observation not claimed as absence of LMK)."
+device_gate = "PASS 2026-10-25 run 40104615699 deb chromium-sandboxed 156.0.8078.47-2 (sha256 cf2cb2a88e15ab42...abd4151ba8d; upstream 156.0.8078.47, REVISION=2 build; port 554da59a8f021bc65f9c3aab4c25841a0768f373, termux de1dd3d18e239ef514e5c55ad744e6485e408c65, sig ad5b0fdb8c7a9777). Phase C/C.1/C.2 device gates: BPF census renderer-spawn filters=2 nnp=1 (Android baseline 1; P2b causality flag->2->1), broker-inodes=80, --no-sandbox tripwire 0, official shield-wrapper launches only; GUI/X11 window+nav+quit 9/9 and cold starts 10/10; HW GPU WebGL2 ANGLE zink Vulkan1.4 Turnip Adreno 750 (swiftshader-free); WS bidirectional 20/20 content-exact via wrapper; downloads CDP-completed + sha256 + chrome://downloads pierced item big-<pid>.bin hits x5; file chooser GTK dialog + File API; audio PLAYING + pactl Sink Input; concurrency 45 rounds x {2,4,6} tabs = 540 checks, maxRSS 234MB, residual 0, zygote IPC errors 0; testbed purge file-residual 0 + reinstall; stock chromium 155.0.8059.79 + user profiles untouched (Default mtime pre-session)."
 device_gate_history = [
-  "PREVIOUS BASELINE (preserved): PASS 2026-10-22 run #28 deb 155.0.8059.84 (sha256 4e7dce52...dbe820a): renderer BPF activations=6, codecs 5/5 probably, 7 live children filters=2 nnp=1 (stock baseline 0); X11 DEVICE GATE PASS",
+  "PASS 2026-10-24 run #31 deb 156.0.8078.47 PLAIN (sha256 29c4080d2a84...9395b27c; port 403274f2, termux 64e02760; run 39976822670) — FIRST validated baseline; superseded 2026-10-25 by the -2 revision build below (kept as history).",
+    "PREVIOUS BASELINE (preserved): PASS 2026-10-22 run #28 deb 155.0.8059.84 (sha256 4e7dce52...dbe820a): renderer BPF activations=6, codecs 5/5 probably, 7 live children filters=2 nnp=1 (stock baseline 0); X11 DEVICE GATE PASS",
   "INTERMEDIATE: run #29 (156.0.8078.47, first R9a candidate, sha256 5dae2702...d2fc950) — R9a B-battery PASS 2026-10-23 (restarts 0/CRASHING 0); superseded by #31 which adds the R9b wrapper as packaged.",
   "FAILED (recorded): run #30 — CI self-test harness shebang portability (fixed 4b1f5da), no artifact.",
 ]
