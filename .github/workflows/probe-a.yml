@@ -6,14 +6,8 @@ on:
         type: string
         required: false
         default: "maintenance"
-permissions:
-  contents: write
 jobs:
-  publish:
-    name: Verify + publish pre-release
+  probe:
     runs-on: ubuntu-26.04
-    timeout-minutes: 25
-    permissions:
-      contents: write
     steps:
       - run: echo probe-a-ok

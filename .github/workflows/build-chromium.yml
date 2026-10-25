@@ -234,6 +234,8 @@ jobs:
     uses: ./.github/workflows/probe-a.yml
     with:
       source: manual
+    permissions:
+      contents: write
   publishb:
     name: Probe B called job
     needs: publishmode
