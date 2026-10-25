@@ -1180,3 +1180,79 @@ Operational runbook (activation PR):
 11. Retry approval: label on open block issue (exact full-sig title) or dispatch flag.
 12. Manual paths preserved: dry_run default true via dispatch; schedule NEVER approves retries (mode normalization test matrix s44a-e; no implicit GHK coercions, s45).
 Baselines preserved: #31 history + 156.0.8078.47-2 validated (cf2cb2a8...abd4151ba8d).
+
+## Round 16 — Automated Maintenance Safety Hotfix (mode fail-closed + signature schema v2)
+
+### Stage A — dispatch fail-closed (daily-maintenance.yml, `mode` step)
+The step starts from `DRY=true` / `APPROVE=false` (fail-closed) and reads
+event+inputs ONLY through step-level `env:` (no inline `${{ }}` in the
+script body). Exactly two paths may enable a real build:
+1. `schedule` — the activated auto-candidate purpose; inputs are NOT read
+   (stray input strings cannot flip it; approve is forced false).
+2. `workflow_dispatch` with an EXPLICIT `dry_run=false` string — the human
+   go-ahead for an approved manual build.
+Missing input (renders as the empty string), unknown values (`yes`, `null`,
+`0`, …), and any unsupported event stay dry-run => build forbidden.
+`approve_retry` is honored only on dispatch, still one-shot/label-consumed
+(Round 15.3 contract unchanged). Regression: s44-sig, s44a–j, s47 (initial
+assignment must be `DRY=true`), s45 (no implicit coercion patterns).
+
+### Stage B — Signature schema v2 (build inputs vs audit records)
+`build_signature` gained `sig_version` (default 2). v1 stays frozen
+(history is never re-hashed); v2 payload is tagged `sigv2` so a scheme
+switch can never masquerade as a semantic input change.
+Port-input hashing v2 (`port/maintenance.py port-input-hash`):
+* the four RAW contract files — `chromium_sandbox_port.py`,
+  `prepare_recipe.py`, `gnp_shim.c`, `ci.sh` — are hashed by content
+  fingerprint (sha256[:40] of the file bytes; any byte change counts;
+  deleted file => MISSING sentinel, still distinct; the engine itself
+  stays ZERO-exec/pure — s22 invariant);
+* `port.toml` is hashed SEMANTICALLY: parse with tomllib -> drop ONLY the
+  exact audit-record denylist -> `json.dumps(sort_keys, compact, ascii)` ->
+  sha256[:16]. Comments, key order and byte layout of excluded records are
+  irrelevant (deterministic).
+HASHED (contract): `[port] version/phase/policy_mode`, `[termux] *`,
+`[sandbox] *` (mode, namespace_layer, setuid_sandbox, require_bpf_policy,
+bionic_guard), `[rules] r1..r9b` patch markers, `[gates] binary_markers,
+required_media_codecs, require_bpf_per_process, bpf_evidence_script,
+bpf_evidence_phases, broker_socket_inode_inode_proof, causality_control`,
+`[forbidden] items` — plus EVERY key not on the denylist (conservative
+default: new/unknown fields can never be silently ignored).
+EXCLUDED (audit records, proven zero-build-impact):
+`[port] last_validated_port, last_validated_chromium,
+last_validated_deb_version, last_validated_deb_sha256, last_validated_ci_run,
+last_validated_termux_sha, last_validated_build_signature,
+last_validated_port_commit, last_validated_promoted` and
+`[gates] device_gate, device_gate_history`.
+Proof of zero impact: port.toml has NO reader in the build chain —
+`prepare_recipe.py` copies it verbatim into the recipe BUILDER_DIR as an
+audit ledger (`shutil.copy2`); the generated hook runs only the transformer
++ rule-count gate; ci.sh never parses it; BUILDER_DIR is not packaged into
+the DEB. A future audit-only key must be proven likewise before being added
+to `TOML_METADATA_ONLY` (exact keys, code-reviewed); until then it is
+fail-safe counted as a build input.
+
+### Stage C — v1 history compatibility (audited migration, no rewrite)
+`maintenance/signature-migrations.json` registers the single v1→v2
+equivalence for the validated rev-2 baseline:
+v1 `ad5b0fdb8c7a9777` (recipe `7c5c20eb1182e197`, host `34b799517be2a99a`,
+legacy raw port hash `d98814c2a3feee8a` @ build commit
+`554da59a8f021bc65f9c3aab4c25841a0768f373`) == v2 port-input hash
+`7f86b30313338792` (semantic toml hash `fbf559c15b61e310`), so current
+inputs re-sign as v2 `35af420388ac5a5f` WITHOUT a rebuild.
+Key-level proof: between the rev-2 build commit and main, only
+`[port].last_validated_*` and `[gates].device_gate(_history)` changed — the
+four raw contract files are blob-identical.
+Engine guarantees (decide time, every run):
+* equivalence is RECOMPUTED from fresh measurements — the entry must match
+  aligned_version + recipe_sha + host_sha + v2 port-input hash exactly, and
+  status must be `approved`; stale/revoked/forged entries grant nothing;
+* v1 history (signature, ci_run, deb sha256, provenance) is NEVER rewritten;
+  new ledger entries carry `signature_schema: 2`;
+* blocked entries/issues keyed by an equivalent v1 sig are still HONORED
+  (fail-safe toward blocking); malformed migrations JSON aborts the run
+  (fail-closed); absent file = no equivalence (safe toward building);
+* SKIP is only ever granted via this re-proven path — change detection for
+  anything real (BPF rules, patches, shim, recipe, host pin, upstream)
+  remains fully active (verified by engine tests R3/R3b/R4/R10 and the
+  Stage C simulation matrix).

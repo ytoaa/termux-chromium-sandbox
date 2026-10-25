@@ -65,25 +65,48 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Resolve run mode (explicit; no implicit type coercion)
+      - name: Resolve run mode (fail-closed; explicit strings, no implicit coercion)
         id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
+          IN_APPROVE_RETRY: ${{ inputs.approve_retry }}
         run: |
           set -euo pipefail
-          EV="${{ github.event_name }}"
-          # schedule events carry NO inputs: dry defaults to false
-          # (auto-build allowed), approve ALWAYS false. dispatch values are
-          # matched as STRINGS via case — no reliance on GHK null/boolean
-          # coercion. Anything unrecognized fails safe to the manual path.
-          DRY=false
+          EV="${EVENT_NAME-}"
+          # FAIL-CLOSED defaults: nothing builds unless a path EXPLICITLY
+          # allows it. Exactly two paths may set DRY=false:
+          #   1) schedule — auto candidate builds are the activated purpose.
+          #      schedule events carry NO inputs; any stray input strings are
+          #      ignored and approve stays false (forced here, never read).
+          #   2) workflow_dispatch with an EXPLICIT dry_run=false string —
+          #      the human go-ahead for an approved manual build.
+          # Everything else (missing input, unknown string, unsupported
+          # event) stays dry. All comparisons are string `case` matches —
+          # no reliance on GHK null/boolean coercion; a missing input
+          # renders as the empty string and lands in the fail-closed branch.
+          DRY=true
           APPROVE=false
-          if [ "$EV" = "workflow_dispatch" ]; then
-            case "${{ inputs.dry_run }}" in
-              true|True|TRUE) DRY=true ;;
-            esac
-            case "${{ inputs.approve_retry }}" in
-              true|True|TRUE) APPROVE=true ;;
-            esac
-          fi
+          case "$EV" in
+            schedule)
+              DRY=false
+              ;;
+            workflow_dispatch)
+              case "${IN_DRY_RUN-}" in
+                false|False|FALSE) DRY=false ;;
+                *) DRY=true ;;  # true/True/TRUE/missing/unknown -> dry-run
+              esac
+              case "${IN_APPROVE_RETRY-}" in
+                true|True|TRUE) APPROVE=true ;;  # dispatch-only one-shot
+                *) APPROVE=false ;;              # missing/unknown -> never
+              esac
+              ;;
+            *)
+              # Unsupported/unexpected events never reach the build path.
+              DRY=true
+              APPROVE=false
+              ;;
+          esac
           echo "dry=$DRY" >> "$GITHUB_OUTPUT"
           echo "event=$EV" >> "$GITHUB_OUTPUT"
           echo "approve=$APPROVE" >> "$GITHUB_OUTPUT"
@@ -142,15 +165,17 @@ jobs:
           set -euo pipefail
           APPROVE=""
           if [ "${{ steps.mode.outputs.approve }}" = "true" ]; then APPROVE="--approve-retry"; fi
-          # port build inputs = hash of build-consumed files only (doc-only
-          # commits do NOT change this -> no spurious rebuilds; Round 15.1 #5)
-          PORT_SIG=$(for f in port/chromium_sandbox_port.py port/prepare_recipe.py \
-                     port/port.toml port/gnp_shim.c port/ci.sh; do
-                       git rev-parse "HEAD:$f" 2>/dev/null || echo MISSING:$f; done \
-                     | sha256sum | cut -c1-16)
+          # Round 16 (Stage B): v2 port-input hash — the four RAW contract
+          # files by content fingerprint (any byte counts) + port.toml
+          # SEMANTICALLY (audit promotion records and gates.device_gate*
+          # result records excluded under the reviewed denylist; every other
+          # key, incl. new/unclassified ones, is hashed => contract edits can
+          # never be silently ignored). Fails closed on missing/broken input.
+          PORT_SIG=$(python3 port/maintenance.py port-input-hash --root .)
           python3 port/maintenance.py decide --state state.json --probes probes.json \
             --out plan.json --issues issues.json --running running.json \
-            --port-sha "$PORT_SIG" --now "$(date -u +%FT%TZ)" $APPROVE
+            --port-sha "$PORT_SIG" --now "$(date -u +%FT%TZ)" \
+            --migrations maintenance/signature-migrations.json $APPROVE
           echo "action=$(python3 -c "import json;print(json.load(open('plan.json'))['action'])")" >> "$GITHUB_OUTPUT"
           echo "reason=$(python3 -c "import json;print(json.load(open('plan.json'))['reason'])")" >> "$GITHUB_OUTPUT"
           echo "target=$(python3 -c "import json;print(json.dumps((json.load(open('plan.json')).get('target') or {})))")" >> "$GITHUB_OUTPUT"

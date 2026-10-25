@@ -323,14 +323,14 @@ BODY=$(sed -n '/cat > "\$_wrap" <<.SHIMWRAP./,/^SHIMWRAP$/p' "$G32")
   && pass "[34] R9b wrapper: no forbidden widening tokens" \
   || fail "[34] R9b forbidden token in wrapper"
 
-# [35] Round 15 maintenance engine scenario tests (offline, mocked).
-python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS=46 FAIL=0$' \
-  && pass "[35] maintenance engine 46/46 scenarios" \
+# [35] Round 15/16 maintenance engine scenario tests (offline, mocked).
+python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS=70 FAIL=0$' \
+  && pass "[35] maintenance engine 70/70 scenarios" \
   || fail "[35] maintenance engine scenarios"
 
-# [36] Round 15 workflow/seed static verification.
-python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=50 FAIL=0$' \
-  && pass "[36] maintenance static workflow+seed 50/50" \
+# [36] Round 15/16 static verification (mode fail-closed matrix + migrations).
+python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=61 FAIL=0$' \
+  && pass "[36] maintenance static workflow+seed 61/61" \
   || fail "[36] maintenance static checks"
 
 # [37] TERMUX_PKG_REVISION injection behavior (default-off reproducibility).
@@ -354,5 +354,11 @@ bash "port/tests/maintenance_recipe_test.sh" 2>&1 | tail -1 | grep -q '^RECIPE-C
 python3 "port/tests/phase_c/gui_extra_verdict_test.py" 2>&1 | tail -1 | grep -q '^VERDICT-TESTS-RC=0$' \
   && pass "[40] gui_extra verdict matrix 11/11" \
   || fail "[40] gui_extra verdict matrix"
+
+# [41] Round 16 Stage C REQUIRED simulation matrix (13 scenarios: identical/metadata
+# edits SKIP, real edits BUILD, blocked BLOCK, fetch fail + unclear migration fail-closed).
+python3 "port/tests/maintenance_signature_test.py" 2>&1 | grep -q '^MAINTENANCE-SIGNATURE PASS=18 FAIL=0$' \
+  && pass "[41] build-signature v2 + migration simulation (13 scenarios, 18 checks)" \
+  || fail "[41] build-signature simulation matrix"
 
 exit $rc

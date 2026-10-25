@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "note": "Audited signature-SCHEME equivalence registrations (Round 16 safety hotfix). These entries NEVER rewrite history: every original ledger record keeps its legacy v1 signature, ci_run, deb sha256 and provenance exactly as built. Equivalence only states that the v2 semantic build-input fingerprint of the CURRENT tree provably matches the PINNED v2 fingerprint of the inputs that actually produced the v1-signed build; the engine re-verifies all pinned components (aligned version, recipe/host content hashes, v2 port-input hash) against fresh measurements on EVERY run — a stale or forged entry grants nothing when any component differs. Approved exclusively via human-reviewed PR; engine refuses malformed files (fail-closed).",
+  "migrations": [
+    {
+      "id": "rev2-156.0.8078.47-2-v1-to-v2",
+      "status": "approved",
+      "approved_by": "PR #6 (Automated Maintenance Safety Hotfix, human-reviewed merge)",
+      "date": "2026-10-26",
+      "from_sig": "ad5b0fdb8c7a9777",
+      "from_sig_version": 1,
+      "to_sig_version": 2,
+      "aligned_version": "156.0.8078.47",
+      "recipe_sha": "7c5c20eb1182e197",
+      "host_sha": "34b799517be2a99a",
+      "port_inputs_hash_v2": "7f86b30313338792",
+      "to_sig": "35af420388ac5a5f",
+      "provenance": {
+        "build_ci_run": 40104615699,
+        "build_commit": "554da59a8f021bc65f9c3aab4c25841a0768f373",
+        "legacy_v1_components": {
+          "upstream": "156.0.8078.47",
+          "recipe_sha": "7c5c20eb1182e197",
+          "host_sha": "34b799517be2a99a",
+          "port_sha_raw5blob": "d98814c2a3feee8a",
+          "repro": "sha256(json([upstream,recipe,host,port_sha_raw5blob],sort_keys))[:16] == ad5b0fdb8c7a9777 (verified bit-exact against maintenance-state.last_successful_build)"
+        },
+        "termux_ref": "de1dd3d18e239ef514e5c55ad744e6485e408c65",
+        "deb_sha256": "cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d",
+        "package_version": "156.0.8078.47-2",
+        "equivalence_evidence": {
+          "raw_files_blob_identical": {
+            "port/chromium_sandbox_port.py": "6eea716944c07bfd49e1f7e383e465f45809c472",
+            "port/prepare_recipe.py": "e7de096326c1330ad4ef1ac57c6c5ee8bc21b1a2",
+            "port/gnp_shim.c": "85e10528d409c1bba53a9b5aba0c430b2a132ee2",
+            "port/ci.sh": "bb745ac5c12ebfe7a81a41a638fa43ebfe03bb6f"
+          },
+          "port_toml_blob_changed": {
+            "at_build_commit": "3a9cf925aa02976d47f10eb2dd84b5f57ecf6b0e",
+            "at_main": "9a6a0386237b1af407f661a3e1dcefbf9d35a6e0",
+            "semantic_hash_both": "fbf559c15b61e310",
+            "key_level_diff": "ONLY [port].last_validated_* (promotion records) and [gates].device_gate / device_gate_history (device-gate result records). No contract key differs (verified key-by-key with tomllib: version/phase/policy_mode, [termux], [sandbox], [rules] r1-r9b, [gates] contracts, [forbidden] all identical)."
+          },
+          "build_impact_proof": "port.toml has no reader in the build chain: prepare_recipe.py copies it verbatim into the recipe BUILDER_DIR as an audit ledger (shutil.copy2); the generated port hook executes only chromium_sandbox_port.py + rule-count checks; ci.sh/gate scripts do not parse it; BUILDER_DIR contents are not packaged into the DEB. Excluding its audit records therefore cannot skip a build whose real inputs changed: any change to contract keys (or any byte of the four raw files) still moves the signature.",
+          "raw_files_note": "git blob ids (proof of byte-identity between build commit and main); the v2 hash uses sha256(file bytes)[:40] content fingerprints of these SAME bytes",
+          "v2_port_inputs_hash_both_commits": "7f86b30313338792"
+        }
+      },
+      "port_inputs_formula": "sha256(\"\\n\".join([\"sigv2\", fp(port/chromium_sandbox_port.py), fp(port/prepare_recipe.py), fp(port/gnp_shim.c), fp(port/ci.sh), \"port.toml@semantic-v2:\"+semantic_hash]) + \"\\n\")[:16]; fp = sha256(file bytes)[:40]; semantic_hash = sha256(\"port-toml-v2:\"+canonical_json)[\"..16\"] over all keys EXCEPT the TOML_METADATA_ONLY audit denylist"
+    }
+  ]
+}

@@ -214,5 +214,130 @@ check('[26] approval origin in serialized plan', ser.get('approval',{}).get('iss
 stA,_=M.apply_result(stB,ser,{'success':False,'stage':'gate','log_tail':'x','ci_run':1,'ci_url':'https://x'},'t')
 entA=list(stA['blocked'].values())[0]
 check('[26b] consumed via serialized plan only', entA['retry_approved'] is False and 11 in (entA.get('approval_consumed_issues') or []))
+
+# ================= Round 16 — signature schema v2 (Stage B/C) ==============
+REAL_TOML = open(os.path.join(os.path.dirname(__file__), '..', 'port.toml')).read()
+_blob = {f: 'b'*40 for f in M.PORT_RAW_FILES}
+_h0 = M.port_toml_semantic_sha(REAL_TOML)
+def _swap(text, key, newval):
+    import re as _r2
+    return _r2.sub(r'(?m)^%s = .*$$' % key, '%s = %s' % (key, newval), text, count=1)
+# [R1] audit-record (promotion) edits do NOT move the semantic hash
+_r1 = _swap(REAL_TOML, 'last_validated_promoted', '"changed by a robot tomorrow"')
+check('[R1] metadata-only (last_validated_*) edit -> same semantic hash',
+      M.port_toml_semantic_sha(_r1) == _h0)
+# [R2] device-gate record edits do NOT move the semantic hash
+_r2 = REAL_TOML.replace('device_gate = "PASS', 'device_gate = "PASS (hypothetical future record)')
+check('[R2] device_gate record edit -> same semantic hash',
+      M.port_toml_semantic_sha(_r2) == _h0)
+# [R3] a security-contract edit MUST move the hash
+_r3 = REAL_TOML.replace('setuid_sandbox', 'setuid_sandbox_X')
+check('[R3] contract key rename ([sandbox]) -> hash changes',
+      M.port_toml_semantic_sha(_r3) != _h0)
+_r3b = REAL_TOML.replace('require_bpf_policy = true', 'require_bpf_policy = false')
+check('[R3b] require_bpf_policy true->false -> hash changes',
+      M.port_toml_semantic_sha(_r3b) != _h0 and _r3b != REAL_TOML)
+# [R4] NEW/unclassified keys are hashed by DEFAULT (conservative inclusion)
+_r4 = REAL_TOML.replace('[forbidden]', 'newly_observed_contract = "x"\n[forbidden]')
+check('[R4] new unclassified contract key -> hash changes (never silently ignored)',
+      M.port_toml_semantic_sha(_r4) != _h0)
+# [R5] determinism + canonicalization insensitivity (layout/comments/order)
+check('[R5] same text twice -> same hash (determinism)',
+      _h0 == M.port_toml_semantic_sha(REAL_TOML))
+_r5c = REAL_TOML.replace('[sandbox]', '# an added comment does not sign\n[sandbox]')
+check('[R5b] comment-only edit -> same semantic hash',
+      M.port_toml_semantic_sha(_r5c) == _h0)
+check('[R5c] port_inputs_hash deterministic',
+      M.port_inputs_hash(_blob, REAL_TOML) == M.port_inputs_hash(dict(_blob), REAL_TOML))
+# [R6] a missing raw input is a sentinel, not a silent collision
+_b2 = dict(_blob); _b2.pop('port/ci.sh')
+check('[R6] missing raw file -> distinct hash (MISSING sentinel)',
+      M.port_inputs_hash(_b2, REAL_TOML) != M.port_inputs_hash(_blob, REAL_TOML))
+# [R7] v1 frozen reproduction of the rev-2 baseline; v1 != v2 for same inputs
+check('[R7] legacy v1 sig reproduces bit-exact (rev-2 baseline)',
+      M.build_signature('156.0.8078.47', '7c5c20eb1182e197', '34b799517be2a99a',
+                        'd98814c2a3feee8a', sig_version=1) == 'ad5b0fdb8c7a9777')
+_v2 = M.build_signature('156.0.8078.47', '7c5c20eb1182e197', '34b799517be2a99a', '7f86b30313338792')
+check('[R7b] v2 schema-tagged and distinct from v1', _v2 == '35af420388ac5a5f'
+      and _v2 != M.build_signature('156.0.8078.47', '7c5c20eb1182e197',
+                                   '34b799517be2a99a', '7f86b30313338792', sig_version=1))
+try:
+    M.build_signature('1', '2', '3', '4', sig_version=99); _r8 = False
+except ValueError:
+    _r8 = True
+check('[R8] unsupported sig_version rejected', _r8)
+# [R9] decide + migration: v1 last_success is SKIPPED only with fresh proof
+def _mig_entry(**over):
+    e = {'id': 't-rev2', 'status': 'approved', 'from_sig': 'ad5b0fdb8c7a9777',
+         'from_sig_version': 1, 'to_sig_version': 2,
+         'aligned_version': '156.0.8078.47', 'recipe_sha': 'R1', 'host_sha': 'H1',
+         'port_inputs_hash_v2': 'PORT-V2'}
+    e.update(over); return e
+sM = base_state()
+sM['last_successful_build']['signature'] = 'ad5b0fdb8c7a9777'
+plM = M.decide(sM, probes(), 'PORT-V2', 't', [], None, [_mig_entry()])
+check('[R9] migration-equivalent identical inputs -> skip (never a build)',
+      plM['action'] == 'skip' and plM['reason'] == 'identical-inputs-already-built'
+      and any('migration active' in d for d in plM['diagnostics']), plM['reason'])
+# [R10] recipe drift invalidates equivalence -> real build (detection intact)
+plM2 = M.decide(sM, probes(recipe_sha='R2'), 'PORT-V2', 't', [], None, [_mig_entry()])
+check('[R10] pinned component differs -> NO equivalence -> build',
+      plM2['action'] == 'build' and plM2['reason'] == 'inputs-changed-revision-build', plM2['reason'])
+# [R11] revoked entry grants nothing
+plM3 = M.decide(sM, probes(), 'PORT-V2', 't', [], None, [_mig_entry(status='revoked')])
+check('[R11] revoked migration -> build (equivalence withdrawn)',
+      plM3['action'] == 'build')
+# [R12] malformed entry is rejected (no crash, no equivalence)
+plM4 = M.decide(sM, probes(), 'PORT-V2', 't', [], None,
+                [_mig_entry(from_sig='ZZZZ')])
+check('[R12] malformed from_sig in-memory entry ignored',
+      plM4['action'] == 'build')
+# [R13] candidate list honours equivalence too (last is NOT equivalent here)
+sC = copy.deepcopy(sM)
+sC['last_successful_build']['signature'] = 'ffffffffffffffff'
+sC['candidates'] = [{'upstream_version': '156.0.8078.47',
+                     'status': 'BUILD_VERIFIED_CANDIDATE',
+                     'signature': 'ad5b0fdb8c7a9777'}]
+plC = M.decide(sC, probes(), 'PORT-V2', 't', [], None, [_mig_entry()])
+check('[R13] equivalent candidate signature -> identical-candidate skip',
+      plC['reason'] == 'identical-candidate-already-built', plC['reason'])
+# [R14] a v1-keyed BLOCK still blocks the equivalent v2 inputs (fail-safe)
+sBl = copy.deepcopy(sM)
+sBl['last_successful_build']['signature'] = 'ffffffffffffffff'
+sBl['blocked'] = {'ad5b0fdb8c7a9777': {'classification': 'port',
+                                       'issue': 7, 'retry_approved': False}}
+plB = M.decide(sBl, probes(), 'PORT-V2', 't', [], None, [_mig_entry()])
+check('[R14] v1 block honoured via equivalence (blocked-dedup)',
+      plB['action'] == 'skip' and plB['reason'] == 'blocked-dedup', plB['reason'])
+# [R15] open issue titled with v1 sig still dedups (lost-state repair)
+sIs = base_state()
+sIs['last_successful_build']['signature'] = 'ffffffffffffffff'
+plI = M.decide(sIs, probes(), 'PORT-V2', 't', [{'number': 9,
+      'title': '[auto-build] Chromium 156.0.8078.47 revision 2 blocked (gate, sig ad5b0fdb8c7a9777)',
+      'labels': ['auto-build-blocked']}], None, [_mig_entry()])
+check('[R15] open issue with v1 sig dedups via equivalence',
+      plI['action'] == 'skip' and plI['reason'] == 'open-issue-exists', plI['reason'])
+# [R16] load_migrations fail-closed on malformed JSON; absent file is safe
+with open('._mig_bad.json', 'w') as _f: _f.write('{"migrations": [oops')
+_, _err = M.load_migrations('._mig_bad.json')
+os.unlink('._mig_bad.json')
+check('[R16] malformed migrations JSON -> error (caller aborts)', _err is not None)
+_, _err2 = M.load_migrations('does-not-exist.json')
+check('[R16b] absent migrations file -> no error, no equivalence (safe: builds)',
+      _err2 is None)
+# [R17] CLI end-to-end fail-closed on bad migrations file
+with open('._mig_bad2.json', 'w') as _f: _f.write('not json at all')
+_stf = _os.path.join(_os.getcwd(), '._st.json')
+json.dump(base_state(), open(_stf, 'w')); json.dump(probes(), open('._pr.json', 'w'))
+rc_cli = M.main(['decide', '--state', _stf, '--probes', '._pr.json',
+                 '--out', '._out.json', '--port-sha', 'x',
+                 '--migrations', '._mig_bad2.json'])
+os.unlink('._mig_bad2.json'); os.unlink(_stf); os.unlink('._pr.json')
+check('[R17] CLI decide with corrupt migrations -> rc!=0 (no plan, no build)',
+      rc_cli == 1)
+# [R18] golden values pinned from the real rev-2 provenance (canary)
+check('[R18] golden semantic hash of current port.toml', _h0 == 'fbf559c15b61e310', _h0)
+_rc = M.main(['port-input-hash', '--root', os.path.join(os.path.dirname(__file__), '..', '..')])
+check('[R18b] golden v2 port-input hash via CLI (repo tree)', _rc == 0)
 print(f'MAINTENANCE-TESTS PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)

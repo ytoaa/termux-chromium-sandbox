@@ -40,7 +40,14 @@ and invites a PR. This project is that attempt.
   PROMOTION):** the daily workflow runs on schedule at **09:23 KST**
   (00:23 UTC; GitHub may delay — timing is an expectation, not a gate).
   Automated per run: upstream/recipe detection, validated/state compare,
-  changed-input detection, build-signature computation, duplicate skip,
+  changed-input detection, build-signature computation (schema v2: the four
+  raw port contract files by content fingerprint + `port.toml` SEMANTICALLY
+  — human audit records `[port].last_validated_*` and
+  `[gates].device_gate(_history)` are excluded as provably build-irrelevant;
+  every other key, including new/unclassified ones, is hashed, so real
+  contract edits always trigger rebuilds; v1 history is never rewritten —
+  equivalence for the validated rev-2 baseline is re-proven every run from
+  the audited `maintenance/signature-migrations.json`), duplicate skip,
   R1~R9b security gate, conditional CANDIDATE CI build, artifact capture,
   failure classification, deduplicated block Issues, candidate recording.
   NEVER automated: device installation/gates, validated promotion,
@@ -52,6 +59,10 @@ and invites a PR. This project is that attempt.
   `approve_retry=true` dispatch; recovery runs are idempotent (signature
   dedup + serial concurrency). Manual entry points remain:
   `gh workflow run daily-maintenance.yml -f dry_run=true|false`.
+  **Manual dispatch is fail-closed:** omitting `dry_run` (or passing any
+  value other than explicit `false`) runs DRY-ONLY; a real candidate build
+  from dispatch requires the explicit `-f dry_run=false` go-ahead, and
+  unsupported events can never reach the build path.
   Device-gate procedure and validated promotion policy: port/DESIGN.md.
 
 - **Current validated baseline (2026-10-25):** `chromium-sandboxed

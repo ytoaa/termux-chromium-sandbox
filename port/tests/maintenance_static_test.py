@@ -148,25 +148,42 @@ check('[s42] called-job name parsing splits on last slash',
 check('[s43] log download errors surfaced not hidden',
       'log download failed (job id' in _dwt)
 _mode=[st for st in _dwj['evaluate']['steps'] if st.get('id')=='mode']
-_mtxt=_mode[0]['run'] if _mode else ''
+_mstep=_mode[0] if _mode else {}
+_mtxt=_mstep.get('run','')
+_menv=_mstep.get('env') or {}
 def _run_mode(event, dry_val, appr_val):
-    body=_mtxt.replace('${{ github.event_name }}',event)\
-             .replace('${{ inputs.dry_run }}',dry_val)\
-             .replace('${{ inputs.approve_retry }}',appr_val)
-    import tempfile as _tf2
-    gh_out=_tf2.mktemp()
+    # Faithful simulation: GHK resolves the step-level env expressions to
+    # STRINGS before bash ever sees them; the body only reads shell vars.
+    gh_out=_tf.mktemp()
     open(gh_out,'w').close()
-    out=_sp.run(['bash','-c',body],capture_output=True,text=True,
-                env=dict(os.environ,GITHUB_OUTPUT=gh_out))
+    resolved={}
+    for k,v in _menv.items():
+        v=str(v)
+        v=v.replace('${{ github.event_name }}',event)
+        v=v.replace('${{ inputs.dry_run }}',dry_val)
+        v=v.replace('${{ inputs.approve_retry }}',appr_val)
+        resolved[k]=v
+    out=_sp.run(['bash','-c',_mtxt],capture_output=True,text=True,
+                env=dict(os.environ,GITHUB_OUTPUT=gh_out,**resolved))
     kv=dict(l.split('=',1) for l in open(gh_out).read().splitlines() if '=' in l)
     try: os.unlink(gh_out)
     except OSError: pass
     return kv, out.returncode
+check('[s44-sig] mode step reads inputs ONLY via env (no inline ${{ }) in body',
+      '${{' not in _mtxt and set(_menv)>= {'EVENT_NAME','IN_DRY_RUN','IN_APPROVE_RETRY'})
 kv,rc=_run_mode('schedule','','');   check('[s44a] schedule -> dry=false approve=false rc0', rc==0 and kv.get('dry')=='false' and kv.get('approve')=='false', str(kv))
 kv,rc=_run_mode('workflow_dispatch','true','false'); check('[s44b] dispatch dry_run=true -> dry=true', rc==0 and kv.get('dry')=='true' and kv.get('approve')=='false', str(kv))
-kv,rc=_run_mode('workflow_dispatch','',''); check('[s44c] dispatch absent -> dry=false (fail-safe manual)', rc==0 and kv.get('dry')=='false', str(kv))
-kv,rc=_run_mode('workflow_dispatch','false','true'); check('[s44d] approve_retry=true only via dispatch', rc==0 and kv.get('approve')=='true' and kv.get('dry')=='false', str(kv))
-kv,rc=_run_mode('schedule','true','true'); check('[s44e] schedule IGNORES stray input strings (approve never true on schedule)', rc==0 and kv.get('approve')=='false', str(kv))
+kv,rc=_run_mode('workflow_dispatch','',''); check('[s44c] dispatch dry_run MISSING -> dry=true (fail-closed)', rc==0 and kv.get('dry')=='true', str(kv))
+kv,rc=_run_mode('workflow_dispatch','false','true'); check('[s44d] explicit dry_run=false -> build allowed; approve only via dispatch', rc==0 and kv.get('approve')=='true' and kv.get('dry')=='false', str(kv))
+kv,rc=_run_mode('schedule','true','true'); check('[s44e] schedule IGNORES stray inputs (approve forced false)', rc==0 and kv.get('approve')=='false' and kv.get('dry')=='false', str(kv))
+kv,rc=_run_mode('workflow_dispatch','yes','true'); check('[s44f] dispatch INVALID dry_run value -> build forbidden', rc==0 and kv.get('dry')=='true', str(kv))
+kv,rc=_run_mode('workflow_dispatch','null','true'); check('[s44g] dispatch dry_run=null-string -> build forbidden', rc==0 and kv.get('dry')=='true', str(kv))
+kv,rc=_run_mode('workflow_dispatch','False',''); check('[s44h] dispatch False (capitalized) explicit -> build allowed; approve missing -> false', rc==0 and kv.get('dry')=='false' and kv.get('approve')=='false', str(kv))
+kv,rc=_run_mode('repository_dispatch','false','true'); check('[s44i] UNSUPPORTED event -> build forbidden regardless of inputs', rc==0 and kv.get('dry')=='true' and kv.get('approve')=='false', str(kv))
+kv,rc=_run_mode('schedule','false','true'); check('[s44j] schedule stray dry_run=false ignored (still auto)', rc==0 and kv.get('dry')=='false' and kv.get('approve')=='false', str(kv))
+_first_dry=[l.strip() for l in _mtxt.splitlines() if l.strip().startswith('DRY=')]
+check('[s47] mode step initialises FAIL-CLOSED (first DRY assignment is true)',
+      bool(_first_dry) and _first_dry[0]=='DRY=true', str(_first_dry[:1]))
 check('[s45] no implicit GHK boolean coercion patterns remain',
       'inputs.dry_run !=' not in _dwt and 'inputs.approve_retry }}" = ' not in _dwt)
 # s46: YAML duplicate-key guard (GHK/GitHub rejects duplicates; pyyaml
@@ -198,5 +215,42 @@ try:
           _r.returncode==0 and 'NODUP-OK' in _r.stdout, (_r.stdout+_r.stderr)[:150])
 except Exception as _ex:
     check('[s46] workflows contain no duplicate YAML keys', False, repr(_ex))
+# s48 (Round 16): signature-schema v2 wiring — semantic port-input hash +
+# audited v1→v2 migration file, with the legacy raw-5-blob loop retired.
+_migf=ROOT+'/../maintenance/signature-migrations.json'
+try:
+    _mig=json.load(open(_migf))
+    _ms=_mig.get('migrations') or []
+    _m0=_ms[0] if _ms else {}
+    _prov=_m0.get('provenance') or {}
+    check('[s48] migrations file: approved v1->v2 entry pinning rev-2 baseline (from_sig ad5b0fdb8c7a9777, ci 40104615699), never rewriting history',
+          _mig.get('schema')==1 and len(_ms)==1 and _m0.get('status')=='approved'
+          and _m0.get('from_sig')=='ad5b0fdb8c7a9777'
+          and _m0.get('from_sig_version')==1 and _m0.get('to_sig_version')==2
+          and _m0.get('aligned_version')=='156.0.8078.47'
+          and _m0.get('recipe_sha')=='7c5c20eb1182e197'
+          and _m0.get('host_sha')=='34b799517be2a99a'
+          and all(_re.fullmatch(r'[0-9a-f]{16}',_m0.get(k) or '')
+                  for k in ('port_inputs_hash_v2',))
+          and _prov.get('build_ci_run')==40104615699
+          and _prov.get('deb_sha256','').startswith('cf2cb2a8')
+          and _prov.get('build_commit')=='554da59a8f021bc65f9c3aab4c25841a0768f373',
+          json.dumps(_m0)[:120])
+except Exception as _mx:
+    check('[s48] migrations file: approved v1->v2 entry pinning rev-2 baseline', False, repr(_mx))
+_decstep=[st for st in _dwj['evaluate']['steps'] if st.get('id')=='decide']
+_dtxt=_decstep[0]['run'] if _decstep else ''
+check('[s48b] decide uses v2 port-input-hash + migrations; legacy raw-5-blob loop removed',
+      'maintenance.py port-input-hash' in _dtxt
+      and '--migrations maintenance/signature-migrations.json' in _dtxt
+      and 'for f in port/chromium_sandbox_port.py' not in _dwt)
+_msrc=open(ROOT+'/maintenance.py').read()
+check('[s48c] engine denylist is EXACT (new keys hash by default) and documented in DESIGN',
+      "'last_validated_promoted'" in _msrc and "'device_gate_history'" in _msrc
+      and 'TOML_METADATA_ONLY' in _msrc
+      and 'Signature schema v2' in open(ROOT+'/DESIGN.md').read())
+check('[s48d] engine keeps v1 frozen (sig_version=1 path) and tags v2 payload',
+      "if sig_version == 1" in _msrc and "'sigv2'" in _msrc
+      and "unsupported signature schema" in _msrc)
 print(f'MAINTENANCE-STATIC PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)
