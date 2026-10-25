@@ -41,10 +41,16 @@ check('[s17] validated never written by workflow', 'last_validated' not in dj)
 seed=json.load(open(os.path.join(ROOT,'..','maintenance/state.seed.json')))
 with open(os.path.join(ROOT,'port.toml'),'rb') as f: t=tomllib.load(f)
 p=t['port']
-check('[s18] seed agrees with validated ledger', seed['validated']['upstream_version']==p['last_validated_chromium'] and seed['validated']['port_sha'].startswith('403274f') and p['phase']=='validated' and p['last_validated_port']=='0.1.0')
-check('[s18b] seed #31 uses REAL plain deb version (no retro -1)', seed['last_successful_build']['package_version']=='156.0.8078.47' and seed['last_successful_build'].get('deb_version')=='156.0.8078.47' and seed['candidates'][0]['package_version']=='156.0.8078.47')
-check('[s19] seed deb sha matches #31', seed['validated']['deb_sha256'].startswith('29c4080d') and seed['last_successful_build']['deb_sha256']==seed['validated']['deb_sha256'])
-check('[s20] seed records #31 as first success', seed['last_successful_build']['ci_run']==39976822670 and seed['last_successful_build']['status']=='BUILD_VERIFIED_CANDIDATE')
+check('[s18] seed agrees with validated ledger (promoted -2 baseline)', seed['validated']['upstream_version']==p['last_validated_chromium'] and seed['validated']['port_sha']==p['last_validated_port_commit'] and seed['validated'].get('deb_version')==p['last_validated_deb_version'] and seed['validated']['termux_sha']==p['last_validated_termux_sha'] and p['phase']=='validated' and p['last_validated_port']=='0.1.0')
+check('[s18b] seed: #31 plain preserved as history; last_successful + validated == promoted -2 baseline',
+      seed['candidates'][0]['package_version']=='156.0.8078.47'
+      and seed['last_successful_build']['package_version']=='156.0.8078.47-2'
+      and seed['validated'].get('deb_version')=='156.0.8078.47-2'
+      and seed['validated']['deb_sha256']=='cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d'
+      and seed['validated']['ci_run']==40104615699
+      and seed['last_successful_build'].get('artifact_verified') is True)
+check('[s19] seed deb sha == promoted baseline AND #31 preserved as history', seed['validated']['deb_sha256']==p['last_validated_deb_sha256'] and seed['last_successful_build']['deb_sha256']==seed['validated']['deb_sha256'] and seed['candidates'][0]['deb_sha256'].startswith('29c4080d'))
+check('[s20] seed records #31 in history AND last_success == promoted baseline', seed['candidates'][0]['ci_run']==39976822670 and seed['last_successful_build']['ci_run']==40104615699 and seed['last_successful_build']['status']=='BUILD_VERIFIED_CANDIDATE' and seed['last_successful_build'].get('validated') is True)
 
 check('[s21] maintenance.py never imports subprocess/os.system', True)  # structural: reviewed by test below
 src=open(os.path.join(ROOT,'maintenance.py')).read()
