@@ -445,33 +445,3 @@ jobs:
             if [ -f result.json ]; then echo "- classified: \`$(jq -c '{success,stage}' result.json)\`"; fi
             if [ -f ops.json ]; then echo "- issues created: $(jq '.create_issues|length' ops.json), comments: $(jq '.comment_issues|length' ops.json)"; fi
           } >> "$GITHUB_STEP_SUMMARY"
-
-  publish:
-    name: Publish CI-verified Pre-release
-    needs: [evaluate, build, outcome]
-    # Round 17 — ledger-gated publishing. ALL must hold: a REAL (non-dry)
-    # decided build, the called build succeeded, the outcome job succeeded
-    # AND recorded a verified candidate for this run, and the ledger-side
-    # metadata matches the build outputs byte-for-byte. action=skip,
-    # blocked-dedup, dry-run, failures or unrecorded candidates NEVER
-    # publish. A publish failure stays SEPARATE: maintenance-state, the
-    # candidate ledger and the build verdict are already committed and are
-    # never reclassified; only THIS job is retried (no Chromium rebuild).
-    if: needs.evaluate.result == 'success' && needs.evaluate.outputs.action == 'build'
-        && needs.evaluate.outputs.dry == 'false' && needs.build.result == 'success'
-        && needs.outcome.result == 'success' && needs.outcome.outputs.recorded == 'true'
-        && needs.build.outputs.deb_sha256 == needs.outcome.outputs.deb_sha256
-        && needs.build.outputs.deb_version == needs.outcome.outputs.deb_version
-    uses: ./.github/workflows/publish-release.yml
-    with:
-      source: maintenance
-      ci_run_id: ${{ github.run_id }}
-      artifact_name: build-${{ github.run_id }}
-      deb_version: ${{ needs.outcome.outputs.deb_version }}
-      deb_sha256: ${{ needs.outcome.outputs.deb_sha256 }}
-      termux_sha: ${{ needs.build.outputs.termux_sha }}
-      port_sha: ${{ needs.build.outputs.port_sha }}
-      build_signature: ${{ needs.outcome.outputs.signature }}
-      build_timestamp: ${{ needs.outcome.outputs.recorded_at }}
-    permissions:
-      contents: write
