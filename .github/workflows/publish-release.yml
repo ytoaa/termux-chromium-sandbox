@@ -58,13 +58,14 @@ on:
 permissions:
   contents: write   # the ONLY job in the repo with write; never issues/apt
 
-concurrency:
-  group: publish-release-${{ inputs.deb_version }}
-  cancel-in-progress: false
-
 jobs:
   publish:
     name: Verify + publish pre-release
+    # job-level concurrency (workflow-level cannot resolve `inputs` in
+    # reusable workflows — startup_failure observed on run 40217322460)
+    concurrency:
+      group: publish-release-${{ inputs.deb_version }}
+      cancel-in-progress: false
     runs-on: ubuntu-26.04
     timeout-minutes: 25
     permissions:
