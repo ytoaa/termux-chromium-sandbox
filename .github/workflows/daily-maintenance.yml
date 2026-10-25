@@ -215,14 +215,6 @@ jobs:
       contents: write   # ONLY the maintenance/state.json Contents-API commit
       issues: write     # deduplicated block issues
       actions: read     # job-level classification of the called workflow
-    outputs:
-      # Round 17 publish-gate facts: a verified candidate recorded for THIS
-      # run, exactly as the ledger says (never inferred by the publisher).
-      recorded: ${{ steps.gatefacts.outputs.recorded }}
-      deb_version: ${{ steps.gatefacts.outputs.deb_version }}
-      deb_sha256: ${{ steps.gatefacts.outputs.deb_sha256 }}
-      signature: ${{ steps.gatefacts.outputs.signature }}
-      recorded_at: ${{ steps.gatefacts.outputs.recorded_at }}
     steps:
       - uses: actions/checkout@v7
 
@@ -409,31 +401,6 @@ jobs:
             echo "::error::state file probe failed: $(tail -2 file.err)"; exit 1
           fi
           echo "state pushed"
-
-      - name: Export publish-gate facts
-        id: gatefacts
-        if: always()
-        run: |
-          set -euo pipefail
-          echo "recorded=false" >> "$GITHUB_OUTPUT"
-          [ -f result.json ] && [ -f state2.json ] || exit 0
-          [ "$(jq -r '.success' result.json)" = "true" ] || exit 0
-          ok=$(jq -r --argjson run "${{ github.run_id }}" '
-            (.last_successful_build // {}) as $b
-            | if ($b.ci_run == $run
-                  and ($b.status // "") == "BUILD_VERIFIED_CANDIDATE"
-                  and (($b.deb_sha256 // "") | test("^[0-9a-f]{64}$"))
-                  and (($b.deb_version // "") | length > 0)
-                  and (($b.signature // "") | test("^[0-9a-f]{16}$")))
-              then "true" else "false" end' state2.json)
-          [ "$ok" = "true" ] || exit 0
-          {
-            echo "recorded=true"
-            echo "deb_version=$(jq -r '.last_successful_build.deb_version' state2.json)"
-            echo "deb_sha256=$(jq -r '.last_successful_build.deb_sha256' state2.json)"
-            echo "signature=$(jq -r '.last_successful_build.signature' state2.json)"
-            echo "recorded_at=$(jq -r '.last_successful_build.recorded_at // ""' state2.json)"
-          } >> "$GITHUB_OUTPUT"
 
       - name: Summary
         if: always()

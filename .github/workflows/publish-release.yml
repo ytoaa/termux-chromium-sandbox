@@ -1,102 +1,36 @@
-# Round 17 (v2) — GitHub Pre-release publishing for CI-verified candidate DEBs.
+# Round 17 (v2 final) — GitHub Pre-release publishing for CI-verified DEBs.
 #
-# WHY A SEPARATE TOP-LEVEL WORKFLOW: this GitHub instance rejects ANY caller
-# job that carries `permissions:` while using `uses:` (startup_failure —
-# proven by bisection runs 40217322460..40218784660, revert PR #8). So both
-# entry points TRIGGER this workflow via `gh workflow run` from ordinary
-# jobs (actions:write is a legitimate ordinary-job scope) and the publisher
-# runs with its OWN top-level `permissions: contents: write` — granted
-# inside this file only, the single write scope in the repo.
+# WHY workflow_run: this GitHub instance REJECTS elevated `permissions`
+# (actions:write) on ordinary jobs and any caller-side `permissions:` on
+# `uses:` jobs with startup_failure (bisection runs 40217322460..
+# 40220026845; revert PR #8). `contents: write` at the TOP of a standalone
+# workflow is proven-accepted. So both entry points (nightly maintenance
+# run, direct manual build run) AUTO-TRIGGER this workflow on completion
+# with ZERO caller changes, and the publisher itself decides — fail-closed
+# and idempotently — whether a pre-release is due.
 #
-# Hard boundaries (unchanged from Round 17 spec):
+# Hard boundaries (Round 17 spec):
 #  * PRE-RELEASE only; stable/apt/validated are separate human approvals.
-#  * Publish state is SEPARATE from build state: never touches
-#    maintenance-state; its failure never reclassifies a build. Re-run THIS
-#    workflow (or wait for the next nightly) — never a Chromium rebuild.
-#  * Draft-first; tags/releases/assets are never clobbered, edited or deleted.
-#  * Event safety: workflow_dispatch inputs are ALL string-typed and
-#    required (except two optional metadata strings); every value is
-#    re-validated fail-closed by port/publish_release.py (exact string
-#    matching, no implicit coercion) — a caller that forgets an input gets
-#    an integrity refusal, never a publish.
+#  * Publish state SEPARATE from build state: never touches
+#    maintenance-state, never reclassifies a build. Publish failure = re-run
+#    THIS workflow's run (`gh run rerun <id>`) or wait for the nightly —
+#    never a Chromium rebuild; the artifact is already there.
+#  * Draft-first; tags/releases/assets never clobbered, edited or deleted.
+#  * Ledger gate re-executed by the publisher from maintenance-state:
+#    only a BUILD_VERIFIED_CANDIDATE recorded for THIS run id publishes.
+#    dry-run/skip/blocked/failed/branch runs => NO-OP success (nothing to
+#    publish) — never an accidental release.
 name: Publish Pre-release
 
 on:
-  workflow_dispatch:
-    inputs:
-      source:
-        description: caller identity (maintenance|manual)
-        required: true
-        type: choice
-        options: [maintenance, manual]
-      ci_run_id:
-        description: run whose artifact is published (ownership audited)
-        required: true
-        type: string
-      artifact_name:
-        description: exact Actions artifact name
-        required: true
-        type: string
-      deb_version:
-        description: dpkg Version from the build outputs
-        required: true
-        type: string
-      deb_sha256:
-        description: DEB sha256 from the build outputs
-        required: true
-        type: string
-      termux_sha:
-        description: pinned termux-packages commit (40hex)
-        required: true
-        type: string
-      port_sha:
-        description: repo commit the DEB was built from (40hex)
-        required: true
-        type: string
-      build_signature:
-        description: maintenance build signature (16hex); empty on manual runs
-        required: false
-        type: string
-        default: ''
-      build_timestamp:
-        description: candidate recorded_at timestamp (may be empty)
-        required: false
-        type: string
-        default: ''
-  workflow_call:
-    inputs:
-      source:
-        type: string
-        required: true
-      ci_run_id:
-        type: string
-        required: true
-      artifact_name:
-        type: string
-        required: true
-      deb_version:
-        type: string
-        required: true
-      deb_sha256:
-        type: string
-        required: true
-      termux_sha:
-        type: string
-        required: true
-      port_sha:
-        type: string
-        required: true
-      build_signature:
-        type: string
-        required: false
-        default: ''
-      build_timestamp:
-        type: string
-        required: false
-        default: ''
+  workflow_run:
+    workflows:
+      - Daily Maintenance
+      - Build Termux Chromium Seccomp Sandbox Port
+    types: [completed]
 
 permissions:
-  contents: write   # the ONLY write scope in the repo; never issues/apt
+  contents: write   # the ONLY write scope in the repo (top-level, standalone)
 
 concurrency:
   group: publish-release-queue
@@ -104,95 +38,172 @@ concurrency:
 
 jobs:
   publish:
-    name: Verify + publish pre-release
+    name: Classify + verify + publish pre-release
+    # Only SUCCESSFUL completions of the two build-capable workflows on the
+    # DEFAULT branch. workflow_call builds belong to the CALLER run
+    # ('Daily Maintenance'), so maintenance builds flow through here after
+    # the ledger push — publish-before-ledger is structurally impossible.
+    if: github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.head_branch == github.event.repository.default_branch
     runs-on: ubuntu-26.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
+      # Publisher code is pinned from the default branch (supply-chain),
+      # NOT from the triggered run's commit (which may be any ref).
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
-      - name: Resolve inputs (fail-closed explicit strings; workflow-level env cannot read inputs)
-        id: in
+      - name: Classify trigger event (manual vs maintenance; fail-closed no-op otherwise)
+        id: cls
         env:
-          I_SOURCE: ${{ github.event.inputs.source || inputs.source }}
-          I_CI_RUN_ID: ${{ github.event.inputs.ci_run_id || inputs.ci_run_id }}
-          I_ARTIFACT_NAME: ${{ github.event.inputs.artifact_name || inputs.artifact_name }}
-          I_DEB_VERSION: ${{ github.event.inputs.deb_version || inputs.deb_version }}
-          I_DEB_SHA256: ${{ github.event.inputs.deb_sha256 || inputs.deb_sha256 }}
-          I_TERMUX_SHA: ${{ github.event.inputs.termux_sha || inputs.termux_sha }}
-          I_PORT_SHA: ${{ github.event.inputs.port_sha || inputs.port_sha }}
-          I_BUILD_SIGNATURE: ${{ github.event.inputs.build_signature || inputs.build_signature }}
-          I_BUILD_TIMESTAMP: ${{ github.event.inputs.build_timestamp || inputs.build_timestamp }}
+          WF: ${{ github.event.workflow_run.name }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+          BUILD_INPUTS_PUBLISH: ${{ github.event.workflow_run.inputs.publish }}
         run: |
           set -euo pipefail
-          # workflow_call runs expose the same values via the inputs
-          # context rendered into these env vars by GitHub; for
-          # workflow_dispatch this is exact string passthrough.
-          {
-            echo "source=${I_SOURCE:-}"
-            echo "ci_run_id=${I_CI_RUN_ID:-}"
-            echo "artifact_name=${I_ARTIFACT_NAME:-}"
-            echo "deb_version=${I_DEB_VERSION:-}"
-            echo "deb_sha256=${I_DEB_SHA256:-}"
-            echo "termux_sha=${I_TERMUX_SHA:-}"
-            echo "port_sha=${I_PORT_SHA:-}"
-            echo "build_signature=${I_BUILD_SIGNATURE:-}"
-            echo "build_timestamp=${I_BUILD_TIMESTAMP:-}"
-            echo "tag=chromium-sandboxed-v${I_DEB_VERSION:-}"
-          } >> "$GITHUB_OUTPUT"
-          # minimal shape guards (the publisher owns full integrity)
-          case "${I_DEB_VERSION:-}" in
-            ''|*[!0-9A-Za-z.-]*) echo "::error::deb_version malformed"; exit 1 ;;
+          source=''
+          case "$WF" in
+            "Daily Maintenance")
+              source='maintenance' ;;
+            "Build Termux Chromium Seccomp Sandbox Port")
+              # direct manual build only (dispatch/schedule top-level runs);
+              # a workflow_dispatch of DAILY whose called build failed never
+              # reaches here (its run failed). Manual opt-out via the build
+              # workflow's publish=false dispatch input (run.inputs.publish).
+              case "$BUILD_INPUTS_PUBLISH" in
+                false|False|FALSE)
+                  echo "manual run $RUN_ID opted out (publish=false) — no-op" >> "$GITHUB_STEP_SUMMARY"
+                  echo "skip=true" >> "$GITHUB_OUTPUT"
+                  echo "reason=opt-out" >> "$GITHUB_OUTPUT"
+                  exit 0 ;;
+              esac
+              source='manual' ;;
+            *)
+              echo "unhandled workflow '$WF' — no-op" >> "$GITHUB_STEP_SUMMARY"
+              echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
           esac
-          case "${I_CI_RUN_ID:-}" in
-            ''|*[!0-9]*) echo "::error::ci_run_id malformed"; exit 1 ;;
-          esac
+          case "$RUN_ID" in ''|*[!0-9]*) echo "::error::run id malformed"; exit 1;; esac
+          case "$RUN_HEAD" in *[!0-9a-f]*|'') echo "::error::head sha malformed"; exit 1;; esac
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "run_head=$RUN_HEAD" >> "$GITHUB_OUTPUT"
+          echo "artifact=build-$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "classification: source=$source run=$RUN_ID"
 
-      - name: Provenance audit — run + artifact ownership (fail closed)
+      - name: Provenance audit + ledger gate (fail closed; re-executed here)
+        if: steps.cls.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.cls.outputs.run_id }}
+          SOURCE: ${{ steps.cls.outputs.source }}
         run: |
           set -euo pipefail
-          gh api "repos/${{ github.repository }}/actions/runs/${{ steps.in.outputs.ci_run_id }}" > run.json
+          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID" > run.json
           jq -e '.status=="completed" and .conclusion=="success"' run.json >/dev/null
-          jq -e '(.name=="Build Termux Chromium Seccomp Sandbox Port")
-                 or (.name=="Daily Maintenance")' run.json >/dev/null
-          gh api "repos/${{ github.repository }}/actions/runs/${{ steps.in.outputs.ci_run_id }}/artifacts" > artifacts.json
-          jq -e --arg n "${{ steps.in.outputs.artifact_name }}" \
+          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" > artifacts.json
+          jq -e --arg n "build-$RUN_ID" \
             '[.artifacts[] | select(.name==$n and .expired==false)] | length == 1' \
             artifacts.json >/dev/null
-          echo "provenance ok: run ${{ steps.in.outputs.ci_run_id }} succeeded; artifact ${{ steps.in.outputs.artifact_name }} owned"
+          if [ "$SOURCE" = "maintenance" ]; then
+            # THE LEDGER IS THE GATE: the outcome job has already pushed a
+            # BUILD_VERIFIED_CANDIDATE for this exact run id (dry-run/skip/
+            # blocked/failed/lost-push all fail this check -> no-op).
+            if ! gh api "repos/${{ github.repository }}/contents/maintenance/state.json?ref=maintenance-state" \
+                 --jq .content > state.b64 2>state.err; then
+              if grep -qiE 'Not Found|No commit found' state.err; then
+                echo "no maintenance-state yet — nothing published" >> "$GITHUB_STEP_SUMMARY"
+                echo "SKIP_REMAIN=true" >> "$GITHUB_ENV"; exit 0
+              fi
+              echo "::error::state probe failed (not a 404) — fail closed"; tail -2 state.err; exit 1
+            fi
+            base64 -d state.b64 > state.json
+            ok=$(jq -r --argjson id "$RUN_ID" '
+              (.last_successful_build // {}) as $b
+              | if ($b.ci_run == $id
+                    and ($b.status // "") == "BUILD_VERIFIED_CANDIDATE"
+                    and (($b.deb_sha256 // "") | test("^[0-9a-f]{64}$"))
+                    and (($b.deb_version // "") | length > 0)
+                    and (($b.signature // "") | test("^[0-9a-f]{16}$")))
+                then "true" else "false" end' state.json)
+            if [ "$ok" != "true" ]; then
+              echo "no verified candidate for run $RUN_ID (dry-run/skip/unrecorded) — no-op" >> "$GITHUB_STEP_SUMMARY"
+              echo "SKIP_REMAIN=true" >> "$GITHUB_ENV"; exit 0
+            fi
+            {
+              echo "EXPECT_VERSION=$(jq -r '.last_successful_build.deb_version' state.json)"
+              echo "EXPECT_SHA=$(jq -r '.last_successful_build.deb_sha256' state.json)"
+              echo "EXPECT_SIG=$(jq -r '.last_successful_build.signature' state.json)"
+              echo "EXPECT_TERMUX=$(jq -r '.last_successful_build.termux_sha // ""' state.json)"
+              echo "EXPECT_TS=$(jq -r '.last_successful_build.recorded_at // ""' state.json)"
+            } >> "$GITHUB_ENV"
+          else
+            # manual path: no ledger contract; expectations derive from the
+            # artifact itself (dpkg identity + measured sha) during verify.
+            echo "SKIP_REMAIN=false" >> "$GITHUB_ENV"
+            echo "EXPECT_VERSION=" >> "$GITHUB_ENV"
+            echo "EXPECT_SHA=" >> "$GITHUB_ENV"
+            echo "EXPECT_SIG=" >> "$GITHUB_ENV"
+            echo "EXPECT_TERMUX=" >> "$GITHUB_ENV"
+            echo "EXPECT_TS=" >> "$GITHUB_ENV"
+          fi
+          echo "SKIP_REMAIN=false" >> "$GITHUB_ENV"
 
-      - uses: actions/download-artifact@v4
+      - name: Download candidate artifact (pinned to the audited run)
+        if: env.SKIP_REMAIN != 'true'
+        uses: actions/download-artifact@v4
         with:
-          name: ${{ steps.in.outputs.artifact_name }}
+          name: ${{ steps.cls.outputs.artifact }}
           repository: ${{ github.repository }}
-          run-id: ${{ steps.in.outputs.ci_run_id }}
+          run-id: ${{ steps.cls.outputs.run_id }}
           path: artifact
 
-      - name: Integrity verification (Stage C — fail closed)
+      - name: Integrity verification (self-derives expectations from artifact; ledger values re-checked)
+        if: env.SKIP_REMAIN != 'true'
+        id: derive
         run: |
           set -euo pipefail
+          deb=$(find artifact -name 'chromium-sandboxed_*_aarch64.deb' | head -1)
+          test -n "$deb" || { echo "::error::no deb in artifact"; exit 1; }
+          ver=$(dpkg-deb -f "$deb" Version)
+          sha=$(sha256sum "$deb" | cut -d' ' -f1)
+          pin=$(find artifact -name termux-pin.txt | head -1 || true)
+          tsha="${EXPECT_TERMUX:-}"
+          if [ -z "$tsha" ] && [ -n "$pin" ]; then tsha=$(tr -d '[:space:]' < "$pin"); fi
+          # ledger cross-check (maintenance): derived == recorded or refuse
+          if [ -n "${EXPECT_VERSION:-}" ] && { [ "$ver" != "$EXPECT_VERSION" ] || [ "$sha" != "$EXPECT_SHA" ]; }; then
+            echo "::error::artifact ($ver/$sha) != ledger ($EXPECT_VERSION/$EXPECT_SHA) — refusing"; exit 1
+          fi
+          {
+            echo "deb_version=$ver"
+            echo "deb_sha256=$sha"
+            echo "termux_sha=$tsha"
+          } >> "$GITHUB_OUTPUT"
           python3 port/publish_release.py verify \
             --artifact-dir artifact \
-            --deb-version '${{ steps.in.outputs.deb_version }}' \
-            --deb-sha256 '${{ steps.in.outputs.deb_sha256 }}' \
-            --termux-sha '${{ steps.in.outputs.termux_sha }}' \
-            --port-sha '${{ steps.in.outputs.port_sha }}' \
-            --source '${{ steps.in.outputs.source }}' \
-            --ci-run-id '${{ steps.in.outputs.ci_run_id }}' \
-            --ci-run-url "https://github.com/${{ github.repository }}/actions/runs/${{ steps.in.outputs.ci_run_id }}" \
-            --artifact-name '${{ steps.in.outputs.artifact_name }}' \
-            --build-signature '${{ steps.in.outputs.build_signature }}' \
-            --build-timestamp '${{ steps.in.outputs.build_timestamp }}' \
+            --deb-version "$ver" \
+            --deb-sha256 "$sha" \
+            --termux-sha "$tsha" \
+            --port-sha "${{ steps.cls.outputs.run_head }}" \
+            --source "${{ steps.cls.outputs.source }}" \
+            --ci-run-id "${{ steps.cls.outputs.run_id }}" \
+            --ci-run-url "https://github.com/${{ github.repository }}/actions/runs/${{ steps.cls.outputs.run_id }}" \
+            --artifact-name "${{ steps.cls.outputs.artifact }}" \
+            --build-signature "${EXPECT_SIG:-}" \
+            --build-timestamp "${EXPECT_TS:-}" \
             --run-audit-json run.json --artifacts-json artifacts.json \
             --out verified.json
 
       - name: Fetch release state + plan (dedup/collision/resume)
+        if: env.SKIP_REMAIN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.in.outputs.tag }}"
+          TAG="chromium-sandboxed-v${{ steps.derive.outputs.deb_version }}"
           args=(--out publish-plan.json)
           if gh api "repos/${{ github.repository }}/releases/tags/$TAG" > release.json 2>rel.err; then
             args+=(--release-json release.json)
@@ -205,6 +216,7 @@ jobs:
             --gh-bin gh --repo '${{ github.repository }}' "${args[@]}"
 
       - name: Execute (draft -> assets -> verify -> pre-release)
+        if: env.SKIP_REMAIN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -213,7 +225,7 @@ jobs:
               --verified verified.json --repo '${{ github.repository }}' \
               --gh-bin gh --out publish-result.json; then
             rc=$?
-            echo "::error::publish step failed (rc=$rc). The Chromium BUILD and the candidate ledger are UNAFFECTED — re-run THIS workflow (gh workflow run publish-release.yml -f ... same inputs) or wait for the nightly; never rebuild Chromium for a publish problem."
+            echo "::error::publish step failed (rc=$rc). The Chromium BUILD and the candidate ledger are UNAFFECTED — re-run THIS run (`gh run rerun ${{ github.run_id }}`) or wait for the nightly; never rebuild Chromium for a publish problem."
             exit "$rc"
           fi
 
@@ -222,7 +234,8 @@ jobs:
         run: |
           {
             echo "### Pre-release publish"
-            echo "- tag: \`${{ steps.in.outputs.tag }}\`  source: \`${{ steps.in.outputs.source }}\`  run: \`${{ steps.in.outputs.ci_run_id }}\`"
+            echo "- source: \`${{ steps.cls.outputs.source || 'n/a' }}\`  run: \`${{ steps.cls.outputs.run_id || 'n/a' }}\`"
+            if [ "${SKIP_REMAIN:-false}" = "true" ]; then echo "- **no-op**: nothing to publish (ledger gate / opt-out / unhandled source)"; fi
             if [ -f publish-plan.json ]; then echo "- plan: \`$(jq -c '{action,reason}' publish-plan.json)\`"; fi
             if [ -f publish-result.json ]; then echo "- result: \`$(jq -c publish-result.json)\`"; fi
             echo "- status: **CI VERIFIED — DEVICE NOT VERIFIED** (device checks are the user's responsibility)"

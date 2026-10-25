@@ -328,94 +328,100 @@ check('[t30] foreign-owned draft -> blocked-ownership exit2, untouched',
       pl9['action'] == 'blocked-ownership' and rc9 == 2
       and store(st5)['chromium-sandboxed-v' + VERSION]['draft'] is True)
 
-# ============ workflow-level publish gates (dry-run/SKIP/blocked rows) =====
+# ============ workflow_run publisher: classify + ledger gate + invariants =
 import yaml as _yaml
-def _load_if(path, job):
-    d = _yaml.safe_load(open(path))
-    return d['jobs'][job]['if']
-DAILY_IF = _load_if(ROOT / '.github/workflows/daily-maintenance.yml', 'trigger')
-def _ghk(expr, ctx):
-    e = expr.replace('&&', ' and ').replace('||', ' or ')
-    paths = sorted(ctx, key=len, reverse=True)
-    env = {}
-    for i, p in enumerate(paths):
-        tok = f'V{i}'
-        e = e.replace(p, tok)
-        env[tok] = ctx[p]
-    return bool(eval(e, {'__builtins__': {}}, env))
-def _daily_ctx(**over):
-    c = {'needs.evaluate.result': 'success',
-         'needs.evaluate.outputs.action': 'build',
-         'needs.evaluate.outputs.dry': 'false',
-         'needs.build.result': 'success',
-         'needs.outcome.result': 'success',
-         'needs.outcome.outputs.recorded': 'true',
-         'needs.build.outputs.deb_sha256': 'a' * 64,
-         'needs.outcome.outputs.deb_sha256': 'a' * 64,
-         'needs.build.outputs.deb_version': '156.0.8078.47-3',
-         'needs.outcome.outputs.deb_version': '156.0.8078.47-3'}
-    c.update(over)
-    return c
-check('[g1] scheduled build success + recorded candidate -> publish gate OPEN',
-      _ghk(DAILY_IF, _daily_ctx()))
-check('[g2] dry-run -> publish gate CLOSED',
-      not _ghk(DAILY_IF, _daily_ctx(**{'needs.evaluate.outputs.dry': 'true'})))
-check('[g3] action=skip (identical inputs) -> CLOSED',
-      not _ghk(DAILY_IF, _daily_ctx(**{'needs.evaluate.outputs.action': 'skip'})))
-check('[g4] candidate NOT recorded (failure/blocked path) -> CLOSED',
-      not _ghk(DAILY_IF, _daily_ctx(**{'needs.outcome.outputs.recorded': 'false'})))
-check('[g5] build job failed -> CLOSED',
-      not _ghk(DAILY_IF, _daily_ctx(**{'needs.build.result': 'failure'})))
-check('[g6] outcome failed -> CLOSED',
-      not _ghk(DAILY_IF, _daily_ctx(**{'needs.outcome.result': 'failure'})))
-check('[g7] ledger sha != build output sha -> CLOSED (metadata must match)',
-      not _ghk(DAILY_IF, _daily_ctx(**{'needs.outcome.outputs.deb_sha256': 'b' * 64})))
-check('[g8] ledger version != build output version -> CLOSED',
-      not _ghk(DAILY_IF, _daily_ctx(**{'needs.build.outputs.deb_version': 'x'})))
-def _manual_ctx(**over):
-    c = {'needs.build.result': 'success',
-         'needs.build.outputs.deb_sha256': 'a' * 64,
-         'needs.build.outputs.deb_version': '156.0.8078.47-3'}
-    c.update(over)
-    return c
-TRIG_IF = _load_if(ROOT / '.github/workflows/build-chromium.yml', 'trigger-publish')
-check('[g9] direct manual build success -> trigger-publish if OPEN',
-      _ghk(TRIG_IF, _manual_ctx()))
-check('[g10] empty build outputs -> trigger-publish CLOSED',
-      not _ghk(TRIG_IF, _manual_ctx(**{'needs.build.outputs.deb_sha256': ''})))
-check('[g11] build failed -> trigger-publish CLOSED',
-      not _ghk(TRIG_IF, _manual_ctx(**{'needs.build.result': 'failure'})))
-# want resolver: execute the REAL bash step with env injection (GHK-style)
-_bj = _yaml.safe_load(open(ROOT / '.github/workflows/build-chromium.yml'))
-_ws = [st for st in _bj['jobs']['trigger-publish']['steps'] if st.get('id') == 'want'][0]
-_wtxt = _ws['run']
-def _run_want(src, pub):
-    out = tempfile.mktemp(); summ = tempfile.mktemp(); ghout = tempfile.mktemp()
-    open(ghout, 'w').close()
-    r = subprocess.run(['bash', '-c', _wtxt], capture_output=True, text=True,
+_PR = _yaml.safe_load(open(ROOT / '.github/workflows/publish-release.yml'))
+_STEPS = _PR['jobs']['publish']['steps']
+_CLS = [st for st in _STEPS if st.get('id') == 'cls'][0]['run']
+def _run_cls(**env_over):
+    ghout = tempfile.mktemp(); summ = tempfile.mktemp()
+    open(ghout, 'w').close(); open(summ, 'w').close()
+    base = {'WF': '', 'RUN_EVENT': 'schedule', 'RUN_ID': '999',
+            'RUN_HEAD': 'e' * 40, 'BUILD_INPUTS_PUBLISH': 'true'}
+    base.update(env_over)
+    r = subprocess.run(['bash', '-c', _CLS], capture_output=True, text=True,
                        env=dict(os.environ, GITHUB_OUTPUT=ghout,
-                                GITHUB_STEP_SUMMARY=summ, SRC=src, PUB=pub))
+                                GITHUB_STEP_SUMMARY=summ, **base))
     kv = dict(l.split('=', 1) for l in open(ghout).read().splitlines() if '=' in l)
-    for f in (out, summ, ghout):
+    for f in (ghout, summ):
         try: os.unlink(f)
         except OSError: pass
-    return kv.get('want'), r.returncode
-w, rcode = _run_want('', 'true')
-check('[g12] manual dispatch publish=true -> want=true', w == 'true' and rcode == 0)
-w, _ = _run_want('maintenance', 'true')
-check('[g13] CALLED by maintenance -> want=false (defer to ledger gate)', w == 'false')
-w, _ = _run_want('', 'false')
-check('[g14] publish=false opt-out -> want=false', w == 'false')
-w, _ = _run_want('', '')
-check('[g15] missing/unknown publish value -> want=false (fail-closed)', w == 'false')
-w, _ = _run_want('', 'yes')
-check('[g16] invalid publish string -> want=false (no implicit coercion)', w == 'false')
-# instance constraint regression: caller-side uses: jobs never carry permissions
-for _wf, _doc in (('daily-maintenance.yml', _yaml.safe_load(open(ROOT / '.github/workflows/daily-maintenance.yml'))),
-                  ('build-chromium.yml', _bj),
-                  ('publish-release.yml', _yaml.safe_load(open(ROOT / '.github/workflows/publish-release.yml')))):
-    _bad = [j for j, spec in _doc['jobs'].items() if 'uses' in spec and 'permissions' in spec]
-    check(f'[g17] {_wf}: no caller-side permissions on uses: jobs (startup_failure invariant)',
+    return kv, r.returncode
+kv, rc = _run_cls(WF='Daily Maintenance')
+check('[g1] nightly maintenance run -> source=maintenance (ledger-gated publish)',
+      rc == 0 and kv.get('skip') == 'false' and kv.get('source') == 'maintenance'
+      and kv.get('artifact') == 'build-999', str(kv))
+kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port',
+                  RUN_EVENT='workflow_dispatch')
+check('[g2] direct manual build success -> source=manual (auto publish)',
+      rc == 0 and kv.get('skip') == 'false' and kv.get('source') == 'manual')
+kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port',
+                  BUILD_INPUTS_PUBLISH='false')
+check('[g3] manual publish=false opt-out -> skip (no release)',
+      rc == 0 and kv.get('skip') == 'true')
+kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port',
+                  BUILD_INPUTS_PUBLISH='yes')
+check('[g4] invalid opt-out string -> treated as default publish (exact-match fail-open only for known false; value is boolean-typed input)',
+      rc == 0 and kv.get('skip') == 'false')
+kv, rc = _run_cls(WF='Some Other Workflow')
+check('[g5] unhandled workflow -> no-op skip', rc == 0 and kv.get('skip') == 'true')
+kv, rc = _run_cls(WF='Daily Maintenance', RUN_ID='1;rm')
+check('[g6] malformed run id -> step fails (fail closed)', rc != 0)
+kv, rc = _run_cls(WF='Daily Maintenance', RUN_HEAD='zzz')
+check('[g7] malformed head sha -> step fails', rc != 0)
+
+# ---- ledger gate (jq extracted from the workflow itself)
+import re as _re2
+_src = open(ROOT / '.github/workflows/publish-release.yml').read()
+_m = _re2.search(r"ok=\$\(jq -r --argjson id " + chr(34) + r"\$RUN_ID" + chr(34) + r" '(.*?)' state.json\)", _src, _re2.S)
+LED = _m.group(1)
+def _ledger_ok(state_doc, run_id=999):
+    p = ROOT / '._led_state.json'
+    p.write_text(json.dumps(state_doc))
+    r = subprocess.run(['jq', '-r', '--argjson', 'id', str(run_id), LED, str(p)],
+                       capture_output=True, text=True)
+    p.unlink()
+    return r.stdout.strip()
+def _recorded_state(**over):
+    b = {'ci_run': 999, 'status': 'BUILD_VERIFIED_CANDIDATE',
+         'deb_sha256': 'a' * 64, 'deb_version': '156.0.8078.47-4',
+         'signature': 'a' * 16}
+    b.update(over)
+    return {'last_successful_build': b}
+check('[g8] ledger candidate recorded for THIS run -> gate OPEN',
+      _ledger_ok(_recorded_state()) == 'true')
+check('[g9] dry-run/skip (ledger still references an OLD run id) -> gate CLOSED',
+      _ledger_ok(_recorded_state(ci_run=555)) == 'false')
+check('[g10] failed/unrecorded (status missing) -> CLOSED',
+      _ledger_ok(_recorded_state(status='BUILD_FAILED')) == 'false')
+check('[g11] malformed ledger sha/sig -> CLOSED (never publish on weak metadata)',
+      _ledger_ok(_recorded_state(deb_sha256='abc')) == 'false'
+      and _ledger_ok(_recorded_state(signature='zz')) == 'false')
+check('[g12] no last_successful_build at all -> CLOSED',
+      _ledger_ok({'last_successful_build': {}}) == 'false')
+# ---- instance invariants (startup_failure bisection learnings, revert PR #8)
+_WFS = {'daily-maintenance.yml': _yaml.safe_load(open(ROOT / '.github/workflows/daily-maintenance.yml')),
+        'build-chromium.yml': _yaml.safe_load(open(ROOT / '.github/workflows/build-chromium.yml')),
+        'publish-release.yml': _PR}
+for _n, _d in _WFS.items():
+    _bad = [j for j, sp in _d['jobs'].items() if 'uses' in sp and 'permissions' in sp]
+    check(f'[g13] {_n}: no caller-side permissions on uses: jobs (instance invariant)',
           not _bad, str(_bad))
+_all_src = ''.join(open(ROOT / ('.github/workflows/' + n)).read() for n in _WFS)
+check('[g14] no actions:write anywhere; contents:write ONLY at publish-release top level',
+      'actions: write' not in _all_src.replace('actions: read', '')
+      and _PR['permissions'] == {'contents': 'write'}
+      and all('permissions' not in sp for sp in _PR['jobs'].values())
+      and _WFS['daily-maintenance.yml']['permissions'] == {'contents': 'read'})
+check('[g15] workflow_run restricted to the two build workflows, completed-only, default-branch-only',
+      set(_PR[True if True in _PR else 'on']['workflow_run']['workflows'])
+      == {'Daily Maintenance', 'Build Termux Chromium Seccomp Sandbox Port'}
+      and _PR[True if True in _PR else 'on']['workflow_run']['types'] == ['completed']
+      and 'github.event.workflow_run.conclusion == \'success\'' in _PR['jobs']['publish']['if']
+      and "head_branch == github.event.repository.default_branch" in _PR['jobs']['publish']['if'])
+check('[g16] publisher pinned to default-branch code (supply-chain) + artifact by audited run-id',
+      'ref: ${{ github.event.repository.default_branch }}' in _src
+      and 'run-id: ${{ steps.cls.outputs.run_id }}' in _src)
+
 print(f'PUBLISH-TESTS PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)

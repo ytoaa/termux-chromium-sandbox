@@ -19,7 +19,7 @@ on:
         type: string
         default: ""
       publish:
-        description: Publish successful direct builds as GitHub Pre-release
+        description: Publish a successful direct build as GitHub Pre-release (Round 17; opt-out=false)
         type: boolean
         default: true
   workflow_call:

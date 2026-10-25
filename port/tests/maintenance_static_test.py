@@ -263,59 +263,44 @@ check('[s48d] engine keeps v1 frozen (sig_version=1 path) and tags v2 payload',
 _pw=(ROOT+'/../.github/workflows/publish-release.yml')
 _psrc=open(_pw).read()
 _pj=yaml.safe_load(open(_pw))
-check('[s50] publisher workflow: top-level contents:write ONLY scope, no per-job overrides, no issues/admin',
-      _pj['permissions']=={'contents':'write'}
-      and all('permissions' not in spec for spec in _pj['jobs'].values())
-      and 'issues:' not in _psrc and 'admin:' not in _psrc)
 _pub=open(ROOT+'/publish_release.py').read()
 _both=_psrc+_pub
-check('[s50b] no --clobber anywhere, no --latest, never deletes releases/tags/assets',
+check('[s50] publisher is a SELF-CONTAINED workflow_run job: contents:write only at top level, NO job-level permissions',
+      _pj['permissions']=={'contents':'write'}
+      and all('permissions' not in sp for sp in _pj['jobs'].values())
+      and 'issues:' not in _psrc and 'admin:' not in _psrc
+      and 'workflow_run' in (_pj[True] if True in _pj else _pj['on']))
+check('[s50b] no clobber-style flag, no latest marker, no delete anywhere in publisher',
       '--clobber' not in _both and '--latest' not in _both
       and 'release delete' not in _both and 'git tag -d' not in _both
       and '--draft=false' in _both and "'release', 'create'" in _both
       and '--draft' in _both and '--prerelease' in _both)
-check('[s50c] provenance audit BEFORE publish: run conclusion+workflow+artifact uniqueness+run-id pin',
-      'conclusion=="success"' in _psrc and 'name=="Build Termux Chromium Seccomp Sandbox Port"' in _psrc
-      and 'length == 1' in _psrc and 'run-id: ${{ steps.in.outputs.ci_run_id }}' in _psrc
-      and 'github.event.inputs.' in _psrc and '|| inputs.' in _psrc)
-check('[s50d] draft-first order enforced: verify -> plan -> execute steps in sequence',
-      _psrc.index('Integrity verification') < _psrc.index('+ plan (dedup')
-      < _psrc.index('Execute (draft'))
-_dj=_dwj['trigger']
-check('[s51] maintenance trigger is ledger-gated (dry false + action build + build success + outcome recorded + sha/version equality), actions:write ONLY, dispatches publisher',
-      _dj['needs']==['evaluate','build','outcome']
-      and "needs.evaluate.outputs.dry == 'false'" in _dj['if']
-      and "needs.evaluate.outputs.action == 'build'" in _dj['if']
-      and "needs.build.result == 'success'" in _dj['if']
-      and "needs.outcome.result == 'success'" in _dj['if']
-      and "needs.outcome.outputs.recorded == 'true'" in _dj['if']
-      and 'needs.build.outputs.deb_sha256 == needs.outcome.outputs.deb_sha256' in _dj['if']
-      and 'needs.build.outputs.deb_version == needs.outcome.outputs.deb_version' in _dj['if']
-      and _dj['permissions']=={'actions':'write'}
-      and 'workflow run publish-release.yml' in _dj['steps'][0]['run']
-      and all(('-f '+k) in _dj['steps'][0]['run'] for k in
-              ('source=maintenance','ci_run_id=','artifact_name=','deb_version=',
-               'deb_sha256=','termux_sha=','port_sha=','build_signature=')))
-check('[s51b] outcome exports gate facts from the LEDGER (state2.json), never from the build step',
-      'steps.gatefacts.outputs.recorded' in str(_dwj['outcome'].get('outputs'))
-      and 'state2.json' in [st.get('run','') for st in _dwj['outcome']['steps']
-                            if st.get('id')=='gatefacts'][0])
-_bj=yaml.safe_load(open(ROOT+'/../.github/workflows/build-chromium.yml'))['jobs']['trigger-publish']
-check('[s52] direct-build trigger: build-success+outputs gate, actions:write only, defers to maintenance when called, fail-closed want resolver',
-      "needs.build.result == 'success'" in _bj['if']
-      and "needs.build.outputs.deb_sha256 != ''" in _bj['if']
-      and _bj['permissions']=={'actions':'write'}
-      and '$SRC" = "maintenance"' in str(_bj['steps'][0]['run'])
-      and 'true|True|TRUE) want=true' in str(_bj['steps'][0]['run'])
-      and "want=false" in str(_bj['steps'][0]['run'])
-      and 'workflow run publish-release.yml' in str(_bj['steps'][1]['run'])
-      and _bj['steps'][1]['if'] == "steps.want.outputs.want == 'true'")
-check('[s52b] manual dispatch gained publish input (default true); existing job perms unchanged',
-      yaml.safe_load(open(ROOT+'/../.github/workflows/build-chromium.yml'))
-        [True if True in yaml.safe_load(open(ROOT+'/../.github/workflows/build-chromium.yml')) else 'on']
-        ['workflow_dispatch']['inputs']['publish']['default'] is True
-      and yaml.safe_load(open(ROOT+'/../.github/workflows/build-chromium.yml'))['permissions']=={'contents':'read'})
-_pub=open(ROOT+'/publish_release.py').read()
+check('[s50c] provenance audit BEFORE publish: run success + artifact uniqueness + download pinned to audited run id',
+      'conclusion=="success"' in _psrc and 'length == 1' in _psrc
+      and 'run-id: ${{ steps.cls.outputs.run_id }}' in _psrc
+      and 'workflow_run.conclusion == ' in str(_pj['jobs']['publish']['if']))
+check('[s50d] step order: classify -> ledger gate -> download -> verify -> plan -> execute',
+      _psrc.index('Classify trigger event') < _psrc.index('ledger gate')
+      < _psrc.index('Download candidate artifact') < _psrc.index('Integrity verification')
+      < _psrc.index('+ plan (dedup') < _psrc.index('Execute (draft'))
+check('[s50e] ledger gate re-executed in publisher (BUILD_VERIFIED_CANDIDATE + 64hex sha + 16hex sig for THIS run)',
+      'BUILD_VERIFIED_CANDIDATE' in _psrc and 'test("^' in _psrc
+      and '[0-9a-f]{64}' in _psrc and '[0-9a-f]{16}' in _psrc and 'SKIP_REMAIN' in _psrc)
+check('[s50f] dry-run/skip/blocked/unrecorded => no-op (SKIP_REMAIN=true, never publish)',
+      'no-op' in _psrc and 'SKIP_REMAIN=true' in _psrc)
+# s51/s52: caller workflows must NOT have gained any publisher wiring or elevated perms (Round 17 keeps them at Round-16 baseline; only build-chromium gained a dispatch opt-out input)
+check('[s51] daily-maintenance publisher-free at caller level: no permissions: on any uses: job, actions:write nowhere, no gh workflow run publish',
+      all(not ('uses' in sp and 'permissions' in sp) for sp in _dwj.values())
+      and 'actions: write' not in _dwt.replace('actions: read','')
+      and 'publish-release.yml' not in _dwt)
+_bfull=yaml.safe_load(open(ROOT+'/../.github/workflows/build-chromium.yml'))
+_bwt=open(ROOT+'/../.github/workflows/build-chromium.yml').read()
+check('[s52] build-chromium gained ONLY a publish dispatch opt-out input; no caller publisher wiring / elevated perms',
+      'publish-release.yml' not in _bwt
+      and all(not ('uses' in sp and 'permissions' in sp) for sp in _bfull['jobs'].values())
+      and 'actions: write' not in _bwt.replace('actions: read','')
+      and _bfull[True if True in _bfull else 'on']['workflow_dispatch']['inputs']['publish']['default'] is True
+      and _bfull['permissions']=={'contents':'read'})
 check('[s53] publisher is ISOLATED from build/state classification (no maintenance import/state writes)',
       'import maintenance' not in _pub and 'maintenance-state' not in _pub
       and 'state.json' not in _pub and 'state2' not in _pub
