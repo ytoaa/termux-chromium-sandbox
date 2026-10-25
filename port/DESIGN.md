@@ -1163,3 +1163,20 @@ Operational policy: schedule OFF, dispatch-only (dry_run default true),
 no builds without explicit approval, Release/apt never automatic; new
 upstream versions require the full CI + device-gate cycle again; failed
 signatures stay blocked (Issue #2 history untouched).
+
+## Automated maintenance activation (2026-10-25) — AUTOMATED MAINTENANCE / MANUAL PROMOTION
+
+Operational runbook (activation PR):
+1. Schedule: cron 23 0 * * * UTC (09:23 KST); delivery delay tolerated, not a PASS criterion.
+2. Detection: ChromiumDash Stable + termux HEAD-pinned recipe/host-tools blobs; validated/last-success compare; build signature = (aligned-version, recipe-blob-sha, host-blob-sha, port-inputs-hash).
+3. Auto-build condition: NEW signature only (identical inputs skip; candidates dedup; termux drift alone never rebuilds; concurrency serial; in-flight build respected).
+4. Failure classes: gate/verify->port BLOCK+Issue; build+transient->infra exactly ONE retry then BLOCK+Issue; unknown->BLOCK (fail closed); cancelled/skipped->history only.
+5. Blocked signatures: skip; unblock = changed inputs, `retry-approved` label (one-shot, consumed on GitHub + state) or `approve_retry=true` dispatch.
+6. Duplicate-build prevention: signature dedup + daily/build serial groups + running-detect (API error = busy = fail closed).
+7. Device gate: humans only (procedure: Phase C battery — bpf_evidence phases, GUI/X11, downloads, audio, soak).
+8. Validated promotion: humans only via port.toml + maintenance-state CAS (this PR did NOT touch validated; s17 guards engine authority=0).
+9. Releases/apt: never automatic; separate approvals.
+10. Emergency stop: `gh workflow disable daily-maintenance.yml`; recovery: enable + rerun (idempotent).
+11. Retry approval: label on open block issue (exact full-sig title) or dispatch flag.
+12. Manual paths preserved: dry_run default true via dispatch; schedule NEVER approves retries (mode normalization test matrix s44a-e; no implicit GHK coercions, s45).
+Baselines preserved: #31 history + 156.0.8078.47-2 validated (cf2cb2a8...abd4151ba8d).

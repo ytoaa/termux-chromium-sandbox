@@ -36,12 +36,23 @@ and invites a PR. This project is that attempt.
   NEVER publishes. Schedule fires only after PR merge (default-branch
   cron) — merge and activation are separate approvals.
 
-- **Maintenance automation (live on main — MANUAL ONLY):** daily-maintenance
-  workflow ships WITHOUT any schedule trigger (removed in Phase C.2).
-  Activation of the daily cron requires a separate approved PR. Until then
-  the ONLY entry point is `gh workflow run daily-maintenance.yml -f
-  dry_run=true|false` (manual; dry_run defaults true). All fail-closed
-  issue/state policies apply. See port/DESIGN.md "Activation policy".
+- **Maintenance automation (LIVE — AUTOMATED MAINTENANCE / MANUAL
+  PROMOTION):** the daily workflow runs on schedule at **09:23 KST**
+  (00:23 UTC; GitHub may delay — timing is an expectation, not a gate).
+  Automated per run: upstream/recipe detection, validated/state compare,
+  changed-input detection, build-signature computation, duplicate skip,
+  R1~R9b security gate, conditional CANDIDATE CI build, artifact capture,
+  failure classification, deduplicated block Issues, candidate recording.
+  NEVER automated: device installation/gates, validated promotion,
+  port.toml writes, policy changes, Releases, apt, product-code merges.
+  **Emergency stop:** `gh workflow disable daily-maintenance.yml` (runtime
+  kill-switch) or revert the schedule trigger via PR. **Resume:**
+  `gh workflow enable daily-maintenance.yml`. Blocked signatures retry
+  only via human `retry-approved` label (consumed once) or
+  `approve_retry=true` dispatch; recovery runs are idempotent (signature
+  dedup + serial concurrency). Manual entry points remain:
+  `gh workflow run daily-maintenance.yml -f dry_run=true|false`.
+  Device-gate procedure and validated promotion policy: port/DESIGN.md.
 
 - **Current validated baseline (2026-10-25):** `chromium-sandboxed
   156.0.8078.47-2` (upstream 156.0.8078.47 + packaging revision 2),

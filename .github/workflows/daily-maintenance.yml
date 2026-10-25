@@ -14,13 +14,21 @@
 # maintenance/state.seed.json; ANY other API error aborts the run.
 name: Daily Maintenance
 
-# C.2-E: the daily schedule trigger is REMOVED until a separate
-# operational approval. Merging this PR does NOT activate any automation —
-# the pipeline runs only via explicit workflow_dispatch (dry_run default
-# true). Restoring `on.schedule` (00:23 UTC = 09:23 KST, idempotency via
-# signature dedup + concurrency groups) requires a dedicated follow-up PR
-# and owner approval. See port/DESIGN.md "Activation policy".
+# OPERATIONAL STATE: AUTOMATED MAINTENANCE / MANUAL PROMOTION
+# (activated by the dedicated approved PR; promotions/deployments remain
+# human-gated). schedule = auto-detect + conditional CANDIDATE builds only;
+# it NEVER promotes validated, NEVER deploys, NEVER retries blocked
+# signatures without human approval, and NEVER mutates validated.
+# Emergency stop: `gh workflow disable daily-maintenance.yml` (or revert
+# the schedule trigger via PR). Recovery: re-enable the workflow; runs are
+# idempotent per build signature + concurrency groups.
 on:
+  schedule:
+    # 00:23 UTC = 09:23 Asia/Seoul. GitHub may delay schedules; delivery
+    # timing is an operational expectation, not a PASS criterion. Missed
+    # schedules deliver the latest occurrence only.
+    - cron: '23 0 * * *'
+  workflow_dispatch:
   workflow_dispatch:
     inputs:
       dry_run:
@@ -53,8 +61,34 @@ jobs:
       reason: ${{ steps.decide.outputs.reason }}
       target: ${{ steps.decide.outputs.target }}
       relink: ${{ steps.decide.outputs.relink }}
+      dry: ${{ steps.mode.outputs.dry }}
+      event: ${{ steps.mode.outputs.event }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Resolve run mode (explicit; no implicit type coercion)
+        id: mode
+        run: |
+          set -euo pipefail
+          EV="${{ github.event_name }}"
+          # schedule events carry NO inputs: dry defaults to false
+          # (auto-build allowed), approve ALWAYS false. dispatch values are
+          # matched as STRINGS via case — no reliance on GHK null/boolean
+          # coercion. Anything unrecognized fails safe to the manual path.
+          DRY=false
+          APPROVE=false
+          if [ "$EV" = "workflow_dispatch" ]; then
+            case "${{ inputs.dry_run }}" in
+              true|True|TRUE) DRY=true ;;
+            esac
+            case "${{ inputs.approve_retry }}" in
+              true|True|TRUE) APPROVE=true ;;
+            esac
+          fi
+          echo "dry=$DRY" >> "$GITHUB_OUTPUT"
+          echo "event=$EV" >> "$GITHUB_OUTPUT"
+          echo "approve=$APPROVE" >> "$GITHUB_OUTPUT"
+          echo "mode: event=$EV dry=$DRY approve=$APPROVE"
 
       - name: Probe upstream (head-pinned termux recipe reads)
         env:
@@ -108,7 +142,7 @@ jobs:
         run: |
           set -euo pipefail
           APPROVE=""
-          if [ "${{ inputs.approve_retry }}" = "true" ]; then APPROVE="--approve-retry"; fi
+          if [ "${{ steps.mode.outputs.approve }}" = "true" ]; then APPROVE="--approve-retry"; fi
           # port build inputs = hash of build-consumed files only (doc-only
           # commits do NOT change this -> no spurious rebuilds; Round 15.1 #5)
           PORT_SIG=$(for f in port/chromium_sandbox_port.py port/prepare_recipe.py \
@@ -136,7 +170,7 @@ jobs:
   build:
     name: Reusable build (only when decided)
     needs: evaluate
-    if: needs.evaluate.outputs.action == 'build' && inputs.dry_run != true
+    if: needs.evaluate.outputs.action == 'build' && needs.evaluate.outputs.dry == 'false'
     uses: ./.github/workflows/build-chromium.yml
     with:
       termux_ref: ${{ fromJson(needs.evaluate.outputs.target).termux_ref }}
@@ -150,7 +184,7 @@ jobs:
     if: always() && needs.evaluate.result == 'success'
         && (needs.evaluate.outputs.action == 'build'
             || needs.evaluate.outputs.relink == 'true')
-        && inputs.dry_run != true
+        && needs.evaluate.outputs.dry == 'false'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
@@ -350,7 +384,7 @@ jobs:
           {
             echo "### Maintenance outcome"
             echo "- decision: \`${{ needs.evaluate.outputs.action }} — ${{ needs.evaluate.outputs.reason }}\`"
-            echo "- build job result: \`${{ needs.build.result }}\`  dry_run: \`${{ inputs.dry_run }}\`"
+            echo "- build job result: \`${{ needs.build.result }}\`  event: \`${{ needs.evaluate.outputs.event }}\`  dry: \`${{ needs.evaluate.outputs.dry }}\`"
             if [ -f result.json ]; then echo "- classified: \`$(jq -c '{success,stage}' result.json)\`"; fi
             if [ -f ops.json ]; then echo "- issues created: $(jq '.create_issues|length' ops.json), comments: $(jq '.comment_issues|length' ops.json)"; fi
           } >> "$GITHUB_STEP_SUMMARY"

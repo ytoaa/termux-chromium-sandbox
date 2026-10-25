@@ -24,15 +24,20 @@ check('[s7] gate self-test intact', 'port/ci.sh selftest' in steps)
 
 dw=yaml.safe_load(open(os.path.join(ROOT,'..','.github/workflows/daily-maintenance.yml')))
 don=dw[True] if True in dw else dw['on']
-check('[s8] NO schedule trigger (activation requires separate approval); dispatch+dry_run+approve_retry intact',
-      'schedule' not in don and 'workflow_dispatch' in don and 'dry_run' in don['workflow_dispatch']['inputs'] and 'approve_retry' in don['workflow_dispatch']['inputs'], str(list(don.keys())))
+check('[s8] ACTIVATION: schedule cron 23 0 * * * + dispatch with dry_run+approve_retry',
+      don.get('schedule',[{}])[0].get('cron')=='23 0 * * *'
+      and 'workflow_dispatch' in don
+      and set(don['workflow_dispatch']['inputs'])=={'dry_run','approve_retry'},
+      str(list(don.keys())))
 check('[s9] daily dispatch inputs (dry_run/approve_retry)', set(don['workflow_dispatch']['inputs'])=={'dry_run','approve_retry'})
 check('[s10] daily top-level perms minimal (read); writes only per-job', dw['permissions']=={'contents':'read'}, str(dw['permissions']))
 check('[s11] daily concurrency no-cancel', dw['concurrency']=={'group':'daily-maintenance','cancel-in-progress':False})
 dj=json.dumps(dw['jobs'])
 _dwj = dw['jobs']
-check('[s13] dry_run gates build+outcome jobs', 'inputs.dry_run != true' in _dwj['build']['if'] and 'inputs.dry_run != true' in _dwj['outcome']['if'])
-check('[s12] build invoked via reusable call only', './.github/workflows/build-chromium.yml' in dj and 'workflow_dispatch' not in dj.replace('Build Termux',''))
+check('[s13] normalized dry gate on build+outcome (explicit string compare, no implicit coercion)',
+      "needs.evaluate.outputs.dry == 'false'" in _dwj['build']['if'] and "needs.evaluate.outputs.dry == 'false'" in _dwj['outcome']['if'])
+check('[s12] build invoked via reusable call only (no dispatch API)',
+      'actions/workflows/' not in dj.lower() or 'POST' not in dj)
 check('[s14] state path locked to maintenance-state', dj.count('maintenance-state')>=6 and 'maintenance/state.json' in dj)
 check('[s15] issue label dedup used', 'auto-build-blocked' in dj)
 check('[s16] no apt/release/publish verbs', not any(k in dj.lower() for k in ('apt','gh release','deploy-pages','package publish')))
@@ -78,7 +83,7 @@ check('[s28] reusable call at JOBS level (no steps[].uses ./)',
 check('[s29] outcome needs evaluate+build and runs on always()',
       set(_dwj['outcome']['needs'])=={'evaluate','build'}
       and 'always()' in _dwj['outcome']['if']
-      and 'dry_run != true' in _dwj['outcome']['if'])
+      and "needs.evaluate.outputs.dry == 'false'" in _dwj['outcome']['if'])
 check('[s30] data handoff via artifact (upload==download name)',
       _dwj['evaluate']['steps'][-1]['with']['name'].replace('${{ github.run_id }}','R')
       == next(s['with']['name'].replace('${{ github.run_id }}','R')
@@ -142,5 +147,27 @@ check('[s42] called-job name parsing splits on last slash',
       'split("/") | last' in _dwt)
 check('[s43] log download errors surfaced not hidden',
       'log download failed (job id' in _dwt)
+_mode=[st for st in _dwj['evaluate']['steps'] if st.get('id')=='mode']
+_mtxt=_mode[0]['run'] if _mode else ''
+def _run_mode(event, dry_val, appr_val):
+    body=_mtxt.replace('${{ github.event_name }}',event)\
+             .replace('${{ inputs.dry_run }}',dry_val)\
+             .replace('${{ inputs.approve_retry }}',appr_val)
+    import tempfile as _tf2
+    gh_out=_tf2.mktemp()
+    open(gh_out,'w').close()
+    out=_sp.run(['bash','-c',body],capture_output=True,text=True,
+                env=dict(os.environ,GITHUB_OUTPUT=gh_out))
+    kv=dict(l.split('=',1) for l in open(gh_out).read().splitlines() if '=' in l)
+    try: os.unlink(gh_out)
+    except OSError: pass
+    return kv, out.returncode
+kv,rc=_run_mode('schedule','','');   check('[s44a] schedule -> dry=false approve=false rc0', rc==0 and kv.get('dry')=='false' and kv.get('approve')=='false', str(kv))
+kv,rc=_run_mode('workflow_dispatch','true','false'); check('[s44b] dispatch dry_run=true -> dry=true', rc==0 and kv.get('dry')=='true' and kv.get('approve')=='false', str(kv))
+kv,rc=_run_mode('workflow_dispatch','',''); check('[s44c] dispatch absent -> dry=false (fail-safe manual)', rc==0 and kv.get('dry')=='false', str(kv))
+kv,rc=_run_mode('workflow_dispatch','false','true'); check('[s44d] approve_retry=true only via dispatch', rc==0 and kv.get('approve')=='true' and kv.get('dry')=='false', str(kv))
+kv,rc=_run_mode('schedule','true','true'); check('[s44e] schedule IGNORES stray input strings (approve never true on schedule)', rc==0 and kv.get('approve')=='false', str(kv))
+check('[s45] no implicit GHK boolean coercion patterns remain',
+      'inputs.dry_run !=' not in _dwt and 'inputs.approve_retry }}" = ' not in _dwt)
 print(f'MAINTENANCE-STATIC PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)
