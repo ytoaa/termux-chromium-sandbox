@@ -335,8 +335,16 @@ rc_cli = M.main(['decide', '--state', _stf, '--probes', '._pr.json',
 os.unlink('._mig_bad2.json'); os.unlink(_stf); os.unlink('._pr.json')
 check('[R17] CLI decide with corrupt migrations -> rc!=0 (no plan, no build)',
       rc_cli == 1)
-# [R18] golden values pinned from the real rev-2 provenance (canary)
-check('[R18] golden semantic hash of current port.toml', _h0 == 'fbf559c15b61e310', _h0)
+# [R18] keep the old approved rev-2 provenance canary IMMUTABLE.
+# The new R10 rule is a new security contract; its semantic hash must
+# differ. Do NOT edit maintenance/signature-migrations.json to claim the
+# R10 candidate has the original rev-2 content.
+_r10start = REAL_TOML.index('[rules.r10]\\n')
+_r10end = REAL_TOML.index('[rules.r9b]\\n', _r10start)
+_historical_toml = REAL_TOML[:_r10start] + REAL_TOML[_r10end:]
+check('[R18] frozen rev-2 hash preserved and new R10 contract differs',
+      M.port_toml_semantic_sha(_historical_toml) == 'fbf559c15b61e310'
+      and _h0 != 'fbf559c15b61e310', _h0)
 _rc = M.main(['port-input-hash', '--root', os.path.join(os.path.dirname(__file__), '..', '..')])
 check('[R18b] golden v2 port-input hash via CLI (repo tree)', _rc == 0)
 print(f'MAINTENANCE-TESTS PASS={PASS} FAIL={fail}')
