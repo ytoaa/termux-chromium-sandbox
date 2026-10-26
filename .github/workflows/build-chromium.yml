@@ -127,6 +127,11 @@ jobs:
           ver=$(dpkg-deb -f "$deb" Version)
           [ "$pkg" = "chromium-sandboxed" ] || { echo "wrong package name: $pkg"; exit 1; }
           echo "artifact: $pkg $ver"
+          # Installation ownership gate: verify actual DEB member paths.
+          # In particular, never let this package own stock Chromium's
+          # chromium.desktop, manpage, icons, AppStream metadata or symlinks.
+          # Must pass before Upload artifacts and any Pre-release creation.
+          python3 port/package_identity_gate.py "$deb"
           # Fail-closed rule enforcement lives IN the hook (post_get_source
           # exits 1 unless >=5 rules applied; runs inside the build container).
           # Here the log mirror is best-effort evidence (container->host mirror
