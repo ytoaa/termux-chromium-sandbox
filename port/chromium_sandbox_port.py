@@ -41,6 +41,7 @@ R5_MARKER = "Termux seccomp-only stack-top prewarm:"
 R7_MARKER = "Termux seccomp-only bionic stack cache:"
 R8_MARKER = "Termux seccomp-only bionic stack-top:"
 R9A_MARKER = "Termux seccomp-only net-sockopt:"
+R10_MARKER = "Termux seccomp-only bionic-sigsys:"
 
 
 class PortError(RuntimeError):
@@ -391,11 +392,52 @@ const pthread_t g_termux_main_thread = pthread_self();
 #endif  // defined(__BIONIC__)
           .Default(CrashSIGSYSSockopt());"""
 
+
+    # R10: Android's app zygote installs a seccomp policy AND SIGSYS
+    # handler. Chromium's Android SeccompStarterAndroid::StartSandbox
+    # explicitly resets SIGSYS to SIG_DFL before initializing Trap, but
+    # Termux compiles desktop Linux paths on bionic (IS_ANDROID=false).
+    # On device 2026-10-26 every sandboxed child logged
+    # "Existing signal handler when trying to install SIGSYS" (trap.cc:106).
+    # Do exactly what upstream Android does, in the child, immediately
+    # before StartSandboxWithExternalPolicy, and only for bionic.
+    # No syscall policy or privilege exception is introduced. Keep a CHECK
+    # so failure to reserve SIGSYS cannot silently disable seccomp.
+    R10_INCLUDE_OLD = "#include <stdint.h>"
+
+    R10_INCLUDE_NEW = """#if defined(__BIONIC__)
+#include <signal.h>
+#endif
+#include <stdint.h>"""
+
+    R10_OLD = """  SandboxSeccompBPF::StartSandboxWithExternalPolicy(
+      std::move(policy), OpenProc(proc_fd_), seccomp_level);"""
+
+    R10_NEW = """#if defined(__BIONIC__)
+  // """ + R10_MARKER + """ Chromium's Android SeccompStarterAndroid
+  // resets the zygote-installed SIGSYS handler before installing its own
+  // BPF trap handler. Termux is a desktop Linux build on bionic, so the
+  // Android starter is not called. Reserve SIGSYS in this child, immediately
+  // before Chromium installs the BPF policy; do not touch other signals.
+  const auto old_sigsys_handler = signal(SIGSYS, SIG_DFL);
+  CHECK(old_sigsys_handler != SIG_ERR)
+      << "Termux seccomp-only bionic-sigsys: failed to reserve SIGSYS";
+  if (old_sigsys_handler != SIG_DFL) {
+    VLOG(1) << "Termux seccomp-only bionic-sigsys: "
+               "replaced pre-existing Android SIGSYS handler";
+  }
+#endif  // defined(__BIONIC__)
+""" + R10_OLD
+
     def apply(self) -> None:
         self.replace_once(self.ZYGOTE_HOST, "R1 seccomp-only usable mode (Bionic)",
                           self.R1_OLD, self.R1_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R2 skip namespace engage (Bionic)",
                           self.R2_OLD, self.R2_NEW)
+        self.replace_once(self.SANDBOX_LINUX, "R10 bionic SIGSYS reservation include",
+                          self.R10_INCLUDE_OLD, self.R10_INCLUDE_NEW)
+        self.replace_once(self.SANDBOX_LINUX, "R10 bionic SIGSYS reservation before BPF",
+                          self.R10_OLD, self.R10_NEW)
         self.replace_once(self.SYSCALL_RESTRICT, "R3 bionic prctl options (arm64-Android)",
                           self.R3_OLD, self.R3_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R4 zygote passthrough (Bionic)",
@@ -425,6 +467,7 @@ const pthread_t g_termux_main_thread = pthread_self();
             (self.SANDBOX_LINUX, R2_MARKER, "R2"),
             (self.SYSCALL_RESTRICT, R3_MARKER, "R3"),
             (self.NETWORK_POLICY, R9A_MARKER, "R9a"),
+            (self.SANDBOX_LINUX, R10_MARKER, "R10"),
             (self.SANDBOX_LINUX, R4_MARKER, "R4"),
             (self.SANDBOX_LINUX, R5_MARKER, "R5"),
             (self.STACK_TRACE, R7_MARKER, "R7"),
@@ -440,6 +483,20 @@ const pthread_t g_termux_main_thread = pthread_self();
         if "#if defined(__BIONIC__)" not in text or "#else" not in text:
             raise PortError("verifier: R2 guard structure missing")
         print(f"[     VERIFIED] R2 preprocessor guard structure intact")
+        # R10 is only valid on bionic and only before Chromium's BPF
+        # installer. Refuse source drift, accidental removal of SIG_DFL
+        # reset, and incomplete include/guard changes.
+        pos = text.find(R10_MARKER)
+        next_pos = text.find("SandboxSeccompBPF::StartSandboxWithExternalPolicy(", pos)
+        if (pos < 0 or next_pos < 0 or next_pos - pos > 1400 or
+                'signal(SIGSYS, SIG_DFL)' not in text[pos:next_pos] or
+                'CHECK(old_sigsys_handler != SIG_ERR)' not in text[pos:next_pos] or
+                '#if defined(__BIONIC__)' not in text[max(0, pos-12):pos+80] and
+                '#if defined(__BIONIC__)' not in text[max(0, pos-250):pos]):
+            raise PortError("verifier: R10 Bionic SIGSYS reset/guard/ordering drift")
+        if '#include <signal.h>' not in text:
+            raise PortError("verifier: R10 missing signal.h")
+        print("[     VERIFIED] R10 Bionic-only SIGSYS reservation before BPF")
         # Gate 3: vendored PA patches must be present WHENEVER the subtree is
         # shipped (silently skipping them would ship a build that still calls
         # pthread_getattr_np after the filter - the exact boot-loop we fix).
