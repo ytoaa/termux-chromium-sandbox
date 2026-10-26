@@ -23,6 +23,22 @@
 name: Publish Pre-release
 
 on:
+  # One-time, operator-confirmed recovery for the already-built 2026-10-26
+  # revision-3 artifact. No rebuild, no implicit bypass for other run IDs.
+  workflow_dispatch:
+    inputs:
+      recovery_run_id:
+        description: 'One-time legacy recovery run ID (40254429486 only)'
+        type: string
+        required: true
+      recovery_expected_sha256:
+        description: 'SHA256 of the exact DEB inside that run artifact'
+        type: string
+        required: true
+      recovery_ack:
+        description: 'Type PUBLISH-LEGACY-BUILD-40254429486 to authorize publishing'
+        type: string
+        required: true
   workflow_run:
     workflows:
       - Daily Maintenance
@@ -30,7 +46,8 @@ on:
     types: [completed]
 
 permissions:
-  contents: write   # the ONLY write scope in the repo (top-level, standalone)
+  contents: write   # the ONLY write scope (release create); top-level standalone
+  actions: read     # cross-run artifact download requires explicit read token
 
 concurrency:
   group: publish-release-queue
@@ -43,8 +60,12 @@ jobs:
     # DEFAULT branch. workflow_call builds belong to the CALLER run
     # ('Daily Maintenance'), so maintenance builds flow through here after
     # the ledger push — publish-before-ledger is structurally impossible.
-    if: github.event.workflow_run.conclusion == 'success'
-        && github.event.workflow_run.head_branch == github.event.repository.default_branch
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == github.event.repository.default_branch)
+      || (github.event_name == 'workflow_dispatch' &&
+          github.ref_name == github.event.repository.default_branch)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
@@ -61,30 +82,52 @@ jobs:
           RUN_EVENT: ${{ github.event.workflow_run.event }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
-          BUILD_INPUTS_PUBLISH: ${{ github.event.workflow_run.inputs.publish }}
+          TRIGGER_KIND: ${{ github.event_name }}
+          RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
+          RECOVERY_SHA: ${{ inputs.recovery_expected_sha256 }}
+          RECOVERY_ACK: ${{ inputs.recovery_ack }}
         run: |
           set -euo pipefail
           source=''
-          case "$WF" in
-            "Daily Maintenance")
-              source='maintenance' ;;
-            "Build Termux Chromium Seccomp Sandbox Port")
-              # direct manual build only (dispatch/schedule top-level runs);
-              # a workflow_dispatch of DAILY whose called build failed never
-              # reaches here (its run failed). Manual opt-out via the build
-              # workflow's publish=false dispatch input (run.inputs.publish).
-              case "$BUILD_INPUTS_PUBLISH" in
-                false|False|FALSE)
-                  echo "manual run $RUN_ID opted out (publish=false) — no-op" >> "$GITHUB_STEP_SUMMARY"
-                  echo "skip=true" >> "$GITHUB_OUTPUT"
-                  echo "reason=opt-out" >> "$GITHUB_OUTPUT"
-                  exit 0 ;;
+          recovery=false
+          case "$TRIGGER_KIND" in
+            workflow_dispatch)
+              # Deliberately pinned ONE-TIME recovery only. Historical run
+              # predates the artifact-bound consent marker. Explicit operator
+              # acknowledgement and independently supplied DEB digest are
+              # mandatory. Do not generalize into a legacy default-allow.
+              [ "$RECOVERY_RUN_ID" = "40254429486" ] || { echo "::error::recovery run not allowlisted"; exit 1; }
+              [ "$RECOVERY_ACK" = "PUBLISH-LEGACY-BUILD-40254429486" ] || { echo "::error::recovery acknowledgement missing"; exit 1; }
+              [[ "$RECOVERY_SHA" =~ ^[a-f0-9]{64}$ ]] || { echo "::error::recovery DEB sha malformed"; exit 1; }
+              RUN_ID="$RECOVERY_RUN_ID"
+              RUN_HEAD="783efd63eeea89e2999e0408d55ea0de70fbed7c"
+              source='manual'
+              recovery=true
+              {
+                echo "EXPECT_VERSION=156.0.8078.47-3"
+                echo "EXPECT_SHA=$RECOVERY_SHA"
+                echo "EXPECT_SIG="
+                echo "EXPECT_TERMUX="
+                echo "EXPECT_TS="
+              } >> "$GITHUB_ENV"
+              ;;
+            workflow_run)
+              case "$WF" in
+                "Daily Maintenance")
+                  source='maintenance' ;;
+                "Build Termux Chromium Seccomp Sandbox Port")
+                  [ "$RUN_EVENT" = "workflow_dispatch" ] || { echo "::error::unexpected manual source event"; exit 1; }
+                  # The workflow_run.inputs.publish field is absent in real
+                  # events; consent is checked against the source artifact.
+                  source='manual' ;;
+                *)
+                  echo "unhandled workflow '$WF' — no-op" >> "$GITHUB_STEP_SUMMARY"
+                  echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
               esac
-              source='manual' ;;
-            *)
-              echo "unhandled workflow '$WF' — no-op" >> "$GITHUB_STEP_SUMMARY"
-              echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+              ;;
+            *) echo "::error::unsupported publisher event"; exit 1 ;;
           esac
+          echo "recovery=$recovery" >> "$GITHUB_OUTPUT"
           case "$RUN_ID" in ''|*[!0-9]*) echo "::error::run id malformed"; exit 1;; esac
           case "$RUN_HEAD" in *[!0-9a-f]*|'') echo "::error::head sha malformed"; exit 1;; esac
           echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -104,6 +147,11 @@ jobs:
           set -euo pipefail
           gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID" > run.json
           jq -e '.status=="completed" and .conclusion=="success"' run.json >/dev/null
+          if [ "${{ steps.cls.outputs.recovery }}" = "true" ]; then
+            # A specific successful build on main, never a fabricated run.
+            jq -e --arg sha "${{ steps.cls.outputs.run_head }}" \
+              '.id==40254429486 and .name=="Build Termux Chromium Seccomp Sandbox Port" and .event=="workflow_dispatch" and .head_branch=="main" and .head_sha==$sha' run.json >/dev/null
+          fi
           if [ "$SOURCE" = "maintenance" ]; then
             # THE LEDGER IS THE GATE — evaluated BEFORE any artifact check so
             # dry-run/skip/blocked runs (which never upload build-<id>)
@@ -150,11 +198,13 @@ jobs:
             # manual path: no ledger contract — a successful build run MUST
             # own its build-<run> artifact; absence is a real anomaly (red).
             echo "SKIP_REMAIN=false" >> "$GITHUB_ENV"
-            echo "EXPECT_VERSION=" >> "$GITHUB_ENV"
-            echo "EXPECT_SHA=" >> "$GITHUB_ENV"
-            echo "EXPECT_SIG=" >> "$GITHUB_ENV"
-            echo "EXPECT_TERMUX=" >> "$GITHUB_ENV"
-            echo "EXPECT_TS=" >> "$GITHUB_ENV"
+            if [ "${{ steps.cls.outputs.recovery }}" != "true" ]; then
+              echo "EXPECT_VERSION=" >> "$GITHUB_ENV"
+              echo "EXPECT_SHA=" >> "$GITHUB_ENV"
+              echo "EXPECT_SIG=" >> "$GITHUB_ENV"
+              echo "EXPECT_TERMUX=" >> "$GITHUB_ENV"
+              echo "EXPECT_TS=" >> "$GITHUB_ENV"
+            fi
           fi
           # artifact ownership (both paths, AFTER the ledger no-op above)
           gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" > artifacts.json
@@ -169,9 +219,38 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ${{ steps.cls.outputs.artifact }}
+          github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ steps.cls.outputs.run_id }}
           path: artifact
+
+      # The upstream workflow_run event does NOT include reliable inputs.
+      # Never publish a direct manual build without its artifact-bound
+      # consent record (except the single tightly pinned recovery above).
+      - name: Verify manual publish consent (fail closed)
+        if: env.SKIP_REMAIN != 'true' && steps.cls.outputs.source == 'manual' && steps.cls.outputs.recovery != 'true'
+        env:
+          EXPECTED_RUN_ID: ${{ steps.cls.outputs.run_id }}
+          EXPECTED_HEAD_SHA: ${{ steps.cls.outputs.run_head }}
+        run: |
+          set -euo pipefail
+          marker=artifact/publish-intent.json
+          if [ ! -f "$marker" ]; then
+            echo "::error::missing artifact-bound manual publish intent; refusing publication"
+            exit 1
+          fi
+          if ! jq -e --arg run "$EXPECTED_RUN_ID" --arg sha "$EXPECTED_HEAD_SHA" \
+              '.schema==1 and .event=="workflow_dispatch" and .run_id==$run and .head_sha==$sha and (.publish==true or .publish==false)' \
+              "$marker" >/dev/null; then
+            echo "::error::manual publish intent invalid or bound to a different run"
+            exit 1
+          fi
+          if [ "$(jq -r '.publish' "$marker")" != "true" ]; then
+            echo "SKIP_REMAIN=true" >> "$GITHUB_ENV"
+            echo "manual run $EXPECTED_RUN_ID explicitly opted out; no Release" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "manual publish consent verified for run $EXPECTED_RUN_ID"
 
       - name: Integrity verification (self-derives expectations from artifact; ledger values re-checked)
         if: env.SKIP_REMAIN != 'true'

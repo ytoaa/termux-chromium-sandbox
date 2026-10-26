@@ -181,6 +181,34 @@ jobs:
         with:
           path: termux-packages/.sccache
           key: chromium-sccache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
+      # The completed workflow_run payload does NOT reliably expose the
+      # workflow_dispatch inputs. Bind the caller's publish consent to
+      # the build artifact itself; never infer consent from a missing field.
+      - name: Record manual publish intent (fail closed)
+        if: always()
+        env:
+          SOURCE_EVENT: ${{ github.event_name }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          SOURCE_HEAD_SHA: ${{ github.sha }}
+          REQUESTED_PUBLISH: ${{ inputs.publish }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          raw = os.environ.get('REQUESTED_PUBLISH', '').lower()
+          if raw not in ('true', 'false', ''):
+              raise SystemExit('invalid publish input: refusing ambiguous build consent')
+          event = os.environ['SOURCE_EVENT']
+          doc = {
+              'schema': 1,
+              'event': event,
+              'run_id': os.environ['SOURCE_RUN_ID'],
+              'head_sha': os.environ['SOURCE_HEAD_SHA'],
+              'publish': event == 'workflow_dispatch' and raw == 'true',
+          }
+          Path('publish-intent.json').write_text(json.dumps(doc, sort_keys=True) + '\n')
+          print('publish intent recorded (explicit manual consent only)')
+          PY
       - name: Upload artifacts (debs + logs)
         if: always()
         uses: actions/upload-artifact@v4
@@ -192,4 +220,5 @@ jobs:
             termux-packages/port-apply-chromium.log
             termux-packages/**/port-apply-chromium.log
             termux-pin.txt
+            publish-intent.json
           if-no-files-found: warn

@@ -266,7 +266,7 @@ _pj=yaml.safe_load(open(_pw))
 _pub=open(ROOT+'/publish_release.py').read()
 _both=_psrc+_pub
 check('[s50] publisher is a SELF-CONTAINED workflow_run job: contents:write only at top level, NO job-level permissions',
-      _pj['permissions']=={'contents':'write'}
+      _pj['permissions']=={'contents':'write','actions':'read'}
       and all('permissions' not in sp for sp in _pj['jobs'].values())
       and 'issues:' not in _psrc and 'admin:' not in _psrc
       and 'workflow_run' in (_pj[True] if True in _pj else _pj['on']))
@@ -323,7 +323,22 @@ check('[s52] build-chromium gained ONLY a publish dispatch opt-out input; no cal
       and all(not ('uses' in sp and 'permissions' in sp) for sp in _bfull['jobs'].values())
       and 'actions: write' not in _bwt.replace('actions: read','')
       and _bfull[True if True in _bfull else 'on']['workflow_dispatch']['inputs']['publish']['default'] is True
-      and _bfull['permissions']=={'contents':'read'})
+      and _bfull['permissions']=={'contents':'read'}
+      and 'publish-intent.json' in _bwt)
+check('[s61] publisher cross-run Artifact download uses explicit read token and actions:read',
+      'github-token: ${{ github.token }}' in _psrc
+      and _pj['permissions'].get('actions')=='read'
+      and 'actions: write' not in _psrc.replace('actions: read',''))
+check('[s62] manual publisher consent requires exact source artifact and rejects missing/mismatched metadata',
+      'Verify manual publish consent' in _psrc
+      and 'publish-intent.json' in _psrc
+      and 'SKIP_REMAIN=true' in _psrc
+      and 'workflow_run.inputs.publish }}' not in _psrc)
+check('[s63] legacy recovery is pinned to original run and requires explicit independent SHA and acknowledgement',
+      '40254429486' in _psrc
+      and 'PUBLISH-LEGACY-BUILD-40254429486' in _psrc
+      and 'recovery_expected_sha256' in _psrc
+      and 'and .head_sha==$sha' in _psrc)
 check('[s53] publisher is ISOLATED from build/state classification (no maintenance import/state writes)',
       'import maintenance' not in _pub and 'maintenance-state' not in _pub
       and 'state.json' not in _pub and 'state2' not in _pub
