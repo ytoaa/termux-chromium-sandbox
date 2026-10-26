@@ -339,8 +339,8 @@ check('[R17] CLI decide with corrupt migrations -> rc!=0 (no plan, no build)',
 # The new R10 rule is a new security contract; its semantic hash must
 # differ. Do NOT edit maintenance/signature-migrations.json to claim the
 # R10 candidate has the original rev-2 content.
-_r10start = REAL_TOML.index('[rules.r10]\\n')
-_r10end = REAL_TOML.index('[rules.r9b]\\n', _r10start)
+_r10start = REAL_TOML.index('[rules.r10]\n')
+_r10end = REAL_TOML.index('[rules.r9b]\n', _r10start)
 _historical_toml = REAL_TOML[:_r10start] + REAL_TOML[_r10end:]
 check('[R18] frozen rev-2 hash preserved and new R10 contract differs',
       M.port_toml_semantic_sha(_historical_toml) == 'fbf559c15b61e310'
