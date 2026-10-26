@@ -201,11 +201,12 @@ def run_plan(tmp, tag_expected):
     tag = tag_expected or ('chromium-sandboxed-v' + VERSION)
     args = ['plan', '--verified', str(tmp / 'verified.json'),
             '--gh-bin', GH, '--repo', 'r/p', '--out', str(tmp / 'plan.json')]
-    r = subprocess.run(GH.split() + ['release', 'view', tag, '--json',
-                       'isDraft,isPrerelease,assets,html_url', '--repo', 'r/p'],
-                       capture_output=True, text=True)
-    if r.returncode == 0:
-        rp = tmp / 'rel.json'; rp.write_text(r.stdout)
+    # The real planner receives a REST release JSON document from "gh api".
+    # Do not confuse its snake_case "html_url" field with the gh CLI's
+    # camelCase "url" selector (which failed in live run 40308659469).
+    rel = store(Path(os.environ['GH_MOCK_STORE'])).get(tag)
+    if rel is not None:
+        rp = tmp / 'rel.json'; rp.write_text(json.dumps(rel))
         args += ['--release-json', str(rp)]
     rc = P.main(args)
     return rc, json.loads((tmp / 'plan.json').read_text())
@@ -238,6 +239,16 @@ check('[t18] execute -> published PRE-RELEASE with deb+SHA256SUMS+manifest',
            'build-manifest.json'} <= ok_assets,
       'rc=%s %s || %s' % (rc, json.dumps(rel)[:160],
                          (tmpm / 'exec.err').read_text()[-400:]))
+exec_result = json.loads((tmpm / 'exec.json').read_text())
+check('[t44] after publication, gh CLI url field is recognized and captured',
+      exec_result.get('status') == 'published'
+      and exec_result.get('url') ==
+      'https://github.com/r/p/releases/tag/chromium-sandboxed-v' + VERSION)
+bad_cli = subprocess.run(GH.split() + ['release', 'view',
+    'chromium-sandboxed-v' + VERSION, '--json', 'html_url', '--repo', 'r/p'],
+    capture_output=True, text=True)
+check('[t45] REST-only html_url selector refused by strict CLI mock',
+      bad_cli.returncode != 0 and 'Unknown JSON field' in bad_cli.stderr)
 man = json.loads((Path(st / 'files' / ('chromium-sandboxed-v' + VERSION + '-build-manifest.json'))).read_text())
 check('[t19] manifest carries full provenance + CI VERIFIED / DEVICE NOT VERIFIED',
       man['deb_sha256'] == P.sha256_file(debm) and man['termux_pinned_sha'] == TSHA
