@@ -39,7 +39,7 @@ if argv[:2] == ['release', 'create']:
     d[tag] = {'tag_name': tag, 'draft': '--draft' in argv,
               'prerelease': '--prerelease' in argv, 'target': target,
               'title': title, 'body': notes, 'assets': [],
-              'html_url': f'https://example.invalid/releases/tag/{tag}'}
+              'html_url': f'https://github.com/r/p/releases/tag/{tag}'}
     save(d); sys.exit(0)
 if argv[:2] == ['release', 'upload']:
     tag = argv[2]; d = load()
@@ -61,11 +61,20 @@ if argv[:2] == ['release', 'view']:
     tag = argv[2]; d = load()
     if tag not in d: fail('Not Found')
     r = dict(d[tag])
-    out = {'isDraft': r['draft'], 'isPrerelease': r['prerelease'],
-           'assets': [{'name': a['name'], 'url': a['url']} for a in r['assets']],
-           'html_url': r['html_url'], 'tag_name': r['tag_name'],
-           'draft': r['draft'], 'body': r['body']}
-    print(json.dumps(out)); sys.exit(0)
+    # Match the real gh CLI's --json selectors, not REST response fields.
+    # In particular, "html_url" is REST-only; gh release view exposes "url".
+    fields = {'isDraft': r['draft'], 'isPrerelease': r['prerelease'],
+              'assets': [{'name': a['name'], 'url': a['url']} for a in r['assets']],
+              'url': r['html_url'], 'tagName': r['tag_name'],
+              'body': r['body']}
+    if '--json' not in argv:
+        fail('gh_mock: --json selector required')
+    requested = argv[argv.index('--json') + 1].split(',')
+    for key in requested:
+        if key not in fields:
+            fail(f'Unknown JSON field: "{key}"')
+    print(json.dumps({key: fields[key] for key in requested}))
+    sys.exit(0)
 if argv[:2] == ['release', 'download']:
     tag = argv[2]; d = load()
     if tag not in d: fail('Not Found')
