@@ -392,10 +392,8 @@ else
 fi
 
 # [46] R11 diagnostic-only SIGSYS ownership and registry ordering probes.
-# The actual Chromium 156 trap.cc fixture must match source anchors, be
-# idempotent, remain Bionic-only, and fail closed on drift/tampering.
 out=$(python3 port/tests/sigsys_r11_diag_test.py 2>&1); got=$?
-if [ "$got" -eq 0 ] && grep -q '^R11-DIAG-TESTS PASS=15 FAIL=0 <<< "$out"; then
+if [ "$got" -eq 0 ] && grep -Fqx "R11-DIAG-TESTS PASS=15 FAIL=0" <<< "$out"; then
   pass "[46] R11 SIGSYS ownership/order diagnostics (15 checks)"
 else
   fail "[46] R11 SIGSYS ownership/order diagnostics"
