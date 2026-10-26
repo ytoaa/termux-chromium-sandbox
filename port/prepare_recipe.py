@@ -24,16 +24,63 @@ class RecipeError(RuntimeError):
 def sha(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
+def _replace_expected(text: str, old: str, new: str, count: int, label: str) -> str:
+    """Fail closed if an upstream installer anchor changes, rather than
+    silently packaging stock Chromium-owned files again."""
+    actual = text.count(old)
+    if actual != count:
+        raise RecipeError(
+            f"side-by-side identity drift ({label}): expected {count} "
+            f"occurrences, got {actual}: {old!r}"
+        )
+    return text.replace(old, new)
+
+
 def rewrite_identity(text: str) -> str:
-    # side-by-side identity: distinct lib dir + launcher name
-    t = text
-    t = t.replace("lib/chromium", "lib/chromium-sandboxed")
-    t = t.replace("bin/chromium-browser", "bin/chromium-sandboxed")
-    t = t.replace('desktop="chromium.desktop"', 'desktop="chromium-sandboxed.desktop"')
-    # NOTE: termux_step_post_make_install (dummy-lib cleanup) is deliberately
-    # left intact: it removes files THIS clone's own build created in its own
-    # staging dir. It never touches the stock package.
+    # The original recipe installs MORE than a binary and launcher. The
+    # complete stock-owned surface includes driver/headless symlinks, the
+    # desktop file, manpage, icons and AppStream metadata. Every path must
+    # be independent or dpkg -i fails (or --force-overwrite clobbers stock).
+    t = text.replace("lib/chromium", "lib/chromium-sandboxed")
+    t = text.replace("bin/chromium-browser", "bin/chromium-sandboxed")
+    # Each target has a verified location in the pinned Termux recipe.
+    rewrites = (
+        ('ln -sfr $TERMUX_PREFIX/lib/chromium-sandboxed/chromedriver $TERMUX_PREFIX/bin/',
+         'ln -sfr "$TERMUX_PREFIX/lib/chromium-sandboxed/chromedriver" "$TERMUX_PREFIX/bin/chromedriver-sandboxed"', 1, "chromedriver binary"),
+        ('ln -sfr $TERMUX_PREFIX/lib/chromium-sandboxed/headless_shell $TERMUX_PREFIX/bin/',
+         'ln -sfr "$TERMUX_PREFIX/lib/chromium-sandboxed/headless_shell" "$TERMUX_PREFIX/bin/headless_shell-sandboxed"', 1, "headless launcher"),
+        ('share/man/man1/chromium.1', 'share/man/man1/chromium-sandboxed.1', 2, "manpage"),
+        ('share/applications/chromium.desktop', 'share/applications/chromium-sandboxed.desktop', 2, "desktop entry"),
+        ('apps/chromium.png', 'apps/chromium-sandboxed.png', 2, "hicolor icons"),
+        ('share/metainfo/chromium.appdata.xml', 'share/metainfo/chromium-sandboxed.appdata.xml', 2, "AppStream metadata"),
+        ('s/@@usr_bin_symlink_name/chromium-browser/g',
+         's/@@usr_bin_symlink_name/chromium-sandboxed/g', 1, "desktop Exec"),
+        ('s/@@PACKAGE/chromium/g',
+         's/@@PACKAGE/chromium-sandboxed/g', 1, "desktop application ID"),
+        ('s/@@MENUNAME/Chromium/g',
+         's/@@MENUNAME/Chromium (Sandboxed)/g', 1, "desktop visible name"),
+        (r's/chromium-browser\.desktop/chromium.desktop/',
+         r's/chromium-browser\.desktop/chromium-sandboxed.desktop/', 1, "AppStream desktop reference"),
+    )
+    for old, new, count, label in rewrites:
+        t = _replace_expected(t, old, new, count, label)
+    # Preserve the upstream post-make-install dummy-lib cleanup (it executes
+    # only inside the sandboxed package's isolated staging prefix).
     return t
+
+
+def rewrite_launcher(text: str) -> str:
+    # Launcher is a copied, separate recipe file, not build.sh itself.
+    # Do not export the stock desktop ID or consume stock /etc/chromium flags.
+    for old, new, label in (
+        ('export CHROME_DESKTOP="chromium.desktop"',
+         'export CHROME_DESKTOP="chromium-sandboxed.desktop"', "launcher desktop ID"),
+        ('@TERMUX_PREFIX@/etc/chromium/*.conf',
+         '@TERMUX_PREFIX@/etc/chromium-sandboxed/*.conf', "launcher config isolation"),
+        ('/.config}/chromium', '/.config}/chromium-sandboxed', "root-only fallback profile"),
+    ):
+        text = _replace_expected(text, old, new, 1, label)
+    return text
 
 HOOK = f"""
 {HOOK_BEGIN}
@@ -363,9 +410,13 @@ def prepare(termux_dir: Path) -> dict:
             shutil.copytree(f, target, dirs_exist_ok=True)
             report[f.name + "/"] = "tree"
         else:
-            if target.is_file() and sha(target) == sha(f):
+            if f.name == "chromium-launcher.sh.in":
+                data = rewrite_launcher(f.read_text()).encode()
+            else:
+                data = f.read_bytes()
+            if target.is_file() and target.read_bytes() == data:
                 continue
-            target.write_bytes(f.read_bytes())
+            target.write_bytes(data)
             report[f.name] = sha(target)
     # marker: package identity
     if "chromium-sandboxed" not in (dst_dir / "build.sh").read_text():
@@ -387,6 +438,12 @@ def audit(termux_dir: Path) -> None:
         (SHIELD_BEGIN, "bionic shield hook present"),
         ("libtermux-gnp-fix.so", "pthread_getattr_np shield install"),
         ("termux_step_post_make_install_upstream", "shield chain calls upstream hook"),
+        ("share/applications/chromium-sandboxed.desktop", "isolated desktop file"),
+        ("share/man/man1/chromium-sandboxed.1", "isolated manpage"),
+        ("apps/chromium-sandboxed.png", "isolated icons"),
+        ("share/metainfo/chromium-sandboxed.appdata.xml", "isolated AppStream metadata"),
+        ("bin/chromedriver-sandboxed", "isolated driver symlink"),
+        ("bin/headless_shell-sandboxed", "isolated headless symlink"),
     ):
         if needle not in text:
             raise RecipeError(f"audit fail: missing {label}")
@@ -395,6 +452,19 @@ def audit(termux_dir: Path) -> None:
         raise RecipeError("audit fail: sandbox-disable patch exclusion missing")
     if re.search(r"\blib/chromium\b(?!-sandboxed)", text):
         raise RecipeError("audit fail: residual stock lib/chromium path")
+    launcher = termux_dir / PKG_DST / "chromium-launcher.sh.in"
+    if not launcher.is_file():
+        raise RecipeError("audit fail: isolated launcher template missing")
+    lt = launcher.read_text()
+    if ('CHROME_DESKTOP="chromium-sandboxed.desktop"' not in lt
+            or '/etc/chromium-sandboxed/*.conf' not in lt):
+        raise RecipeError("audit fail: stock desktop/config leak in launcher")
+    for forbidden in (
+        "share/applications/chromium.desktop", "share/man/man1/chromium.1",
+        "apps/chromium.png", "share/metainfo/chromium.appdata.xml",
+    ):
+        if forbidden in text:
+            raise RecipeError(f"audit fail: stock-owned installer path {forbidden}")
     if not (termux_dir / PKG_DST / "gnp_shim.c").is_file():
         raise RecipeError("audit fail: gnp_shim.c not shipped in the recipe dir")
     print("[AUDIT OK] chromium-sandboxed recipe contract holds")
