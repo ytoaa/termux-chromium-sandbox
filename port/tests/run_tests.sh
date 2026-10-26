@@ -363,8 +363,8 @@ python3 "port/tests/maintenance_signature_test.py" 2>&1 | grep -q '^MAINTENANCE-
 
 # [42] Round 17 pre-release publisher (required 19-row scenario table: publish
 # gating, integrity refusals, dedup/collision, draft-safe recovery, gates).
-python3 "port/tests/publish_test.py" 2>&1 | grep -q '^PUBLISH-TESTS PASS=81 FAIL=0$' \
-  && pass "[42] pre-release publisher scenarios (19-row table + classify/ledger-lookup/e-series exit-code fidelity + ledger-vs-artifact cross-check, 81 checks)" \
+python3 "port/tests/publish_test.py" 2>&1 | grep -q '^PUBLISH-TESTS PASS=83 FAIL=0$' \
+  && pass "[42] pre-release publisher scenarios (gh CLI schema + published URL validation + provenance, 83 checks)" \
   || fail "[42] pre-release publisher scenarios"
 
 # [43] GitHub Releases workflow-authorization regression for old source SHAs:
