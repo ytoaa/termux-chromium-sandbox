@@ -387,12 +387,17 @@ _RECORD = [x for x in _BW['jobs']['build']['steps']
            if x.get('name', '').startswith('Record manual publish intent')][0]['run']
 _CONSENT = [x for x in _STEPS
             if x.get('name', '').startswith('Verify manual publish consent')][0]['run']
+# The build runner's final step now invokes this exact Bash-only writer.
+# Executing via an absolute path is necessary: the consent fixture intentionally
+# runs from a temporary workdir and a relative port/ path is not present there.
+assert _RECORD.strip() == 'bash port/record_publish_intent.sh', (
+    'workflow consent writer drift: update tests before publishing')
 def _emit_intent(event, requested):
     import tempfile as _tmp
     with _tmp.TemporaryDirectory(prefix='consent-src.') as d:
         env = dict(os.environ, SOURCE_EVENT=event, SOURCE_RUN_ID='999',
                    SOURCE_HEAD_SHA='e'*40, REQUESTED_PUBLISH=requested)
-        r = subprocess.run(['bash', '-c', 'set -euo pipefail\n'+_RECORD],
+        r = subprocess.run(['bash', str(ROOT / 'port/record_publish_intent.sh')],
                            cwd=d, capture_output=True, text=True, env=env)
         f = Path(d) / 'publish-intent.json'
         return r.returncode, json.loads(f.read_text()) if f.exists() else None

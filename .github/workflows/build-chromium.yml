@@ -191,24 +191,7 @@ jobs:
           SOURCE_RUN_ID: ${{ github.run_id }}
           SOURCE_HEAD_SHA: ${{ github.sha }}
           REQUESTED_PUBLISH: ${{ inputs.publish }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          raw = os.environ.get('REQUESTED_PUBLISH', '').lower()
-          if raw not in ('true', 'false', ''):
-              raise SystemExit('invalid publish input: refusing ambiguous build consent')
-          event = os.environ['SOURCE_EVENT']
-          doc = {
-              'schema': 1,
-              'event': event,
-              'run_id': os.environ['SOURCE_RUN_ID'],
-              'head_sha': os.environ['SOURCE_HEAD_SHA'],
-              'publish': event == 'workflow_dispatch' and raw == 'true',
-          }
-          Path('publish-intent.json').write_text(json.dumps(doc, sort_keys=True) + '\n')
-          print('publish intent recorded (explicit manual consent only)')
-          PY
+        run: bash port/record_publish_intent.sh
       - name: Upload artifacts (debs + logs)
         if: always()
         uses: actions/upload-artifact@v4
