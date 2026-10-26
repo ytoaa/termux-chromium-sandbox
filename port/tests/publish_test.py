@@ -356,7 +356,8 @@ kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port',
                   RUN_EVENT='workflow_dispatch')
 check('[g2] direct manual build success -> source=manual (auto publish)',
       rc == 0 and kv.get('skip') == 'false' and kv.get('source') == 'manual')
-kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port')
+kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port',
+                  RUN_EVENT='workflow_dispatch')
 check('[g3] workflow_run missing inputs must NOT imply consent: defer to artifact gate',
       rc == 0 and kv.get('source') == 'manual' and kv.get('skip') == 'false')
 kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port',
@@ -380,7 +381,7 @@ def _emit_intent(event, requested):
     with _tmp.TemporaryDirectory(prefix='consent-src.') as d:
         env = dict(os.environ, SOURCE_EVENT=event, SOURCE_RUN_ID='999',
                    SOURCE_HEAD_SHA='e'*40, REQUESTED_PUBLISH=requested)
-        r = subprocess.run(['bash', '-c', 'set -euo pipefail\\n'+_RECORD],
+        r = subprocess.run(['bash', '-c', 'set -euo pipefail\n'+_RECORD],
                            cwd=d, capture_output=True, text=True, env=env)
         f = Path(d) / 'publish-intent.json'
         return r.returncode, json.loads(f.read_text()) if f.exists() else None
