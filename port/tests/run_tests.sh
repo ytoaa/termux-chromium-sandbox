@@ -261,7 +261,7 @@ setfn=$(awk '/RestrictSetSockoptForNetworkService\(\)/,/^}/' "$F" | grep -c '__B
   || fail "[30] R9a scope drift (dom=$n_dom mark=$n_mark set-bionic=$setfn)"
 
 # [31] ledger contract: port.toml must be valid TOML (parser verification)
-python3 -c "import tomllib,sys; d=tomllib.load(open('port/port.toml','rb')); sys.exit(0 if all(k in d.get('rules',{}) for k in ('r1','r2','r3','r4','r5','r7','r8','r9a','r9b')) and 'items' in d.get('forbidden',{}) else 1)" \
+python3 -c "import tomllib,sys; d=tomllib.load(open('port/port.toml','rb')); sys.exit(0 if all(k in d.get('rules',{}) for k in ('r1','r2','r3','r4','r5','r7','r8','r9a','r9b','r10')) and 'items' in d.get('forbidden',{}) else 1)" \
   && pass "[31] port.toml parses (tomllib) + rules r1-r9a + forbidden.items present" \
   || fail "[31] port.toml invalid TOML / contract keys missing"
 
@@ -373,5 +373,12 @@ python3 "port/tests/publish_test.py" 2>&1 | grep -q '^PUBLISH-TESTS PASS=83 FAIL
 python3 "port/tests/publisher_release_auth_test.py" 2>&1 | grep -q '^RELEASE-AUTH-TESTS PASS=12 FAIL=0$' \
   && pass "[43] release auth historical-target safety matrix (12 checks)" \
   || fail "[43] release auth historical-target safety matrix"
+
+# [44] Android/Termux SIGSYS ownership regression. Exact Chromium fixture
+# anchors + pre-BPF reset + bionic guard + corruption/drift negative controls.
+out=$(python3 "port/tests/sigsys_r10_test.py" 2>&1); got=$?
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^R10-TESTS PASS=12 FAIL=0$' \
+  && pass "[44] Bionic SIGSYS pre-BPF reservation (12 checks)" \
+  || { fail "[44] R10 SIGSYS regression"; printf '%s\n' "$out" | tail -45; }
 
 exit $rc

@@ -66,6 +66,12 @@ file = "sandbox/policy/linux/bpf_network_policy_linux.cc"
 marker = "Termux seccomp-only net-sockopt:"
 note = "R9a VALIDATED in run #31 (156.0.8078.47, port 403274f, termux 64e02760, deb sha256 29c4080d...27c) — B/D battery: network utility ACT, restarts 0, CRASHING 0, no new SIGSYS; #28 B-signature (restarts 16/CRASHING 32) eliminated. Scope guard unchanged: exactly one (SOL_SOCKET, SO_DOMAIN) get-pair under __BIONIC__; no setsockopt, no SO_PROTOCOL. Feature remains DEFAULT-OFF; default-on requires separate approval."
 
+[rules.r10]
+name = "Bionic inherited SIGSYS handler reset before Chromium BPF"
+file = "sandbox/policy/linux/sandbox_linux.cc"
+marker = "Termux seccomp-only bionic-sigsys:"
+note = "Experimental device-fix candidate ONLY (2026-10-26): on Android the app zygote owns SIGSYS; upstream SeccompStarterAndroid resets SIGSYS to SIG_DFL before SandboxBPF. Termux builds Linux-on-bionic, so the Android starter is skipped. R10 reserves SIGSYS only in __BIONIC__ children just before StartSandboxWithExternalPolicy; it does not relax policies or enable a fallback. Must pass sandbox device gate, crash-free navigation, BPF filter census and causality check before any promotion."
+
 [rules.r9b]
 name = "PULSE_SERVER export in shield wrapper (packaging-level)"
 file = "port/prepare_recipe.py"
