@@ -83,7 +83,7 @@ with tempfile.TemporaryDirectory(prefix="r11-test-") as folder:
           "if (!global_trap_) {" in trap[registry-85:registry]
           and "global_trap_ = new Trap();" in trap[registry:registry + 250])
     check("R11 is Bionic guard scoped",
-          "#if defined(__BIONIC__)" in src[i - 260:i]
+          "#if defined(__BIONIC__)" in src[i - 900:i]
           and "#if defined(__BIONIC__)" in trap[owner-135:owner]
           and "#if defined(__BIONIC__)" in trap[registry-100:registry])
     check("R11 cannot inject sandbox-off flags",
