@@ -483,8 +483,21 @@ const pthread_t g_termux_main_thread = pthread_self();
                           self.R2_OLD, self.R2_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R10 bionic SIGSYS reservation include",
                           self.R10_INCLUDE_OLD, self.R10_INCLUDE_NEW)
-        self.replace_once(self.SANDBOX_LINUX, "R10 bionic SIGSYS reservation before BPF",
-                          self.R10_OLD, self.R10_NEW)
+        # R11 instruments *inside* the exact R10 patch body. On the
+        # second invocation the original uninstrumented R10_NEW is no
+        # longer contiguous, even though R10 is already applied. Recognize
+        # only the exact fully instrumented R10 body. A partial or
+        # corrupted body is NOT accepted as ALREADY_PRESENT.
+        r10_instrumented = self.R10_NEW.replace(
+            self.R11_BEFORE_OLD, self.R11_BEFORE_NEW)
+        if self.p(self.SANDBOX_LINUX).read_text().count(r10_instrumented) == 1:
+            self.record("R10 bionic SIGSYS reservation before BPF",
+                        self.SANDBOX_LINUX, "ALREADY_PRESENT",
+                        "exact R11-instrumented R10 body")
+        else:
+            self.replace_once(self.SANDBOX_LINUX,
+                              "R10 bionic SIGSYS reservation before BPF",
+                              self.R10_OLD, self.R10_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R11 SIGSYS action snapshot before R10",
                           self.R11_BEFORE_OLD, self.R11_BEFORE_NEW)
         self.replace_once(self.TRAP, "R11 classify prior handler at Trap::Trap",
