@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory() as dirname:
           "R10 bionic SIGSYS reservation before BPF" in
           [c.name for c in p.changes])
     text = (src / SBX).read_text()
-    check("R10 marker present", text.count(R10_MARKER) == 1)
+    check("R10 single source-marker comment", text.count("// " + R10_MARKER) == 1)
     check("R10 SIGSYS reset present", text.count("signal(SIGSYS, SIG_DFL)") == 1)
     check("R10 signal.h included", text.count("#include <signal.h>") == 1)
     start = text.index(R10_MARKER)
