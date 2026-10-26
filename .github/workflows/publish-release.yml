@@ -320,8 +320,8 @@ jobs:
           set -euo pipefail
           action=$(jq -r '.action' publish-plan.json)
           case "$action" in
-            already-published)
-              echo "release already published — no creation authorization needed"
+            already-published|collision|blocked-ownership)
+              echo "plan does not create a release — authorization gate not applicable"
               exit 0 ;;
             publish|resume-draft) : ;;
             *) echo "::error::unknown publish plan action: $action"; exit 1 ;;
