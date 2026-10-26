@@ -87,3 +87,56 @@ they exist only transiently in diagnostics.
 ## 7. Graphics
 Keep validated WebRender/ANGLE/SwiftShader paths unchanged; GPU driver
 workarounds are OUT of sandbox scope (separate investigation only).
+
+ 
+## Experimental R10 gate — inherited Android SIGSYS handler (2026-10-26)
+
+**Status: OFFLINE CANDIDATE — DEVICE NOT VERIFIED; NO-GO for promotion.**
+
+On main device, manually installed `chromium-sandboxed 156.0.8078.47-3`
+launched without `--no-sandbox` but reported 14 occurrences of Chromium's
+`trap.cc:106 Existing signal handler when trying to install SIGSYS` and
+user-observed `RESULT_CODE_INVALID_SANDBOX_STATE` page failures. Stock
+Termux Chromium 156.0.8078.47 launched with internally injected
+`--no-sandbox` and did not produce the SIGSYS warnings; both built
+against Mesa 26.2.5 / Turnip / Zink, and both reported accelerated WebGL.
+This A/B does not prove the warning *caused* the tab crashes.
+
+Root-cause *candidate*: official Chromium
+`sandbox/linux/seccomp-bpf-helpers/seccomp_starter_android.cc` explicitly
+runs `signal(SIGSYS, SIG_DFL)` because Android app zygotes inherit an
+Android-owned SIGSYS handler. Termux's `os=linux` build runs on Bionic, but
+does not invoke this Android initializer. Rule R10 mirrors only that
+one-time SIGSYS reservation within `StartSeccompBPF()` before
+`SandboxSeccompBPF::StartSandboxWithExternalPolicy`, under
+`#if defined(__BIONIC__)` only. An unsuccessful reset triggers CHECK;
+no other signal, sandbox policy, or syscall allow-list is changed.
+
+**Off-device tests**: `python3 port/tests/sigsys_r10_test.py`, through
+`bash port/ci.sh selftest`, enforce the pinned upstream installer anchor,
+Bionic guard, reset ordering, fail-closed behavior, idempotence and tamper
+refusals. Source tests are NOT evidence of runtime sandbox activation.
+
+**Mandatory device gate before promoting any R10 build**:
+
+1. Build an opt-out candidate (`publish=false`); never overwrite the
+   published `-3` Release or frozen validated `-2` entry.
+2. Use an isolated profile and `chromium-sandboxed --ozone-platform=x11`;
+   no `--no-sandbox` or other sandbox-disabling flags.
+3. Check the new pre-filter `R10` marker in runtime logs
+   (`--enable-logging=stderr --v=1`), confirm **zero** old
+   `Existing signal handler` warnings, and **zero** crashing tabs.
+4. Execute `port/bpf_evidence.sh` with process census on the actual
+   device: renderer `Seccomp:2`, `Seccomp_filters>=2`,
+   `NoNewPrivs:1` and P2b causality control (filters drop when BPF is
+   explicitly disabled for the controlled negative run).
+5. Navigate real sites / exercise multi-tab, GPU/WebGL and lifecycle
+   (start, quit, start); compare to the `-3` failure signature.
+   Surviving page load without filters is a **FAIL**, not a pass.
+6. If the SIGSYS warning disappears but the page still crashes, preserve
+   the logs, collect renderer PIDs, `/proc/<pid>/status`, signal/exit
+   information, and investigate remaining BPF traps. No syscall-policy
+   widening without an observed specific syscall and separate review.
+
+This R10 candidate does not affect `maintenance-state`, the existing
+`-2` validated baseline, or the `-3` published Release.
