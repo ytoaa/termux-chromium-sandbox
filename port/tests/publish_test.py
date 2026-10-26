@@ -334,16 +334,17 @@ _PR = _yaml.safe_load(open(ROOT / '.github/workflows/publish-release.yml'))
 _STEPS = _PR['jobs']['publish']['steps']
 _CLS = [st for st in _STEPS if st.get('id') == 'cls'][0]['run']
 def _run_cls(**env_over):
-    ghout = tempfile.mktemp(); summ = tempfile.mktemp()
-    open(ghout, 'w').close(); open(summ, 'w').close()
+    ghout = tempfile.mktemp(); summ = tempfile.mktemp(); ghenv = tempfile.mktemp()
+    for f in (ghout, summ, ghenv): open(f, 'w').close()
     base = {'WF': '', 'RUN_EVENT': 'schedule', 'RUN_ID': '999',
-            'RUN_HEAD': 'e' * 40, 'BUILD_INPUTS_PUBLISH': 'true'}
+            'RUN_HEAD': 'e' * 40, 'TRIGGER_KIND': 'workflow_run',
+            'RECOVERY_RUN_ID': '', 'RECOVERY_SHA': '', 'RECOVERY_ACK': ''}
     base.update(env_over)
     r = subprocess.run(['bash', '-c', _CLS], capture_output=True, text=True,
                        env=dict(os.environ, GITHUB_OUTPUT=ghout,
-                                GITHUB_STEP_SUMMARY=summ, **base))
+                                GITHUB_STEP_SUMMARY=summ, GITHUB_ENV=ghenv, **base))
     kv = dict(l.split('=', 1) for l in open(ghout).read().splitlines() if '=' in l)
-    for f in (ghout, summ):
+    for f in (ghout, summ, ghenv):
         try: os.unlink(f)
         except OSError: pass
     return kv, r.returncode
@@ -355,20 +356,85 @@ kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port',
                   RUN_EVENT='workflow_dispatch')
 check('[g2] direct manual build success -> source=manual (auto publish)',
       rc == 0 and kv.get('skip') == 'false' and kv.get('source') == 'manual')
+kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port')
+check('[g3] workflow_run missing inputs must NOT imply consent: defer to artifact gate',
+      rc == 0 and kv.get('source') == 'manual' and kv.get('skip') == 'false')
 kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port',
-                  BUILD_INPUTS_PUBLISH='false')
-check('[g3] manual publish=false opt-out -> skip (no release)',
-      rc == 0 and kv.get('skip') == 'true')
-kv, rc = _run_cls(WF='Build Termux Chromium Seccomp Sandbox Port',
-                  BUILD_INPUTS_PUBLISH='yes')
-check('[g4] invalid opt-out string -> treated as default publish (exact-match fail-open only for known false; value is boolean-typed input)',
-      rc == 0 and kv.get('skip') == 'false')
+                  RUN_EVENT='schedule')
+check('[g4] direct build with unexpected source event fails closed', rc != 0)
 kv, rc = _run_cls(WF='Some Other Workflow')
 check('[g5] unhandled workflow -> no-op skip', rc == 0 and kv.get('skip') == 'true')
 kv, rc = _run_cls(WF='Daily Maintenance', RUN_ID='1;rm')
 check('[g6] malformed run id -> step fails (fail closed)', rc != 0)
 kv, rc = _run_cls(WF='Daily Maintenance', RUN_HEAD='zzz')
 check('[g7] malformed head sha -> step fails', rc != 0)
+
+# ---- Artifact-bound manual publish consent + one-time legacy recovery.
+_BW = _yaml.safe_load(open(ROOT / '.github/workflows/build-chromium.yml'))
+_RECORD = [x for x in _BW['jobs']['build']['steps']
+           if x.get('name', '').startswith('Record manual publish intent')][0]['run']
+_CONSENT = [x for x in _STEPS
+            if x.get('name', '').startswith('Verify manual publish consent')][0]['run']
+def _emit_intent(event, requested):
+    import tempfile as _tmp
+    with _tmp.TemporaryDirectory(prefix='consent-src.') as d:
+        env = dict(os.environ, SOURCE_EVENT=event, SOURCE_RUN_ID='999',
+                   SOURCE_HEAD_SHA='e'*40, REQUESTED_PUBLISH=requested)
+        r = subprocess.run(['bash', '-c', 'set -euo pipefail\\n'+_RECORD],
+                           cwd=d, capture_output=True, text=True, env=env)
+        f = Path(d) / 'publish-intent.json'
+        return r.returncode, json.loads(f.read_text()) if f.exists() else None
+rc, doc = _emit_intent('workflow_dispatch', 'true')
+check('[c1] manual publish=true produces artifact-bound explicit consent',
+      rc==0 and doc and doc['publish'] is True and doc['run_id']=='999')
+rc, doc = _emit_intent('workflow_dispatch', 'false')
+check('[c2] manual publish=false remains false (no release authorized)',
+      rc==0 and doc and doc['publish'] is False)
+rc, doc = _emit_intent('workflow_dispatch', '')
+check('[c3] missing publish input is false, never default allow',
+      rc==0 and doc and doc['publish'] is False)
+rc, doc = _emit_intent('workflow_call', 'true')
+check('[c4] workflow_call cannot impersonate direct manual release',
+      rc==0 and doc and doc['publish'] is False)
+rc, doc = _emit_intent('workflow_dispatch', 'ambiguous')
+check('[c5] malformed consent input fails closed', rc!=0 and doc is None)
+def _check_consent(record):
+    import tempfile as _tmp
+    with _tmp.TemporaryDirectory(prefix='consent-pub.') as d:
+        d=Path(d); art=d/'artifact'; art.mkdir()
+        if record is not None: (art/'publish-intent.json').write_text(json.dumps(record))
+        (d/'env').touch(); (d/'summary').touch()
+        env=dict(os.environ, EXPECTED_RUN_ID='999', EXPECTED_HEAD_SHA='e'*40,
+                 GITHUB_ENV=str(d/'env'), GITHUB_STEP_SUMMARY=str(d/'summary'))
+        r=subprocess.run(['bash','-c',_CONSENT],cwd=d,capture_output=True,text=True,env=env)
+        return r.returncode,(d/'env').read_text(),r.stdout+r.stderr
+okdoc={'schema':1,'event':'workflow_dispatch','run_id':'999',
+       'head_sha':'e'*40,'publish':True}
+rc,env,log=_check_consent(okdoc)
+check('[c6] consent=true passes manual publish gate',rc==0 and 'SKIP_REMAIN=true' not in env)
+rc,env,log=_check_consent(dict(okdoc,publish=False))
+check('[c7] consent=false yields explicit normal no-op',rc==0 and 'SKIP_REMAIN=true' in env)
+rc,env,log=_check_consent(None)
+check('[c8] legacy missing consent is RED, never auto-published',rc!=0)
+for k,bad in (('run_id',dict(okdoc,run_id='1000')),
+              ('head_sha',dict(okdoc,head_sha='f'*40)),
+              ('schema',dict(okdoc,schema=2)),
+              ('publish',dict(okdoc,publish='true'))):
+    rc,env,log=_check_consent(bad)
+    check(f'[c9] invalid {k} marker refuses publish',rc!=0)
+kv,rc=_run_cls(TRIGGER_KIND='workflow_dispatch',RECOVERY_RUN_ID='40254429486',
+               RECOVERY_SHA='a'*64,RECOVERY_ACK='PUBLISH-LEGACY-BUILD-40254429486')
+check('[c10] legacy recovery requires pinned run, SHA, exact ack',
+      rc==0 and kv.get('recovery')=='true' and kv.get('run_id')=='40254429486'
+      and kv.get('run_head')=='783efd63eeea89e2999e0408d55ea0de70fbed7c')
+for k,opts in (('run',{'RECOVERY_RUN_ID':'123'}),
+               ('ack',{'RECOVERY_ACK':'not-authorized'}),
+               ('sha',{'RECOVERY_SHA':'abc'})):
+    vals={'TRIGGER_KIND':'workflow_dispatch','RECOVERY_RUN_ID':'40254429486',
+          'RECOVERY_SHA':'a'*64,'RECOVERY_ACK':'PUBLISH-LEGACY-BUILD-40254429486'}
+    vals.update(opts)
+    kv,rc=_run_cls(**vals)
+    check(f'[c11] legacy recovery malformed {k} refuses',rc!=0)
 
 # ---- ledger lookup (engine CLI; covers defect B: candidates[] scan)
 def _lk(state_doc, run_id):
@@ -502,7 +568,7 @@ for _n, _d in _WFS.items():
 _all_src = ''.join(open(ROOT / ('.github/workflows/' + n)).read() for n in _WFS)
 check('[g14] no actions:write anywhere; contents:write ONLY at publish-release top level',
       'actions: write' not in _all_src.replace('actions: read', '')
-      and _PR['permissions'] == {'contents': 'write'}
+      and _PR['permissions'] == {'contents': 'write', 'actions': 'read'}
       and all('permissions' not in sp for sp in _PR['jobs'].values())
       and _WFS['daily-maintenance.yml']['permissions'] == {'contents': 'read'})
 check('[g15] workflow_run restricted to the two build workflows, completed-only, default-branch-only',
@@ -514,7 +580,12 @@ check('[g15] workflow_run restricted to the two build workflows, completed-only,
 _src = open(ROOT / '.github/workflows/publish-release.yml').read()
 check('[g16] publisher pinned to default-branch code (supply-chain) + artifact by audited run-id',
       'ref: ${{ github.event.repository.default_branch }}' in _src
-      and 'run-id: ${{ steps.cls.outputs.run_id }}' in _src)
+      and 'run-id: ${{ steps.cls.outputs.run_id }}' in _src
+      and 'github-token: ${{ github.token }}' in _src)
+check('[g17] direct manual publish opt-out enforced from source artifact, not workflow_run.inputs',
+      'workflow_run.inputs.publish' not in _src.replace('# The workflow_run.inputs.publish field is absent in real','')
+      and 'publish-intent.json' in _src and 'publish-intent.json' in open(ROOT/'.github/workflows/build-chromium.yml').read()
+      and _PR['permissions'].get('actions') == 'read')
 
 print(f'PUBLISH-TESTS PASS={PASS} FAIL={fail}')
 sys.exit(1 if fail else 0)
