@@ -384,9 +384,11 @@ out=$(python3 "port/tests/sigsys_r10_test.py" 2>&1); got=$?
 # [45] Build-runner publish consent is written without relying on Python.
 # A failing publish-intent writer must never claim SUCCESS or silent consent.
 out=$(python3 port/tests/publish_intent_test.py 2>&1); got=$?
-[ "$got" -eq 0 ] && echo "$out" | grep -q '^PUBLISH-INTENT-TESTS PASS=12 FAIL=0
- \
-  && pass "[45] shell publish-intent 12-case matrix" \
-  || { fail "[45] shell publish-intent"; printf '%s\n' "$out" | tail -40; }
+if [ "$got" -eq 0 ] && grep -q '^PUBLISH-INTENT-TESTS PASS=12 FAIL=0$' <<< "$out"; then
+  pass "[45] shell publish-intent 12-case matrix"
+else
+  fail "[45] shell publish-intent"
+  printf '%s\n' "$out" | tail -40
+fi
 
 exit $rc
