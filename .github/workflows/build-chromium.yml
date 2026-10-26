@@ -280,6 +280,12 @@ jobs:
           ver=$(dpkg-deb -f "$deb" Version)
           [ "$pkg" = "chromium-sandboxed" ] || { echo "wrong package name: $pkg"; exit 1; }
           echo "artifact: $pkg $ver"
+          # Installation ownership gate (F6 release blocker, DESIGN Round 26):
+          # verify ACTUAL dpkg-deb member paths incl. symlinks. Never let this
+          # package own stock Chromium's chromium.desktop, manpage, icons,
+          # AppStream metadata or bin symlinks; require the isolated set.
+          # Must pass before Upload artifacts and any Pre-release creation.
+          python3 port/package_identity_gate.py "$deb"
           # Fail-closed rule enforcement lives IN the hook (DESIGN Round 25:
           # transformer rc + per-rule records + scan marker, independent of
           # the builder's shell options). Here the host mirror is the primary
