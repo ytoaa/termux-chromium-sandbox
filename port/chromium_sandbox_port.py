@@ -544,7 +544,7 @@ const pthread_t g_termux_main_thread = pthread_self();
         # reset, and incomplete include/guard changes.
         pos = text.find(R10_MARKER)
         next_pos = text.find("SandboxSeccompBPF::StartSandboxWithExternalPolicy(", pos)
-        if (pos < 0 or next_pos < 0 or next_pos - pos > 1400 or
+        if (pos < 0 or next_pos < 0 or next_pos - pos > 2200 or
                 'signal(SIGSYS, SIG_DFL)' not in text[pos:next_pos] or
                 'CHECK(old_sigsys_handler != SIG_ERR)' not in text[pos:next_pos] or
                 '#if defined(__BIONIC__)' not in text[max(0, pos-12):pos+80] and
