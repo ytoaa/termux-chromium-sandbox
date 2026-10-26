@@ -329,8 +329,8 @@ python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS
   || fail "[35] maintenance engine scenarios"
 
 # [36] Round 15/16 static verification (mode fail-closed matrix + migrations).
-python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=76 FAIL=0$' \
-  && pass "[36] maintenance static workflow+seed 76/76" \
+python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=79 FAIL=0$' \
+  && pass "[36] maintenance static workflow+seed 79/79" \
   || fail "[36] maintenance static checks"
 
 # [37] TERMUX_PKG_REVISION injection behavior (default-off reproducibility).
@@ -363,8 +363,8 @@ python3 "port/tests/maintenance_signature_test.py" 2>&1 | grep -q '^MAINTENANCE-
 
 # [42] Round 17 pre-release publisher (required 19-row scenario table: publish
 # gating, integrity refusals, dedup/collision, draft-safe recovery, gates).
-python3 "port/tests/publish_test.py" 2>&1 | grep -q '^PUBLISH-TESTS PASS=64 FAIL=0$' \
-  && pass "[42] pre-release publisher scenarios (19-row table + classify/ledger-lookup/e-series exit-code fidelity + ledger-vs-artifact cross-check, 64 checks)" \
+python3 "port/tests/publish_test.py" 2>&1 | grep -q '^PUBLISH-TESTS PASS=81 FAIL=0$' \
+  && pass "[42] pre-release publisher scenarios (19-row table + classify/ledger-lookup/e-series exit-code fidelity + ledger-vs-artifact cross-check, 81 checks)" \
   || fail "[42] pre-release publisher scenarios"
 
 exit $rc
