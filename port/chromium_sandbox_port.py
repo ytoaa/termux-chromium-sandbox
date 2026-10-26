@@ -567,7 +567,7 @@ const pthread_t g_termux_main_thread = pthread_self();
         registry = trap.index(R11_REG_MARKER)
         constructor = trap.index(R11_TRAP_MARKER)
         old_checker = trap.index("if (!IsDefaultSignalAction(old_sa))", constructor)
-        if not (registry < constructor < old_checker
+        if not (constructor < old_checker < registry
                 and "#if defined(__BIONIC__)" in trap[registry-130:registry]
                 and "const bool r11_previous_chromium" in trap[constructor:old_checker]
                 and "sigaction(LINUX_SIGSYS" not in trap[constructor:old_checker]
