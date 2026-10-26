@@ -374,12 +374,11 @@ python3 "port/tests/publisher_release_auth_test.py" 2>&1 | grep -q '^RELEASE-AUT
   && pass "[43] release auth historical-target safety matrix (12 checks)" \
   || fail "[43] release auth historical-target safety matrix"
 
-exit $rc
-
-
 # [44] Android/Termux SIGSYS ownership regression. Exact Chromium fixture
 # anchors + pre-BPF reset + bionic guard + corruption/drift negative controls.
 out=$(python3 "port/tests/sigsys_r10_test.py" 2>&1); got=$?
 [ "$got" -eq 0 ] && echo "$out" | grep -q '^R10-TESTS PASS=12 FAIL=0$' \
   && pass "[44] Bionic SIGSYS pre-BPF reservation (12 checks)" \
   || { fail "[44] R10 SIGSYS regression"; printf '%s\n' "$out" | tail -45; }
+
+exit $rc
