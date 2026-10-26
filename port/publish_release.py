@@ -621,8 +621,11 @@ def cmd_execute(args) -> int:
 
     # ---- flip to published PRE-RELEASE, then re-read from the API
     gh(args.gh_bin, 'release', 'edit', tag, '--draft=false', '--repo', args.repo)
+    # gh release view --json uses the CLI field name "url", NOT the
+    # REST API's "html_url". The old selector falsely failed AFTER the
+    # release was already published, leaving a red workflow on success.
     final = json.loads(gh(args.gh_bin, 'release', 'view', tag, '--json',
-                          'isDraft,isPrerelease,assets,html_url',
+                          'isDraft,isPrerelease,assets,url',
                           '--repo', args.repo) or '{}')
     if final.get('isDraft') or not final.get('isPrerelease'):
         raise Refuse(EXIT_TRANSIENT,
@@ -633,10 +636,16 @@ def cmd_execute(args) -> int:
         raise Refuse(EXIT_TRANSIENT,
                      'post-publish asset verification failed — success NOT '
                      'claimed; retry publish step (no rebuild)')
-    _write(args.out, {'status': 'published', 'tag': tag, 'url': final.get('html_url'),
+    published_url = final.get('url')
+    if not isinstance(published_url, str) or not published_url.startswith(
+            f'https://github.com/{args.repo}/releases/tag/'):
+        raise Refuse(EXIT_TRANSIENT,
+                     'post-publish release URL missing/malformed — retry-safe '
+                     'verification refusal (release may already be published)')
+    _write(args.out, {'status': 'published', 'tag': tag, 'url': published_url,
                       'prerelease': True, 'deb_sha256': v['deb_sha256'],
                       'assets': sorted(fnames)})
-    print(f"PUBLISH-OK pre-release {tag} -> {final.get('html_url')}")
+    print(f"PUBLISH-OK pre-release {tag} -> {published_url}")
     return 0
 
 
