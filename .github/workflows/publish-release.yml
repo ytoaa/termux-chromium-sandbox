@@ -306,10 +306,55 @@ jobs:
           python3 port/publish_release.py plan --verified verified.json \
             --gh-bin gh --repo '${{ github.repository }}' "${args[@]}"
 
-      - name: Execute (draft -> assets -> verify -> pre-release)
+      # GitHub's Releases API requires Workflows:write when targeting a
+      # historical commit with workflow-file changes relative to main.
+      # The builtin GITHUB_TOKEN cannot have Workflows:write. Keep the exact
+      # build SHA as release target; never quietly retarget it to main.
+      - name: Authorize exact build-commit release target (fail closed)
         if: env.SKIP_REMAIN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.cls.outputs.run_head }}
+          ELEVATED_TOKEN_CONFIGURED: ${{ secrets.TCS_RELEASE_WORKFLOWS_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          action=$(jq -r '.action' publish-plan.json)
+          case "$action" in
+            already-published|collision|blocked-ownership)
+              echo "plan does not create a release — authorization gate not applicable"
+              exit 0 ;;
+            publish|resume-draft) : ;;
+            *) echo "::error::unknown publish plan action: $action"; exit 1 ;;
+          esac
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "::error::invalid source commit SHA"; exit 1; }
+          case "$ELEVATED_TOKEN_CONFIGURED" in
+            true)
+              echo "dedicated release token supplied (Contents:write + Workflows:write required)"
+              ;;
+            false)
+              # GitHub's default token is sufficient when the build SHA is
+              # still the HEAD of the default branch. Old or moved commits
+              # require an authorized token; never weaken source provenance.
+              default_sha=$(gh api \
+                "repos/${{ github.repository }}/git/ref/heads/${{ github.event.repository.default_branch }}" \
+                --jq '.object.sha')
+              [[ "$default_sha" =~ ^[a-f0-9]{40}$ ]] || { echo "::error::cannot verify main HEAD"; exit 1; }
+              if [ "$SOURCE_SHA" != "$default_sha" ]; then
+                echo "::error::release target is a historical commit. Configure TCS_RELEASE_WORKFLOWS_TOKEN (repo-scoped Contents:write + Workflows:write), then re-run this publisher. No release or tag created."
+                exit 1
+              fi
+              echo "source SHA equals current default-branch HEAD — builtin token permitted"
+              ;;
+            *) echo "::error::invalid release-token configuration state"; exit 1 ;;
+          esac
+
+      - name: Execute (draft -> assets -> verify -> pre-release)
+        if: env.SKIP_REMAIN != 'true'
+        env:
+          # Prefer an optional, repo-scoped credential with both Contents:write
+          # and Workflows:write for historical SHA targets. Only this final
+          # publishing step receives it; read-only audit uses GITHUB_TOKEN.
+          GH_TOKEN: ${{ secrets.TCS_RELEASE_WORKFLOWS_TOKEN || github.token }}
         run: |
           set -euo pipefail
           # Round 18 (defect A): do NOT wrap the publisher in `if ! cmd` —
@@ -335,6 +380,6 @@ jobs:
             echo "- source: \`${{ steps.cls.outputs.source || 'n/a' }}\`  run: \`${{ steps.cls.outputs.run_id || 'n/a' }}\`"
             if [ "${SKIP_REMAIN:-false}" = "true" ]; then echo "- **no-op**: nothing to publish (ledger gate / opt-out / unhandled source)"; fi
             if [ -f publish-plan.json ]; then echo "- plan: \`$(jq -c '{action,reason}' publish-plan.json)\`"; fi
-            if [ -f publish-result.json ]; then echo "- result: \`$(jq -c publish-result.json)\`"; fi
+            if [ -f publish-result.json ]; then echo "- result: \`$(jq -c . publish-result.json)\`"; fi
             echo "- status: **CI VERIFIED — DEVICE NOT VERIFIED** (device checks are the user's responsibility)"
           } >> "$GITHUB_STEP_SUMMARY"

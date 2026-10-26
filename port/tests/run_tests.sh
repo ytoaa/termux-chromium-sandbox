@@ -367,4 +367,11 @@ python3 "port/tests/publish_test.py" 2>&1 | grep -q '^PUBLISH-TESTS PASS=81 FAIL
   && pass "[42] pre-release publisher scenarios (19-row table + classify/ledger-lookup/e-series exit-code fidelity + ledger-vs-artifact cross-check, 81 checks)" \
   || fail "[42] pre-release publisher scenarios"
 
+# [43] GitHub Releases workflow-authorization regression for old source SHAs:
+# builtin-token/head PASS; historic-token-missing FAIL; dedicated token PASS;
+# malformed and API error fail closed; no retarget; summary fixed.
+python3 "port/tests/publisher_release_auth_test.py" 2>&1 | grep -q '^RELEASE-AUTH-TESTS PASS=12 FAIL=0$' \
+  && pass "[43] release auth historical-target safety matrix (12 checks)" \
+  || fail "[43] release auth historical-target safety matrix"
+
 exit $rc
