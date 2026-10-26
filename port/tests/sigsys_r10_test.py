@@ -56,7 +56,7 @@ with tempfile.TemporaryDirectory() as dirname:
     start = text.index(R10_MARKER)
     end = text.index("SandboxSeccompBPF::StartSandboxWithExternalPolicy(", start)
     check("R10 reset immediately precedes BPF", end > start and
-          "signal(SIGSYS, SIG_DFL)" in text[start:end] and end - start < 1400)
+          "signal(SIGSYS, SIG_DFL)" in text[start:end] and end - start < 2200)
     check("R10 fail closed on signal failure",
           "CHECK(old_sigsys_handler != SIG_ERR)" in text[start:end])
     guard_start = text.rfind("#if defined(__BIONIC__)", 0, start)

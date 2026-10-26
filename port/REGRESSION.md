@@ -140,3 +140,80 @@ refusals. Source tests are NOT evidence of runtime sandbox activation.
 
 This R10 candidate does not affect `maintenance-state`, the existing
 `-2` validated baseline, or the `-3` published Release.
+
+
+## R10 device findings and R11 read-only instrumentation (2026-10-26)
+
+**R10 DEVICE NO-GO**: Termux Android kernel 6.1.162, Chromium
+156.0.8078.47 (unrevisioned R10 build artifact from Actions #40316851934;
+this is NOT validated `-2` or published `-3`). Live census showed
+multiple child processes `Seccomp:2 / Seccomp_filters:2 / NoNewPrivs:1`
+and repeated successful `Activated seccomp-bpf sandbox` logs. R10
+`replaced pre-existing Android SIGSYS handler` appeared 53 times. Yet a
+`renderer process crashed` BackForwardCache diagnostic was observed and
+one `trap.cc:106 Existing signal handler ... SIGSYS` recurred.
+
+The exceptional sequence was **22:50:51.698** `[14698:14706]`
+`trap.cc:106`, then **22:50:51.723** `[14698:14698]` R10 handler reset,
+then **22:50:51.724** `[14698:14698]` BPF activation for `utility`.
+The `/proc` snapshot later identified process PID 14698 (PPID 10340,
+filters=2), with child PID 14706 (PPID 14698, filters=2). A PID:TID
+logging prefix does not establish that the earlier message was emitted
+by the same thread; after-fork logging/pid caching may matter. No
+causal conclusion from the 25ms difference alone.
+
+`chrome://gpu` still displayed accelerated ANGLE OpenGL via Zink /
+Turnip Adreno 750 (Mesa 26.2.5); GPU crash count 0. An `eglGetMscRateANGLE`
+warning flood and an independent WebGL/Vulkan warning are not established
+as causes of the renderer failure. `Seccomp_filters=2` is strong BPF
+evidence, not a completed P2b causality comparison.
+
+**R11 scope = logging only; NOT a fix, NOT for publication**:
+
+- In `sandbox_linux.cc`, use non-mutating
+  `sigaction(SIGSYS, nullptr, &before)` to log the existing handler as
+  `default`, `ignored`, or `installed`, immediately **before**
+  the pre-existing R10 `signal(SIGSYS, SIG_DFL)`. The existing reset
+  remains verbatim; still CHECK-fail on an error.
+- In `trap.cc`, emit a single `r11-trap-create` event when
+  `Trap::Registry()` creates its first `Trap` object. Immediately
+  after upstream `sys_sigaction`, log old handler as `default`,
+  `ignored`, `chromium` (same `SigSysAction` pointer) or `foreign`.
+  **No raw handler addresses are logged**, no changes to handlers,
+  and the original upstream warning and filter installation are preserved.
+- All instrumentation is `#if defined(__BIONIC__)` and uses
+  `VLOG(1)`. Do not add setuid/userns/no-sandbox fallbacks, policy
+  exceptions, or changes to `LD_PRELOAD`.
+- Source tests: `python3 port/tests/sigsys_r11_diag_test.py`, 15
+  positive/negative checks; full fixture is pinned Chromium 156
+  `trap.cc`. CI tests are *not* runtime evidence.
+
+**Device capture** (new disposable profile; browser process only through
+`chromium-sandboxed` wrapper, never direct `chrome` bypass):
+
+```bash
+TEST="$HOME/chromium-r11-test"
+mkdir -p "$TEST/profile"
+DISPLAY="${DISPLAY:-:0}" chromium-sandboxed \
+  --ozone-platform=x11 --user-data-dir="$TEST/profile" \
+  --no-first-run --enable-logging=stderr --v=1 \
+  https://example.com >"$TEST/launch.log" 2>&1 &
+# During tab crashes/restarts also capture exe/PPid/Tgid/Pid/Threads/
+# Seccomp/Seccomp_filters/NoNewPrivs for relevant /proc/PID/status entries.
+grep -aEn 'r11-before-reset|r11-trap-create|r11-trap-owner|\
+Existing signal handler|Activated seccomp-bpf|renderer process crashed' \
+  "$TEST/launch.log" >"$TEST/sigsys-events.txt"
+```
+
+**Interpretation**: group by PID and actual PPid/Tgid timeline and order
+`r11-trap-create`, `r11-trap-owner`, `r11-before-reset`,
+R10 replacement and BPF activation. `r11-trap-owner: prior=chromium`
+suggests an already installed Chromium handler in the forked path;
+`prior=foreign` suggests another installed handler but does NOT
+prove Android ownership; `r11-before-reset: installed` confirms R10
+is about to replace *some* nondefault action. If the pre-reset action
+is an existing Chromium handler, applying SIG_DFL may break later
+SECCOMP_RET_TRAP handling; **do not suppress this finding**.
+A crash-free tab session and BPF causality control are still required
+before any final approval. Keep this diagnostic PR unmerged and its
+`publish` input `false`.

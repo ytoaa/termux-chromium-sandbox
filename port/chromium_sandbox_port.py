@@ -42,6 +42,9 @@ R7_MARKER = "Termux seccomp-only bionic stack cache:"
 R8_MARKER = "Termux seccomp-only bionic stack-top:"
 R9A_MARKER = "Termux seccomp-only net-sockopt:"
 R10_MARKER = "Termux seccomp-only bionic-sigsys:"
+R11_BEFORE_MARKER = "Termux seccomp-only r11-before-reset:"
+R11_TRAP_MARKER = "Termux seccomp-only r11-trap-owner:"
+R11_REG_MARKER = "Termux seccomp-only r11-trap-create:"
 
 
 class PortError(RuntimeError):
@@ -109,6 +112,7 @@ class Port:
     # ---------- rules ----------
     ZYGOTE_HOST = "content/browser/zygote_host/zygote_host_impl_linux.cc"
     SANDBOX_LINUX = "sandbox/policy/linux/sandbox_linux.cc"
+    TRAP = "sandbox/linux/seccomp-bpf/trap.cc"
     SYSCALL_RESTRICT = "sandbox/linux/seccomp-bpf-helpers/syscall_parameters_restrictions.cc"
     NETWORK_POLICY = "sandbox/policy/linux/bpf_network_policy_linux.cc"
     STACK_TRACE = "base/debug/stack_trace.cc"
@@ -429,6 +433,49 @@ const pthread_t g_termux_main_thread = pthread_self();
 #endif  // defined(__BIONIC__)
 """ + R10_OLD
 
+
+    # R11 DIAGNOSTICS ONLY (2026-10-26, DEVICE NO-GO):
+    # Trap::Trap() has been observed in a forked child with an existing
+    # SIGSYS action about 25ms before the parent's R10 reset. Do NOT change
+    # filter policy, signal dispositions or R10's reset in this experiment.
+    # Log categorical signal-owner state, not raw handler pointers.
+    # Chromium's existing log prefix supplies both PID and TID.
+    R11_BEFORE_OLD = """  const auto old_sigsys_handler = signal(SIGSYS, SIG_DFL);"""
+    R11_BEFORE_NEW = """  // """ + R11_BEFORE_MARKER + """ read-only ownership probe (before R10).
+  struct sigaction termux_r11_before = {};
+  CHECK(sigaction(SIGSYS, nullptr, &termux_r11_before) == 0);
+  VLOG(1) << "Termux seccomp-only r11-before-reset: "
+          << (termux_r11_before.sa_handler == SIG_DFL ? "default" :
+              termux_r11_before.sa_handler == SIG_IGN ? "ignored" :
+                                                            "installed")
+          << " siginfo=" << !!(termux_r11_before.sa_flags & SA_SIGINFO);
+""" + R11_BEFORE_OLD
+
+    R11_TRAP_OLD = """  if (!IsDefaultSignalAction(old_sa)) {"""
+    R11_TRAP_NEW = """#if defined(__BIONIC__)
+  // """ + R11_TRAP_MARKER + """ classify the *previous* action. The
+  // trap constructor already replaced it via sys_sigaction above.
+  // Only this class can compare it against its own SigSysAction without
+  // exposing a raw function pointer.
+  const bool r11_previous_chromium =
+      old_sa.sa_handler == reinterpret_cast<void (*)(int)>(SigSysAction);
+  VLOG(1) << "Termux seccomp-only r11-trap-owner: prior="
+          << (IsDefaultSignalAction(old_sa) ? "default" :
+              r11_previous_chromium ? "chromium" :
+              old_sa.sa_handler == SIG_IGN ? "ignored" : "foreign")
+          << " siginfo=" << !!(old_sa.sa_flags & SA_SIGINFO);
+#endif  // defined(__BIONIC__)
+""" + R11_TRAP_OLD
+
+    R11_REG_OLD = """  if (!global_trap_) {
+    global_trap_ = new Trap();"""
+    R11_REG_NEW = """  if (!global_trap_) {
+#if defined(__BIONIC__)
+    // """ + R11_REG_MARKER + """ first registry creation in this process.
+    VLOG(1) << "Termux seccomp-only r11-trap-create: first construction";
+#endif  // defined(__BIONIC__)
+    global_trap_ = new Trap();"""
+
     def apply(self) -> None:
         self.replace_once(self.ZYGOTE_HOST, "R1 seccomp-only usable mode (Bionic)",
                           self.R1_OLD, self.R1_NEW)
@@ -436,8 +483,27 @@ const pthread_t g_termux_main_thread = pthread_self();
                           self.R2_OLD, self.R2_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R10 bionic SIGSYS reservation include",
                           self.R10_INCLUDE_OLD, self.R10_INCLUDE_NEW)
-        self.replace_once(self.SANDBOX_LINUX, "R10 bionic SIGSYS reservation before BPF",
-                          self.R10_OLD, self.R10_NEW)
+        # R11 instruments *inside* the exact R10 patch body. On the
+        # second invocation the original uninstrumented R10_NEW is no
+        # longer contiguous, even though R10 is already applied. Recognize
+        # only the exact fully instrumented R10 body. A partial or
+        # corrupted body is NOT accepted as ALREADY_PRESENT.
+        r10_instrumented = self.R10_NEW.replace(
+            self.R11_BEFORE_OLD, self.R11_BEFORE_NEW)
+        if self.p(self.SANDBOX_LINUX).read_text().count(r10_instrumented) == 1:
+            self.record("R10 bionic SIGSYS reservation before BPF",
+                        self.SANDBOX_LINUX, "ALREADY_PRESENT",
+                        "exact R11-instrumented R10 body")
+        else:
+            self.replace_once(self.SANDBOX_LINUX,
+                              "R10 bionic SIGSYS reservation before BPF",
+                              self.R10_OLD, self.R10_NEW)
+        self.replace_once(self.SANDBOX_LINUX, "R11 SIGSYS action snapshot before R10",
+                          self.R11_BEFORE_OLD, self.R11_BEFORE_NEW)
+        self.replace_once(self.TRAP, "R11 classify prior handler at Trap::Trap",
+                          self.R11_TRAP_OLD, self.R11_TRAP_NEW)
+        self.replace_once(self.TRAP, "R11 report first Trap::Registry creation",
+                          self.R11_REG_OLD, self.R11_REG_NEW)
         self.replace_once(self.SYSCALL_RESTRICT, "R3 bionic prctl options (arm64-Android)",
                           self.R3_OLD, self.R3_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R4 zygote passthrough (Bionic)",
@@ -468,6 +534,9 @@ const pthread_t g_termux_main_thread = pthread_self();
             (self.SYSCALL_RESTRICT, R3_MARKER, "R3"),
             (self.NETWORK_POLICY, R9A_MARKER, "R9a"),
             (self.SANDBOX_LINUX, R10_MARKER, "R10"),
+            (self.SANDBOX_LINUX, R11_BEFORE_MARKER, "R11 pre"),
+            (self.TRAP, R11_TRAP_MARKER, "R11 trap"),
+            (self.TRAP, R11_REG_MARKER, "R11 registry"),
             (self.SANDBOX_LINUX, R4_MARKER, "R4"),
             (self.SANDBOX_LINUX, R5_MARKER, "R5"),
             (self.STACK_TRACE, R7_MARKER, "R7"),
@@ -488,7 +557,7 @@ const pthread_t g_termux_main_thread = pthread_self();
         # reset, and incomplete include/guard changes.
         pos = text.find(R10_MARKER)
         next_pos = text.find("SandboxSeccompBPF::StartSandboxWithExternalPolicy(", pos)
-        if (pos < 0 or next_pos < 0 or next_pos - pos > 1400 or
+        if (pos < 0 or next_pos < 0 or next_pos - pos > 2200 or
                 'signal(SIGSYS, SIG_DFL)' not in text[pos:next_pos] or
                 'CHECK(old_sigsys_handler != SIG_ERR)' not in text[pos:next_pos] or
                 '#if defined(__BIONIC__)' not in text[max(0, pos-12):pos+80] and
@@ -497,6 +566,28 @@ const pthread_t g_termux_main_thread = pthread_self();
         if '#include <signal.h>' not in text:
             raise PortError("verifier: R10 missing signal.h")
         print("[     VERIFIED] R10 Bionic-only SIGSYS reservation before BPF")
+        # R11: fail closed on missing instrumentation, unsafe disposition
+        # changes, unexpected order, or unguarded instrumentation.
+        pre = text.index(R11_BEFORE_MARKER)
+        reset = text.index("signal(SIGSYS, SIG_DFL)", pre)
+        bpf = text.index("SandboxSeccompBPF::StartSandboxWithExternalPolicy(", reset)
+        if not (pre < reset < bpf and
+                text.count("sigaction(SIGSYS, nullptr, &termux_r11_before)") == 1 and
+                text.count("const auto old_sigsys_handler = signal(SIGSYS, SIG_DFL);") == 1 and
+                "CHECK(sigaction(SIGSYS, nullptr, &termux_r11_before) == 0)" in text[pre:reset]):
+            raise PortError("verifier: R11 read-only pre-R10 snapshot/order drift")
+        trap = self.p(self.TRAP).read_text()
+        registry = trap.index(R11_REG_MARKER)
+        constructor = trap.index(R11_TRAP_MARKER)
+        old_checker = trap.index("if (!IsDefaultSignalAction(old_sa))", constructor)
+        if not (constructor < old_checker < registry
+                and "#if defined(__BIONIC__)" in trap[registry-130:registry]
+                and "const bool r11_previous_chromium" in trap[constructor:old_checker]
+                and "sigaction(LINUX_SIGSYS" not in trap[constructor:old_checker]
+                and trap.count("sys_sigaction(LINUX_SIGSYS, &sa, &old_sa)") == 1
+                and trap.count("global_trap_ = new Trap();") == 1):
+            raise PortError("verifier: R11 Trap owner/create probe drift")
+        print("[     VERIFIED] R11 read-only signal owner/order probes; BPF policy unchanged")
         # Gate 3: vendored PA patches must be present WHENEVER the subtree is
         # shipped (silently skipping them would ship a build that still calls
         # pthread_getattr_np after the filter - the exact boot-loop we fix).

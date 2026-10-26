@@ -72,6 +72,12 @@ file = "sandbox/policy/linux/sandbox_linux.cc"
 marker = "Termux seccomp-only bionic-sigsys:"
 note = "Experimental device-fix candidate ONLY (2026-10-26): on Android the app zygote owns SIGSYS; upstream SeccompStarterAndroid resets SIGSYS to SIG_DFL before SandboxBPF. Termux builds Linux-on-bionic, so the Android starter is skipped. R10 reserves SIGSYS only in __BIONIC__ children just before StartSandboxWithExternalPolicy; it does not relax policies or enable a fallback. Must pass sandbox device gate, crash-free navigation, BPF filter census and causality check before any promotion."
 
+[rules.r11]
+name = "Read-only SIGSYS handler ownership and Trap initialization ordering diagnostic"
+file = "sandbox/linux/seccomp-bpf/trap.cc"
+marker = "Termux seccomp-only r11-trap-owner:"
+note = "DIAGNOSTIC ONLY / NO-GO (2026-10-26). R10 BPF filter count 2 was observed on device, yet one trap.cc:106 conflict recurred in PID/TID 14698:14706 BEFORE PID 14698 R10 init, and an earlier renderer crashed. R11 logs categorical pre-R10 SIGSYS action (default, ignored, installed), first Trap::Registry creation, and Trap::Trap previous action (default, ignored, chromium, foreign), without raw pointers and without changing existing R10 signal handling or BPF rules. Not a fix. Device verification and crash-free reproduction required; never publish or promote R11 diagnostics without independent approval."
+
 [rules.r9b]
 name = "PULSE_SERVER export in shield wrapper (packaging-level)"
 file = "port/prepare_recipe.py"
