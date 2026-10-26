@@ -53,26 +53,32 @@ def run(**kw):
     return M.decide(state(kw.get('blocked')), p, kw.get('port_sha', ph()),
                     't', kw.get('issues', []), None, MIGS)
 
-# [sim1] fully identical build inputs -> SKIP (via re-proven v1->v2 equivalence)
+# [sim1] The *historical* fingerprint still matches the pinned migration;
+# R10's current raw transformer + contract deliberately DO NOT match it.
+old = run(port_sha=MIGS[0]['port_inputs_hash_v2'])
 pl = run()
-check('[sim1] identical build inputs -> skip (no build)',
-      pl['action'] == 'skip' and pl['reason'] == 'identical-inputs-already-built', pl['reason'])
-# [sim2] only a validated-promotion DATE/record edit -> SKIP
+check('[sim1] frozen rev-2 pin skips, new R10 inputs REQUIRE build',
+      old['action'] == 'skip' and old['reason'] == 'identical-inputs-already-built'
+      and pl['action'] == 'build' and pl['target']['revision'] == 3,
+      f"old={old['reason']} new={pl['reason']}")
+# [sim2] audit-only edits leave new R10 identity unchanged; still BUILD
 t2 = TOML.replace('last_validated_promoted = "2026-10-25 manual human-approved promotion (Phase B CI + C/C.1/C.2 device gates)"',
                   'last_validated_promoted = "2027-01-01 some future human promotion"')
-check('[sim2] promotion-record-only edit -> same hash -> skip',
+check('[sim2] promotion-record-only edit -> same new identity -> build',
       M.port_toml_semantic_sha(t2) == M.port_toml_semantic_sha(TOML)
-      and run(port_sha=ph(toml=t2))['action'] == 'skip')
-# [sim3] only device-gate HISTORY edit -> SKIP
+      and ph(toml=t2) == ph()
+      and run(port_sha=ph(toml=t2))['action'] == 'build')
+# [sim3] history-only edit cannot make the changed R10 input match old pin
 t3 = TOML.replace('device_gate_history = [',
                   'device_gate_history = [\n  "synthetic future gate record for simulation",')
-check('[sim3] device_gate_history-only edit -> same hash -> skip',
+check('[sim3] device_gate_history-only edit -> same hash -> build',
       M.port_toml_semantic_sha(t3) != '' and
       M.port_toml_semantic_sha(t3) == M.port_toml_semantic_sha(TOML)
-      and run(port_sha=ph(toml=t3))['action'] == 'skip')
-# [sim4] docs-only commit (no port input touched) -> SKIP
-check('[sim4] docs-only change -> skip (inputs untouched)',
-      run()['action'] == 'skip')
+      and ph(toml=t3) == ph()
+      and run(port_sha=ph(toml=t3))['action'] == 'build')
+# [sim4] docs-only commit does not erase changed R10 identity: still BUILD
+check('[sim4] docs-only change cannot make current R10 identical to old release',
+      run()['action'] == 'build' and ph() != MIGS[0]['port_inputs_hash_v2'])
 # [sim5] BPF policy contract edit -> BUILD (revision 3 detection intact)
 t5 = TOML.replace('require_bpf_policy = true', 'require_bpf_policy = false')
 pl = run(port_sha=ph(toml=t5))
