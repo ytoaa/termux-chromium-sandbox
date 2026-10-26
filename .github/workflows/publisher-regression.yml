@@ -1,0 +1,25 @@
+# Lightweight publisher/maintenance regression validation on pull requests.
+# No Chromium compilation, elevated token, state writes or publishing.
+name: Publisher Regression Checks
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/build-chromium.yml'
+      - '.github/workflows/publish-release.yml'
+      - '.github/workflows/publisher-regression.yml'
+      - 'port/tests/**'
+      - 'port/publish_release.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run existing publisher, maintenance, and seccomp fixture regressions
+        run: bash port/ci.sh selftest
