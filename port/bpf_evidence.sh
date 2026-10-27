@@ -59,46 +59,46 @@ census() { # $1=bin(exe-verified) $2=out-file
 }
 
 broker_channel() { # $1=census-file $2=chrome-exe — SAME-SNAPSHOT broker proof
-  # Exit codes (measurement integrity contract, 2026-10-27):
-  #   0 = probe executed; stdout = shared-inode count (0 => genuine absence -> WARN)
-  #   2 = census lists no renderer rows (absence of the class; renderer_verdict decides)
-  #   3 = /proc/PID/fd unreadable for census renderers (measurement failure, NOT absence)
-  #   4 = census pids no longer match identity (dead/pid-reuse: stale snapshot)
-  # Never rescan live /proc for pid discovery: pids come ONLY from the census
-  # file written moments earlier inside the same alive-window (no cross-time mixing).
+  # Strict measurement contract (2026-10-27 final audit): partial measurement
+  # failure is NEVER masked by other renderers succeeding.
+  #   0 = FULL measurement: every census renderer probed alive with matching
+  #       exe and readable fds; every census zygote fd-readable. stdout =
+  #       shared-inode count (0 => genuine absence -> WARN)
+  #   2 = census lacks the renderer class or the zygote (broker) class —
+  #       proof impossible from this snapshot (absence of class, not failure)
+  #   3 = ANY /proc/PID/fd unreadable (renderer OR zygote) — measurement failure
+  #   4 = ANY census pid dead or exe-identity mismatch (stale/pid-reuse)
+  # pids come ONLY from the census snapshot (no live rescan; no cross-time mix).
   local cf=$1 bin=$2
-  local t f s n pp nsb pid zpid ino common=0 checked=0 access_fail=0 stale=0
-  local zyps=" "
-  while read -r t f s n pp nsb pid; do
-    [ "$t" = zygote ] && zyps="$zyps$pid "
+  local t f sn nn pp nsb pid zpid ino common=0
+  local -a renv=() zyps=()
+  while read -r t f sn nn pp nsb pid; do
+    case "$t" in
+      renderer) [ -n "$pid" ] && renv+=("$pid") ;;
+      zygote)   [ -n "$pid" ] && zyps+=("$pid") ;;
+    esac
   done < "$cf"
-  while read -r t f s n pp nsb pid; do
-    [ "$t" = renderer ] || continue
-    [ -n "$pid" ] || continue
-    # identity revalidation of the exact census pid (no substitution)
-    if ! [ -d "$PROC_ROOT/$pid" ]; then stale=$((stale+1)); continue; fi
-    local x; x=$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null)
-    [ "$x" = "$bin" ] || { stale=$((stale+1)); continue; }
-    if ! [ -r "$PROC_ROOT/$pid/fd" ]; then access_fail=$((access_fail+1)); continue; fi
-    checked=$((checked+1))
+  if [ "${#renv[@]}" -eq 0 ] || [ "${#zyps[@]}" -eq 0 ]; then echo 0; return 2; fi
+  for pid in "${renv[@]}"; do
+    [ -d "$PROC_ROOT/$pid" ] || { echo 0; return 4; }
+    [ "$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null)" = "$bin" ] || { echo 0; return 4; }
+    [ -r "$PROC_ROOT/$pid/fd" ] || { echo 0; return 3; }
+  done
+  for zpid in "${zyps[@]}"; do
+    [ -d "$PROC_ROOT/$zpid" ] || { echo 0; return 4; }
+    [ "$(readlink "$PROC_ROOT/$zpid/exe" 2>/dev/null)" = "$bin" ] || { echo 0; return 4; }
+    [ -r "$PROC_ROOT/$zpid/fd" ] || { echo 0; return 3; }
+  done
+  for pid in "${renv[@]}"; do
     while read -r ino; do
       [ -n "$ino" ] || continue
-      for zpid in $zyps; do
-        [ -r "$PROC_ROOT/$zpid/fd" ] || continue
+      for zpid in "${zyps[@]}"; do
         if ls -l "$PROC_ROOT/$zpid/fd" 2>/dev/null | grep -q "socket:\[$ino\]"; then
           common=$((common+1)); break
         fi
       done
     done < <(ls -l "$PROC_ROOT/$pid/fd" 2>/dev/null | sed -n 's/.*socket:\[\([0-9]*\)\].*/\1/p')
-  done < "$cf"
-  if [ "$checked" -eq 0 ]; then
-    if [ "$access_fail" -gt 0 ]; then echo 0; return 3; fi
-    if [ "$stale" -gt 0 ]; then echo 0; return 4; fi
-    echo 0; return 2
-  fi
-  if [ "$access_fail" -gt 0 ] || [ "$stale" -gt 0 ]; then
-    echo "broker: ${access_fail} fd-unreadable, ${stale} stale-of-census (partial window; ${checked} valid)" >&2
-  fi
+  done
   echo "$common"; return 0
 }
 
@@ -237,13 +237,18 @@ run_gate() { # $1=chrome bin, $2=ws
   echo "=== P2b causality control (--disable-seccomp-filter-sandbox) ==="
   spawn_probe "$bin" noflt "$ws" --disable-seccomp-filter-sandbox
   census "$match" "$ws/census-noflt.txt"; stop_probe
-  local ren_off
-  if [ ! -s "$ws/census-noflt.txt" ]; then
-    echo "[FAIL] P2b control census empty — measurement error (control browser never spawned?)"; rc=1
+  local ren_off ren_off_present
+  ren_off_present=$(awk '$1=="renderer"{c++}END{print c+0}' "$ws/census-noflt.txt" 2>/dev/null)
+  if [ ! -s "$ws/census-noflt.txt" ] || [ "${ren_off_present:-0}" -eq 0 ]; then
+    # A control census containing only browser/zygote rows would report
+    # max_field=0 and masquerade as 'filters dropped'. Renderer CLASS presence
+    # and a measurable filter value are verified SEPARATELY from the drop.
+    echo "[FAIL] P2b control census lacks renderer rows (empty or class-missing) — measurement error; never counted as 'dropped'"; rc=1
+  elif [ "${ren:-0}" -le 0 ]; then
+    echo "[FAIL] P2b control comparison vacuous (ported run had no filters>=2 renderer)"; rc=1
   else
     ren_off=$(max_field "$ws/census-noflt.txt" renderer 2)
     echo "  renderer filters with switch OFF: $ren_off (expect < $ren)"
-    # empty-vs-zero guard above: a 0 from an EMPTY file must never read as "dropped"
     [ "$ren_off" -lt "$ren" ] || echo "[WARN] filter count did not drop — 2nd filter may not be Chromium's (or switch inert) — causality UNPROVEN (WARN, not pass)"
   fi
   grep -aE 'No usable sandbox|Existing signal handler when trying to install SIGSYS|Activated seccomp-bpf sandbox' "$ws/ev-noflt.log" | head -3
@@ -366,6 +371,33 @@ selftest() {
   if grep -qE ' 109$' "$t/mi.txt"; then echo "[selftest] multi-instance isolation FAIL"; rc=1
   else echo "[selftest] multi-instance isolation ok"; fi
   rm -rf "$P/109"
+  # ---- broker v3 strictness: PARTIAL failures must not be masked ----
+  mk 105 renderer 2 2 1 "" 101
+  PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/p.txt"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/p.txt" "$real"); BRC=$?
+  [ $BRC -eq 0 ] && echo "[selftest] broker full-window (2 renderers) ok" \
+    || { echo "[selftest] broker full-window FAIL rc=$BRC"; rc=1; }
+  rm -rf "$P/105/fd"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/p.txt" "$real"); BRC=$?
+  [ $BRC -eq 3 ] && echo "[selftest] PARTIAL fd loss (1 of 2 renderers) -> 3, not masked" \
+    || { echo "[selftest] broker partial-fd FAIL rc=$BRC (masked?)"; rc=1; }
+  mkdir -p "$P/105/fd"; ln -sf "socket:[4242]" "$P/105/fd/9" 2>/dev/null
+  rm -rf "$P/105"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/p.txt" "$real"); BRC=$?
+  [ $BRC -eq 4 ] && echo "[selftest] PARTIAL dead pid -> 4, not masked" \
+    || { echo "[selftest] broker partial-dead FAIL rc=$BRC (masked?)"; rc=1; }
+  mk 105 renderer 2 2 1 "" 101
+  rm -rf "$P/101/fd"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/p.txt" "$real"); BRC=$?
+  [ $BRC -eq 3 ] && echo "[selftest] zygote fd unreadable -> 3 (proof impossible)" \
+    || { echo "[selftest] broker zygote-fd FAIL rc=$BRC"; rc=1; }
+  mkdir -p "$P/101/fd"; ln -sf "socket:[4242]" "$P/101/fd/9" 2>/dev/null
+  awk '$1!="zygote"' "$t/p.txt" > "$t/pnz.txt"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/pnz.txt" "$real"); BRC=$?
+  [ $BRC -eq 2 ] && echo "[selftest] renderers without zygote class -> 2 (not 0)" \
+    || { echo "[selftest] broker no-zygote FAIL rc=$BRC"; rc=1; }
+  rm -rf "$P/105"
+
   # ---- log classifier: URL/filename strings must NOT match precise patterns ----
   printf 'load https://x/r11-probe.html?sigsys=1 file sigsys.png SIGSYS\n' > "$t/url.log"
   n=$(grep -acE 'Existing signal handler when trying to install SIGSYS|Activated seccomp-bpf sandbox|No usable sandbox' "$t/url.log")
