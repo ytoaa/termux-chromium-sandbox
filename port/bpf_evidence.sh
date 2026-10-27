@@ -120,8 +120,12 @@ spawn_probe() { # $1=bin $2=label $3=ws $4..=extra chrome flags
   local bin=$1 label=$2 ws=$3; shift 3
   local udd="$ws/udd-ev-$label"
   rm -rf "$udd"
+  # --enable-logging=stderr --v=1: without stderr logging ALL log-based
+  # checks below are vacuously zero (Chromium logs go to logcat) — a silent
+  # measurement hole found in the 2026-10-27 audit. VLOG(1) exposes the
+  # 'Activated seccomp-bpf sandbox' runtime evidence line.
   setsid "$bin" --headless=new --user-data-dir="$udd" --no-first-run \
-      --disable-dev-shm-usage "$@" >"$ws/ev-$label.log" 2>&1 &
+      --disable-dev-shm-usage --enable-logging=stderr --v=1 "$@" >"$ws/ev-$label.log" 2>&1 &
   EV_GPID=$!
   ( sleep 75; kill -KILL -"$EV_GPID" 2>/dev/null ) & EV_WPID=$!
   sleep 14
@@ -243,6 +247,22 @@ run_gate() { # $1=chrome bin, $2=ws
     [ "$ren_off" -lt "$ren" ] || echo "[WARN] filter count did not drop — 2nd filter may not be Chromium's (or switch inert) — causality UNPROVEN (WARN, not pass)"
   fi
   grep -aE 'No usable sandbox|Existing signal handler when trying to install SIGSYS|Activated seccomp-bpf sandbox' "$ws/ev-noflt.log" | head -3
+
+  # Runtime evidence (Phase-3): activated / crash / SIGSYS-collision classes
+  # are SEPARATE events. stderr logging is on, so a census renderer without
+  # an 'Activated' line is a measurement failure or unengaged BPF — never a
+  # vacuous pass. Crash signatures are FAIL; SIGSYS-handler collisions are a
+  # distinct WARN class (R10-class builds are expected to show 0).
+  local act_n crash_n sig_n
+  act_n=$(grep -acE 'Activated seccomp-bpf sandbox for process type: renderer' "$ws/ev-ported.log" 2>/dev/null || true)
+  crash_n=$(grep -acE 'CRASHING|renderer process crashed' "$ws/ev-ported.log" 2>/dev/null || true)
+  sig_n=$(grep -acE 'Existing signal handler when trying to install SIGSYS' "$ws/ev-ported.log" 2>/dev/null || true)
+  echo "  runtime evidence: activated-renderer=$act_n crash-lines=$crash_n existing-SIGSYS-warnings=$sig_n"
+  if [ "${ren_present:-0}" -gt 0 ] && [ "${act_n:-0}" -eq 0 ]; then
+    echo "[FAIL] census saw renderer(s) but no 'Activated seccomp-bpf' runtime line (log capture broken or BPF never engaged)"; rc=1
+  fi
+  [ "${crash_n:-0}" -eq 0 ] || { echo "[FAIL] crash signatures present in probe log"; rc=1; }
+  [ "${sig_n:-0}" -eq 0 ] || echo "[WARN] Existing SIGSYS handler collisions present ($sig_n) — distinct event class, R10-class builds expected 0"
 
   echo "=== P3 gpu/utility/network ==="
   local gpu uti
