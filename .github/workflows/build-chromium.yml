@@ -192,6 +192,15 @@ jobs:
           SOURCE_HEAD_SHA: ${{ github.sha }}
           REQUESTED_PUBLISH: ${{ inputs.publish }}
         run: bash port/record_publish_intent.sh
+      # R12 EXPERIMENT ONLY (this branch): node-free artifact mirror for the
+      # runner-pool node24 GC defect (run 40569099539 attempts 1+2). Pushes
+      # split deb + logs to orphan branch r12-artifacts. NOT a publish
+      # channel; warn-only; remove before any promotion PR.
+      - name: R12 fallback artifact mirror (branch-only, bash)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash port/ci.sh r12-fallback-upload "$PWD/termux-packages"
       - name: Upload artifacts (debs + logs)
         if: always()
         uses: actions/upload-artifact@v4

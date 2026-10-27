@@ -112,9 +112,73 @@ build_chromium() {
   )
 }
 
+
+r12_fallback_upload() {
+  # R12 EXPERIMENTAL ONLY (branch r12-bionic-set-tid-address): node-free
+  # artifact delivery. The shared runner pool intermittently loses
+  # actions-runner/cached/*/externals/node24 during long builds (disk GC),
+  # killing actions/upload-artifact although the build itself succeeded
+  # (runs 40569099539 attempts 1+2, 2026-10-27). Deb (~160MB) is split into
+  # 90MB volumes (<100MB per-file cap) + logs + MANIFEST + SHA256SUMS.parts
+  # and pushed to the ORPHAN BRANCH r12-artifacts via git+GH_TOKEN. This is
+  # NOT a publish channel: no releases, no apt, no maintenance-state writes.
+  # WARN-only; never flips a green build red.
+  local d="$1" url tmp rid out deb attempt
+  d=$(need_termux_dir "${1:-}") || { echo "R12-FALLBACK WARN: bad termux dir"; return 0; }
+  rid="${GITHUB_RUN_ID:-unknown}"
+  deb=$(find "$d/output" -name 'chromium-sandboxed_*_aarch64.deb' 2>/dev/null | head -1 || true)
+  [ -n "$deb" ] || { echo "R12-FALLBACK WARN: no deb found"; return 0; }
+  [ -n "${GH_TOKEN:-}" ] || { echo "R12-FALLBACK WARN: no GH_TOKEN"; return 0; }
+  url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY:-ytoaa/termux-chromium-sandbox}.git"
+  tmp=$(mktemp -d)
+  if git ls-remote --exit-code "$url" refs/heads/r12-artifacts >/dev/null 2>&1; then
+    git clone -q --depth 1 -b r12-artifacts "$url" "$tmp" || { rm -rf "$tmp"; echo "R12-FALLBACK WARN: clone failed"; return 0; }
+  else
+    git init -q "$tmp" || { rm -rf "$tmp"; echo "R12-FALLBACK WARN: init failed"; return 0; }
+    git -C "$tmp" remote add origin "$url"
+    git -C "$tmp" checkout -qb r12-artifacts
+  fi
+  local debname; debname=$(basename "$deb")
+  out="$tmp/run-$rid"; mkdir -p "$out"
+  cp -f "$deb" "$out/" || { rm -rf "$tmp"; echo "R12-FALLBACK WARN: cp deb failed"; return 0; }
+  ( cd "$out" && split -b 90m "$debname" "$debname.part." && rm -f "$debname" )
+  cp -f "$d/chromium-build.log" "$out/" 2>/dev/null || true
+  find "$d" -maxdepth 1 -name 'port-apply*.log' -exec cp -f {} "$out/" \; 2>/dev/null || true
+  find "$d/.termux-build" -name 'port-apply*.log' 2>/dev/null | head -1 | while read -r f; do cp -f "$f" "$out/port-apply-builder.log"; done
+  cp -f "$PWD/termux-pin.txt" "$out/" 2>/dev/null || true
+  cp -f "$PWD/publish-intent.json" "$out/" 2>/dev/null || true
+  { echo "run_id=$rid"; echo "run_attempt=${GITHUB_RUN_ATTEMPT:-1}"
+    echo "head_sha=${GITHUB_SHA:-unknown}"; echo "event=${GITHUB_EVENT_NAME:-unknown}"
+    echo "deb_name=$(basename "$deb")"; echo "deb_bytes=$(stat -c %s "$deb")"
+    sha256sum "$deb" | sed 's/^/deb_sha256=/'
+  } > "$out/MANIFEST.txt"
+  ( cd "$out" && sha256sum ./* > SHA256SUMS.parts ) || true
+  git -C "$tmp" config user.email "ci@localhost"
+  git -C "$tmp" config user.name "r12-fallback-upload"
+  git -C "$tmp" add -A >/dev/null 2>&1
+  git -C "$tmp" commit -qm "r12 candidate artifacts run-$rid" || true
+  for attempt in 1 2; do
+    if git -C "$tmp" push -q origin HEAD:refs/heads/r12-artifacts 2>/dev/null; then
+      echo "R12-FALLBACK OK: run-$rid pushed to r12-artifacts"; rm -rf "$tmp"; return 0
+    fi
+    sleep 20
+    rm -rf "$tmp"; tmp=$(mktemp -d)
+    git clone -q --depth 1 -b r12-artifacts "$url" "$tmp" 2>/dev/null || break
+    out="$tmp/run-$rid"; mkdir -p "$out"
+    cp -f "$deb" "$out/" && ( cd "$out" && split -b 90m "$debname" "$debname.part." && rm -f "$debname" )
+    cp -f "$d/chromium-build.log" "$out/" 2>/dev/null || true
+    git -C "$tmp" config user.email "ci@localhost"; git -C "$tmp" config user.name "r12-fallback-upload"
+    git -C "$tmp" add -A >/dev/null 2>&1
+    git -C "$tmp" commit -qm "r12 candidate artifacts run-$rid retry" || break
+  done
+  echo "R12-FALLBACK WARN: push failed (primary artifact upload may still work)"
+  rm -rf "$tmp"; return 0
+}
+
 cmd=${1:-help}
 case "$cmd" in
   selftest) bash "$here/tests/run_tests.sh" ;;
+  r12-fallback-upload) r12_fallback_upload "${2:-}" ;;
   apply)    # $2 = chromium src root
     [ -d "${2:-}" ] || { echo "usage: ci.sh apply <src>" >&2; exit 2; }
     python3 "$here/chromium_sandbox_port.py" apply --src "$2" --scan content,chrome
