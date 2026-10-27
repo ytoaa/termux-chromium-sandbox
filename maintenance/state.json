@@ -1,14 +1,14 @@
 {
  "validated": {
   "upstream_version": "156.0.8078.47",
-  "deb_version": "156.0.8078.47-2",
+  "deb_version": "156.0.8078.47-4",
   "port_version": "0.1.0",
-  "port_sha": "554da59a8f021bc65f9c3aab4c25841a0768f373",
+  "port_sha": "688edfad53a99610d3a6dc751d4f461da9d323a8",
   "termux_sha": "de1dd3d18e239ef514e5c55ad744e6485e408c65",
-  "deb_sha256": "cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d",
-  "ci_run": 40104615699,
-  "build_signature": "ad5b0fdb8c7a9777",
-  "note": "Manual human-approved promotion 2026-10-25 (Phase B CI + C/C.1/C.2 gates). Automation MUST NOT mutate; promotions happen via port.toml + this branch by humans. First baseline run #31 (plain 156.0.8078.47, deb 29c4080d..., ci 39976822670) preserved in candidates[0]."
+  "deb_sha256": "6de791e29fc7389c999464bf9afa814d1029a34cba6e29451112abfdda7310e2",
+  "ci_run": 40382174596,
+  "build_signature": "0aa721739cab92e1",
+  "note": "Manual human-approved promotion (Plan B) prepared 2026-10-27 \u2014 APPLY VIA CAS ONLY AFTER promotion PR (branch promotion/r11-r4-validated) IS MERGED. Same -4 binary, R11 diagnostics retained, no rebuild (port-input-hash 061ae7ead9c3b2b8 and signature 0aa721739cab92e1 INVARIANT across promotion edit, proven by recomputation). Replaces -2 baseline (cf2cb2a8..., ci 40104615699, sig ad5b0fdb8c7a9777) \u2014 prior record preserved verbatim in port.toml [gates].device_gate_history and candidates[]. Device audit: issue #12 (BPF renderer filters=2 nnp=1 + P2b causality 2->1 & Activated 0; broker alive-window; SIGSYS collision -4=0 vs -3=96 with R10/R11 marker sequences; Aquarium original-site 5-stage A/B zero crashes \u2014 original RESULT_CODE_INVALID_SANDBOX_STATE NOT reproduced => INCONCLUSIVE maintained, NOT claimed solved; AV1 NOT VERIFIED). blocked[0aa721739cab92e1] RETAINED by policy (runner node24 infra audit; issue #20 closed) => publisher ledger-lookup keeps LEDGER-REFUSE \u2014 validated promotion is independent of any release/publish action; publisher stays disabled_manually."
  },
  "last_successful_build": {
   "upstream_version": "156.0.8078.47",
