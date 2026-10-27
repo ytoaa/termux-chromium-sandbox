@@ -31,6 +31,10 @@ census() { # $1=bin(exe-verified) $2=out-file
   local bin=$1 out=$2
   local pid exe t f s n pp cmd
   local -a rows=()
+  # Instrumentation fix (2026-10-27 R11 audit): census APPENDS. A reused ws
+  # would silently accumulate stale rows and inflate max_field/presence
+  # verdicts (false-PASS risk). Truncate: one census call = one snapshot.
+  : > "$out"
   local zypids=" "
   for pid in $(ls "$PROC_ROOT" 2>/dev/null | grep -E '^[0-9]+$'); do
     exe=$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null) || continue
@@ -50,25 +54,52 @@ census() { # $1=bin(exe-verified) $2=out-file
     if [ "$rt" = zygote ] && [ "$rp" != "$rpp" ] && case "$zypids" in *" $rpp "*) true;; *) false;; esac; then
       rt=renderer
     fi
-    echo "$rt $rf $rs $rn $rpp $rnsb" >> "$out"
+    echo "$rt $rf $rs $rn $rpp $rnsb $rp" >> "$out"
   done
 }
 
-broker_channel() { # $1=census-file $2=zygote-pids-list (unused; re-scan fds)
-  # A live sandboxed renderer holds a socketpair fd whose inode also appears
-  # in the zygote (broker) fd table. Shared inode > 0 => broker IPC wired.
-  local rp zpid ino common=0
-  for rp in $(pids_of "$CHROME" renderer); do
-    for zpid in $(pids_of "$CHROME" zygote); do
-      while read -r ino; do
-        [ -n "$ino" ] || continue
+broker_channel() { # $1=census-file $2=chrome-exe — SAME-SNAPSHOT broker proof
+  # Strict measurement contract (2026-10-27 final audit): partial measurement
+  # failure is NEVER masked by other renderers succeeding.
+  #   0 = FULL measurement: every census renderer probed alive with matching
+  #       exe and readable fds; every census zygote fd-readable. stdout =
+  #       shared-inode count (0 => genuine absence -> WARN)
+  #   2 = census lacks the renderer class or the zygote (broker) class —
+  #       proof impossible from this snapshot (absence of class, not failure)
+  #   3 = ANY /proc/PID/fd unreadable (renderer OR zygote) — measurement failure
+  #   4 = ANY census pid dead or exe-identity mismatch (stale/pid-reuse)
+  # pids come ONLY from the census snapshot (no live rescan; no cross-time mix).
+  local cf=$1 bin=$2
+  local t f sn nn pp nsb pid zpid ino common=0
+  local -a renv=() zyps=()
+  while read -r t f sn nn pp nsb pid; do
+    case "$t" in
+      renderer) [ -n "$pid" ] && renv+=("$pid") ;;
+      zygote)   [ -n "$pid" ] && zyps+=("$pid") ;;
+    esac
+  done < "$cf"
+  if [ "${#renv[@]}" -eq 0 ] || [ "${#zyps[@]}" -eq 0 ]; then echo 0; return 2; fi
+  for pid in "${renv[@]}"; do
+    [ -d "$PROC_ROOT/$pid" ] || { echo 0; return 4; }
+    [ "$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null)" = "$bin" ] || { echo 0; return 4; }
+    [ -r "$PROC_ROOT/$pid/fd" ] || { echo 0; return 3; }
+  done
+  for zpid in "${zyps[@]}"; do
+    [ -d "$PROC_ROOT/$zpid" ] || { echo 0; return 4; }
+    [ "$(readlink "$PROC_ROOT/$zpid/exe" 2>/dev/null)" = "$bin" ] || { echo 0; return 4; }
+    [ -r "$PROC_ROOT/$zpid/fd" ] || { echo 0; return 3; }
+  done
+  for pid in "${renv[@]}"; do
+    while read -r ino; do
+      [ -n "$ino" ] || continue
+      for zpid in "${zyps[@]}"; do
         if ls -l "$PROC_ROOT/$zpid/fd" 2>/dev/null | grep -q "socket:\[$ino\]"; then
           common=$((common+1)); break
         fi
-      done < <(ls -l "$PROC_ROOT/$rp/fd" 2>/dev/null | sed -n 's/.*socket:\[\([0-9]*\)\].*/\1/p')
-    done
+      done
+    done < <(ls -l "$PROC_ROOT/$pid/fd" 2>/dev/null | sed -n 's/.*socket:\[\([0-9]*\)\].*/\1/p')
   done
-  echo "$common"
+  echo "$common"; return 0
 }
 
 pids_of() { # $1=bin $2=type → pids
@@ -89,13 +120,93 @@ spawn_probe() { # $1=bin $2=label $3=ws $4..=extra chrome flags
   local bin=$1 label=$2 ws=$3; shift 3
   local udd="$ws/udd-ev-$label"
   rm -rf "$udd"
+  # --enable-logging=stderr --v=1: without stderr logging ALL log-based
+  # checks below are vacuously zero (Chromium logs go to logcat) — a silent
+  # measurement hole found in the 2026-10-27 audit. VLOG(1) exposes the
+  # 'Activated seccomp-bpf sandbox' runtime evidence line.
   setsid "$bin" --headless=new --user-data-dir="$udd" --no-first-run \
-      --disable-dev-shm-usage "$@" >"$ws/ev-$label.log" 2>&1 &
+      --disable-dev-shm-usage --enable-logging=stderr --v=1 "$@" >"$ws/ev-$label.log" 2>&1 &
   EV_GPID=$!
   ( sleep 75; kill -KILL -"$EV_GPID" 2>/dev/null ) & EV_WPID=$!
   sleep 14
 }
-stop_probe() { kill -TERM -"$EV_GPID" 2>/dev/null; sleep 2; kill -KILL -"$EV_GPID" 2>/dev/null; kill "$EV_WPID" 2>/dev/null; wait "$EV_WPID" 2>/dev/null; }
+stop_probe() { kill -TERM -"$EV_GPID" 2>/dev/null; sleep 2; kill -KILL -"$EV_GPID" 2>/dev/null; kill "$EV_WPID" 2>/dev/null; wait "$EV_WPID" 2>/dev/null; wait "$EV_GPID" 2>/dev/null; }
+
+
+TCS_PREFIX=${TCS_PREFIX:-/data/data/com.termux/files/usr}
+wrapper_guard() { # $1=launch-path — refuse EXTRACTED DEB shield wrappers
+  # Identity contract: the DEB's chromium-shield-wrapper.sh resolves its
+  # launcher via ${PREFIX:-…} — executing an EXTRACTED copy execs the
+  # INSTALLED package (contamination observed 2026-10-27 R11 audit). The
+  # guard normalizes the REAL TARGET first (readlink -f defeats symlinks,
+  # relative paths, ../ traversal and nesting), then applies a content
+  # signature so a renamed/copied wrapper cannot bypass basename checks.
+  # Installed-mode launches (realpath under normalized $TCS_PREFIX) remain
+  # the supported official path — unless a foreign PREFIX env would hijack
+  # the wrapper's launcher resolution (mixed identity -> refused).
+  local p=$1 rp sig=0
+  rp=$(readlink -f -- "$p" 2>/dev/null) || rp=$p
+  if [ "$(basename "$rp")" = chromium-shield-wrapper.sh ]; then
+    sig=1
+  elif [ -f "$rp" ] && grep -qs 'libtermux-gnp-fix.so' "$rp" && grep -qs 'chromium-launcher.sh' "$rp"; then
+    sig=1
+  fi
+  [ "$sig" = 1 ] || return 0
+  local troot; troot=$(readlink -f -- "$TCS_PREFIX" 2>/dev/null) || troot=$TCS_PREFIX
+  case "$rp" in
+    "$troot"/*)
+      if [ -n "${PREFIX:-}" ]; then
+        local pr; pr=$(readlink -f -- "$PREFIX" 2>/dev/null || echo "$PREFIX")
+        if [ "$pr" != "$troot" ]; then
+          echo "[FAIL] wrapper guard: installed wrapper with PREFIX=$PREFIX (-> $pr) outside installed root $troot — mixed identity refused"
+          return 1
+        fi
+      fi
+      return 0 ;;
+    *)
+      echo "[FAIL] extracted DEB shield-wrapper refuses: it would exec the INSTALLED launcher (hardcoded \${PREFIX}); run the extracted chromium-launcher.sh with LD_PRELOAD=<extract>/libtermux-gnp-fix.so instead (realpath=$rp)"
+      return 1 ;;
+  esac
+}
+
+probe_gone() { # $1=pid [$2=grace_s(8)] — 0 = gone/zombie, 1 = still running.
+  # SIGKILL delivery is asynchronous and can lag on loaded runners (GitHub
+  # ubuntu runners vs Termux); a one-shot kill -0 + state read races. State is
+  # parsed from the FIRST CHARACTER AFTER ') ' (immune to spaces/parens in comm).
+  local pid=$1 grace=${2:-8} waited=0 st
+  while [ "$waited" -lt "$((grace*2))" ]; do
+    st=$(cat "/proc/$pid/stat" 2>/dev/null) || return 0
+    st=${st##*') '}
+    st=${st%% *}
+    [ "$st" = Z ] && return 0
+    sleep 0.5
+    waited=$((waited+1))
+  done
+  return 1
+}
+
+cleanup_all() { # idempotent probe cleanup (normal, error, interrupt, timeout)
+  # Race-proof against setsid(1) not having completed when the trap fires:
+  # at that instant the new process group does not exist yet, so a single
+  # 'kill -KILL -PGID' can ESRCH and the probe later becomes an orphan
+  # (reproduced on GitHub ubuntu-26.04 runner; timing-dependent on Termux
+  # too). Strategy: group kill, direct-pid fallback, then a short re-kill
+  # loop until the pid is gone or zombie.
+  local g=${EV_GPID:-} w=${EV_WPID:-} i st state
+  if [ -n "$g" ]; then
+    for i in 1 2 3 4; do
+      kill -KILL -"$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null || true
+      st=$(cat "/proc/$g/stat" 2>/dev/null) || break
+      state=${st##*') '}
+      state=${state%% *}
+      [ "$state" = Z ] && break
+      sleep 0.3
+    done
+  fi
+  [ -n "$w" ] && kill "$w" 2>/dev/null
+  return 0
+}
+trap 'cleanup_all' EXIT INT TERM
 
 max_field() { # $1=file $2=type $3=field(2..6)
   awk -v t="$2" -v c="$3" '$1==t{if($c>m)m=$c}END{print m+0}' "$1"
@@ -107,6 +218,7 @@ run_gate() { # $1=chrome bin, $2=ws
   # shield wrapper; census identity must match the REAL chrome exe. When bin
   # resolves to a script, target <dir-of-wrapper>/chrome. Spawn still uses
   # the given bin (never bypass the wrapper); marker check uses the exe.
+  wrapper_guard "$bin" || { echo "BPF EVIDENCE GATE: FAIL"; return 1; }
   local match=$bin
   local realbin; realbin=$(readlink -f "$bin")
   case "$realbin" in
@@ -117,15 +229,23 @@ run_gate() { # $1=chrome bin, $2=ws
   if grep -aq 'Termux seccomp-only' "$match"; then echo "[ok] R1/R2 marker string in binary"; else echo "[FAIL] no port marker in binary (built without port?)"; rc=1; fi
 
   echo "=== P2 renderer census ==="
+  # ONE alive-window: spawn -> census -> broker (same snapshot) -> clean stop.
+  # The broker probe must observe /proc/PID/fd while the measured processes
+  # are still alive (2026-10-27 defect A fix: previously ran AFTER stop_probe).
   spawn_probe "$bin" ported "$ws"
-  census "$match" "$ws/census-ported.txt"; stop_probe
-  local ren ren_s ren_n zyg bro inj
+  census "$match" "$ws/census-ported.txt"
+  local ren ren_s ren_n zyg bro bro_rc inj
+  if [ ! -s "$ws/census-ported.txt" ]; then
+    echo "[FAIL] census empty — measurement error (browser never spawned?); refusing broker proof"; rc=1; bro=0; bro_rc=9
+  else
+    bro=$(broker_channel "$ws/census-ported.txt" "$match"); bro_rc=$?
+  fi
+  stop_probe
   ren=$(max_field "$ws/census-ported.txt" renderer 2)
   ren_s=$(max_field "$ws/census-ported.txt" renderer 3)
   ren_n=$(max_field "$ws/census-ported.txt" renderer 4)
   zyg=$(max_field "$ws/census-ported.txt" zygote 2)
   inj=$(max_field "$ws/census-ported.txt" browser 6)
-  bro=$(broker_channel "$ws/census-ported.txt")
   awk '{print "  ["$1"] filters="$2" seccomp="$3" nnp="$4" ppid="$5}' "$ws/census-ported.txt" | sort -u
   echo "  renderer: filters=$ren seccomp=$ren_s nnp=$ren_n | zygote filters=$zyg | broker-inodes=$bro | runtime --no-sandbox=$inj"
   [ "$inj" -eq 0 ] || { echo "[FAIL] runtime --no-sandbox injected (1001/1004 regression?)"; rc=1; }
@@ -137,16 +257,49 @@ run_gate() { # $1=chrome bin, $2=ws
   else echo "[FAIL] renderer filters<2 — Chromium BPF absent (present=$ren_present crashing=$crash_now)"; rc=1; fi
   [ "$ren_s" -eq 2 ] || { echo "[FAIL] renderer not in seccomp filter mode"; rc=1; }
   [ "$ren_n" -eq 1 ] || echo "[WARN] renderer NoNewPrivs=$ren_n"
-  [ "$bro" -gt 0 ] || echo "[WARN] no shared zygote↔renderer socket inode (broker unproven)"
+  case "$bro_rc" in
+    0) [ "$bro" -gt 0 ] || echo "[WARN] no shared zygote↔renderer socket inode (genuine absence on live window)" ;;
+    2) echo "[NOTE] broker probe: no renderer rows in census (class absence handled by renderer verdict)" ;;
+    3) echo "[FAIL] broker probe: /proc/PID/fd unreadable for census renderers — measurement failure, NOT broker absence"; rc=1 ;;
+    4) echo "[FAIL] broker probe: census pids dead or exe-identity mismatch (stale snapshot / pid reuse) — measurement failure"; rc=1 ;;
+    *) echo "[FAIL] broker probe: census empty (measurement error)"; rc=1 ;;
+  esac
   [ "$zyg" -ge 1 ] || { echo "[FAIL] no zygote process — R1 path not reached?"; rc=1; }
 
   echo "=== P2b causality control (--disable-seccomp-filter-sandbox) ==="
   spawn_probe "$bin" noflt "$ws" --disable-seccomp-filter-sandbox
   census "$match" "$ws/census-noflt.txt"; stop_probe
-  local ren_off; ren_off=$(max_field "$ws/census-noflt.txt" renderer 2)
-  echo "  renderer filters with switch OFF: $ren_off (expect < $ren)"
-  [ "$ren_off" -lt "$ren" ] || echo "[WARN] filter count did not drop — 2nd filter may not be Chromium's (or switch inert)"
-  grep -iE 'No usable sandbox|SIGSYS|SeccompBPF' "$ws/ev-noflt.log" | head -3
+  local ren_off ren_off_present
+  ren_off_present=$(awk '$1=="renderer"{c++}END{print c+0}' "$ws/census-noflt.txt" 2>/dev/null)
+  if [ ! -s "$ws/census-noflt.txt" ] || [ "${ren_off_present:-0}" -eq 0 ]; then
+    # A control census containing only browser/zygote rows would report
+    # max_field=0 and masquerade as 'filters dropped'. Renderer CLASS presence
+    # and a measurable filter value are verified SEPARATELY from the drop.
+    echo "[FAIL] P2b control census lacks renderer rows (empty or class-missing) — measurement error; never counted as 'dropped'"; rc=1
+  elif [ "${ren:-0}" -le 0 ]; then
+    echo "[FAIL] P2b control comparison vacuous (ported run had no filters>=2 renderer)"; rc=1
+  else
+    ren_off=$(max_field "$ws/census-noflt.txt" renderer 2)
+    echo "  renderer filters with switch OFF: $ren_off (expect < $ren)"
+    [ "$ren_off" -lt "$ren" ] || echo "[WARN] filter count did not drop — 2nd filter may not be Chromium's (or switch inert) — causality UNPROVEN (WARN, not pass)"
+  fi
+  grep -aE 'No usable sandbox|Existing signal handler when trying to install SIGSYS|Activated seccomp-bpf sandbox' "$ws/ev-noflt.log" | head -3
+
+  # Runtime evidence (Phase-3): activated / crash / SIGSYS-collision classes
+  # are SEPARATE events. stderr logging is on, so a census renderer without
+  # an 'Activated' line is a measurement failure or unengaged BPF — never a
+  # vacuous pass. Crash signatures are FAIL; SIGSYS-handler collisions are a
+  # distinct WARN class (R10-class builds are expected to show 0).
+  local act_n crash_n sig_n
+  act_n=$(grep -acE 'Activated seccomp-bpf sandbox for process type: renderer' "$ws/ev-ported.log" 2>/dev/null || true)
+  crash_n=$(grep -acE 'CRASHING|renderer process crashed' "$ws/ev-ported.log" 2>/dev/null || true)
+  sig_n=$(grep -acE 'Existing signal handler when trying to install SIGSYS' "$ws/ev-ported.log" 2>/dev/null || true)
+  echo "  runtime evidence: activated-renderer=$act_n crash-lines=$crash_n existing-SIGSYS-warnings=$sig_n"
+  if [ "${ren_present:-0}" -gt 0 ] && [ "${act_n:-0}" -eq 0 ]; then
+    echo "[FAIL] census saw renderer(s) but no 'Activated seccomp-bpf' runtime line (log capture broken or BPF never engaged)"; rc=1
+  fi
+  [ "${crash_n:-0}" -eq 0 ] || { echo "[FAIL] crash signatures present in probe log"; rc=1; }
+  [ "${sig_n:-0}" -eq 0 ] || echo "[WARN] Existing SIGSYS handler collisions present ($sig_n) — distinct event class, R10-class builds expected 0"
 
   echo "=== P3 gpu/utility/network ==="
   local gpu uti
@@ -169,6 +322,7 @@ run_gate() { # $1=chrome bin, $2=ws
 }
 
 selftest() {
+  local SELF; SELF=$(readlink -f -- "$0")
   local t=$PWD/.bpf-selftest.$$ ; rm -rf "$t"; mkdir -p "$t"
   local P="$t/proc" ; mkdir -p "$P"
   local real=$(command -v bash)   # any executable works as fake chrome exe target
@@ -192,7 +346,7 @@ selftest() {
   " 2>/dev/null
   # direct invocation path
   if CHROME_BIN=$real PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/c.txt" && \
-     grep -q '^renderer 2 2 1 101 0$' "$t/c.txt"; then echo "[selftest] census ok"; else echo "[selftest] census FAIL"; rc=1; fi
+     grep -qE '^renderer 2 2 1 101 0 102$' "$t/c.txt"; then echo "[selftest] census ok"; else echo "[selftest] census FAIL"; rc=1; fi
   # verdict logic unit: max_field + expected shape
   awk '$1=="renderer"&&$2==2&&$3==2&&$4==1&&$5==101{f=1}END{exit !f}' "$t/c.txt" || { echo "[selftest] verdict FAIL"; rc=1; }
   # negative fixture: renderer 1 filter → should be detected
@@ -203,6 +357,147 @@ selftest() {
   printf -- '--no-sandbox\0--type=browser\0' > "$P/100/cmdline"
   PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/c3.txt"
   awk '$1=="browser"&&$6==1{f=1}END{exit !f}' "$t/c3.txt" || { echo "[selftest] no-sandbox-tripwire FAIL"; rc=1; }
+  # idempotence: a second census on the SAME output file must not accumulate
+  : > "$t/c4.txt"; printf 'Name: chrome\nSeccomp:\t2\nSeccomp_filters:\t2\nNoNewPrivs:\t1\nPPid:\t101\n' > "$P/102/status"
+  PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/c4.txt"; n1=$(wc -l < "$t/c4.txt")
+  PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/c4.txt"; n2=$(wc -l < "$t/c4.txt")
+  [ "$n1" = "$n2" ] && [ "$n1" -gt 0 ] && echo "[selftest] census idempotent ok" \
+    || { echo "[selftest] census idempotence FAIL ($n1 vs $n2)"; rc=1; }
+  # wrapper guard: extracted path refused, prefix-under path allowed
+  mkdir -p "$t/extract" "$t/pfx/usr/lib/chromium-sandboxed"
+  touch "$t/extract/chromium-shield-wrapper.sh" "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"
+  if TCS_PREFIX=$t/pfx bash "$0" _internal_guard "$t/extract/chromium-shield-wrapper.sh"; then
+    echo "[selftest] wrapper guard FAIL (extracted not refused)"; rc=1
+  else echo "[selftest] wrapper guard refuses extracted ok"; fi
+  if TCS_PREFIX=$t/pfx PREFIX= bash "$0" _internal_guard "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"; then
+    echo "[selftest] wrapper guard allows installed-mode ok"
+  else echo "[selftest] wrapper guard FAIL (installed-mode refused)"; rc=1; fi
+  # ---- Phase-2 scenario matrix (2026-10-27): broker lifecycle & classifier ----
+  PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/b.txt"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/b.txt" "$real"); BRC=$?
+  if [ $BRC -eq 0 ] && [ "${BRO:-0}" -gt 0 ]; then echo "[selftest] broker live-window ok (inodes=$BRO)";
+  else echo "[selftest] broker live-window FAIL rc=$BRC out=$BRO"; rc=1; fi
+  rm -rf "$P/102/fd"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/b.txt" "$real"); BRC=$?
+  [ $BRC -eq 3 ] && echo "[selftest] broker fd-unreadable -> measurement-failure(3) ok" \
+    || { echo "[selftest] broker fd-classify FAIL rc=$BRC"; rc=1; }
+  mkdir -p "$P/102/fd"; ln -sf "socket:[4242]" "$P/102/fd/9" 2>/dev/null
+  rm -rf "$P/102"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/b.txt" "$real"); BRC=$?
+  [ $BRC -eq 4 ] && echo "[selftest] broker census-pid-dead -> stale(4) ok" \
+    || { echo "[selftest] broker stale-classify FAIL rc=$BRC"; rc=1; }
+  mk 102 renderer 2 2 1 "" 101
+  ln -sf "$t/b.txt" "$P/102/exe"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/b.txt" "$real"); BRC=$?
+  [ $BRC -eq 4 ] && echo "[selftest] broker pid-reuse(exe mismatch) -> stale(4) ok" \
+    || { echo "[selftest] broker pidreuse FAIL rc=$BRC"; rc=1; }
+  ln -sf "$real" "$P/102/exe"
+  awk '$1!="renderer"' "$t/b.txt" > "$t/bnr.txt"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/bnr.txt" "$real"); BRC=$?
+  [ $BRC -eq 2 ] && echo "[selftest] broker no-renderer-rows -> absence(2) ok" \
+    || { echo "[selftest] broker no-renderers FAIL rc=$BRC"; rc=1; }
+  mkdir -p "$P/109"; ln -sf "$(command -v cat)" "$P/109/exe"
+  printf -- '--type=renderer\0' > "$P/109/cmdline"
+  printf 'Seccomp:\t2\nSeccomp_filters:\t2\nNoNewPrivs:\t1\nPPid:\t101\n' > "$P/109/status"
+  PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/mi.txt"
+  if grep -qE ' 109$' "$t/mi.txt"; then echo "[selftest] multi-instance isolation FAIL"; rc=1
+  else echo "[selftest] multi-instance isolation ok"; fi
+  rm -rf "$P/109"
+  # ---- broker v3 strictness: PARTIAL failures must not be masked ----
+  mk 105 renderer 2 2 1 "" 101
+  PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/p.txt"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/p.txt" "$real"); BRC=$?
+  [ $BRC -eq 0 ] && echo "[selftest] broker full-window (2 renderers) ok" \
+    || { echo "[selftest] broker full-window FAIL rc=$BRC"; rc=1; }
+  rm -rf "$P/105/fd"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/p.txt" "$real"); BRC=$?
+  [ $BRC -eq 3 ] && echo "[selftest] PARTIAL fd loss (1 of 2 renderers) -> 3, not masked" \
+    || { echo "[selftest] broker partial-fd FAIL rc=$BRC (masked?)"; rc=1; }
+  mkdir -p "$P/105/fd"; ln -sf "socket:[4242]" "$P/105/fd/9" 2>/dev/null
+  rm -rf "$P/105"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/p.txt" "$real"); BRC=$?
+  [ $BRC -eq 4 ] && echo "[selftest] PARTIAL dead pid -> 4, not masked" \
+    || { echo "[selftest] broker partial-dead FAIL rc=$BRC (masked?)"; rc=1; }
+  mk 105 renderer 2 2 1 "" 101
+  rm -rf "$P/101/fd"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/p.txt" "$real"); BRC=$?
+  [ $BRC -eq 3 ] && echo "[selftest] zygote fd unreadable -> 3 (proof impossible)" \
+    || { echo "[selftest] broker zygote-fd FAIL rc=$BRC"; rc=1; }
+  mkdir -p "$P/101/fd"; ln -sf "socket:[4242]" "$P/101/fd/9" 2>/dev/null
+  awk '$1!="zygote"' "$t/p.txt" > "$t/pnz.txt"
+  BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/pnz.txt" "$real"); BRC=$?
+  [ $BRC -eq 2 ] && echo "[selftest] renderers without zygote class -> 2 (not 0)" \
+    || { echo "[selftest] broker no-zygote FAIL rc=$BRC"; rc=1; }
+  rm -rf "$P/105"
+
+  # ---- log classifier: URL/filename strings must NOT match precise patterns ----
+  printf 'load https://x/r11-probe.html?sigsys=1 file sigsys.png SIGSYS\n' > "$t/url.log"
+  n=$(grep -acE 'Existing signal handler when trying to install SIGSYS|Activated seccomp-bpf sandbox|No usable sandbox' "$t/url.log")
+  [ "${n:-0}" = 0 ] && echo "[selftest] url/filename false-positive blocked" \
+    || { echo "[selftest] log classifier FALSE-POSITIVE n=$n"; rc=1; }
+  printf '[5:5] Existing signal handler when trying to install SIGSYS. SIGSYS needs\n[6:6] Activated seccomp-bpf sandbox for process type: renderer.\n' > "$t/real.log"
+  n1=$(grep -acE 'Existing signal handler when trying to install SIGSYS' "$t/real.log")
+  n2=$(grep -acE 'Activated seccomp-bpf sandbox' "$t/real.log")
+  [ "$n1" = 1 ] && [ "$n2" = 1 ] && echo "[selftest] genuine crash lines detected" \
+    || { echo "[selftest] log classifier MISSED real lines n1=$n1 n2=$n2"; rc=1; }
+  # ---- cleanup paths: EXIT trap / TERM trap / direct cleanup_all / LEAK control ----
+  setsid sleep 120 & EVTEST_GPID=$!
+  sleep 1
+  EVTEST_GPID=$EVTEST_GPID bash "$SELF" _internal_cleanup
+  wait "$EVTEST_GPID" 2>/dev/null
+  if probe_gone "$EVTEST_GPID" 8; then
+    echo "[selftest] direct cleanup_all reaps probe group (grace-polled)"
+  else echo "[selftest] cleanup trap FAILED to reap probe group"; rc=1; kill -KILL -"$EVTEST_GPID" 2>/dev/null; fi
+  for tp in EXIT TERM; do
+    lpid=$(bash "$SELF" _internal_trap "$tp" 2>/dev/null | sed -n 's/^LEADER=//p')
+    if [ -z "$lpid" ]; then echo "[selftest] trap $tp: no leader captured"; rc=1; continue; fi
+    if probe_gone "$lpid" 8; then echo "[selftest] trap path $tp reaps probe group";
+    else echo "[selftest] trap path $tp LEAK (probe survived)"; rc=1; kill -KILL -"$lpid" 2>/dev/null; fi
+  done
+  lpid=$(bash "$SELF" _internal_trap LEAK 2>/dev/null | sed -n 's/^LEADER=//p')
+  if [ -n "$lpid" ] && ! probe_gone "$lpid" 2; then
+    echo "[selftest] LEAK control survived — detector CAN fail (injection ok)"
+  else
+    echo "[selftest] leak detector BROKEN (LEAK control not detected as alive)"; rc=1
+  fi
+  if [ -n "$lpid" ]; then kill -KILL -"$lpid" 2>/dev/null; wait "$lpid" 2>/dev/null; fi
+  # ---- wrapper guard matrix: symlink/relative/nested/renamed/PREFIX-hijack ----
+  mkdir -p "$t/ex/bin" "$t/bin" "$t/pfx/usr/lib/chromium-sandboxed"
+  WCONTENT='#!/data/data/com.termux/files/usr/bin/bash
+_p="${PREFIX:-/data/data/com.termux/files/usr}/lib/chromium-sandboxed"
+export LD_PRELOAD="$_p/libtermux-gnp-fix.so"
+exec "$_p/chromium-launcher.sh" "$@"
+'
+  printf '%s' "$WCONTENT" > "$t/ex/chromium-shield-wrapper.sh"
+  printf '%s' "$WCONTENT" > "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"
+  printf '#!/bin/sh\nexec "$PROGDIR/chrome" "$@"\n' > "$t/ex/chromium-launcher.sh"
+  ln -sf "$t/ex/chromium-shield-wrapper.sh" "$t/bin/chromium-sandboxed"
+  ln -sf "$t/bin/chromium-sandboxed" "$t/bin/cb-nested"
+  cp "$t/ex/chromium-shield-wrapper.sh" "$t/ex/renamed-thing"
+  wg_refuse() { if TCS_PREFIX=$t/pfx PREFIX= bash "$SELF" _internal_guard "$1"; then
+                  echo "[selftest] wrapper-guard BYPASSED by $1"; rc=1
+                else echo "[selftest] wrapper-guard refuses $1 ok"; fi; }
+  wg_allow()  { if ! TCS_PREFIX=$t/pfx PREFIX= bash "$SELF" _internal_guard "$1"; then
+                  echo "[selftest] wrapper-guard WRONGLY refused $1"; rc=1
+                else echo "[selftest] wrapper-guard allows $1 ok"; fi; }
+  wg_refuse "$t/ex/chromium-shield-wrapper.sh"
+  wg_refuse "$t/bin/chromium-sandboxed"
+  wg_refuse "$t/bin/cb-nested"
+  wg_refuse "$t/ex/renamed-thing"
+  if ( cd "$t/ex" && TCS_PREFIX=$t/pfx PREFIX= bash "$SELF" _internal_guard "./chromium-shield-wrapper.sh" ) >/dev/null 2>&1; then
+    echo "[selftest] relative-path BYPASS!"; rc=1
+  else echo "[selftest] relative path refused ok"; fi
+  if ( cd "$t" && TCS_PREFIX=$t/pfx PREFIX= bash "$SELF" _internal_guard "ex/bin/../chromium-shield-wrapper.sh" ) >/dev/null 2>&1; then
+    echo "[selftest] dotdot-path BYPASS!"; rc=1
+  else echo "[selftest] dotdot path refused ok"; fi
+  wg_allow "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"
+  wg_allow "$t/ex/chromium-launcher.sh"
+  if TCS_PREFIX=$t/pfx PREFIX=/tmp bash "$0" _internal_guard "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"; then
+    echo "[selftest] PREFIX-hijack NOT blocked"; rc=1
+  else echo "[selftest] PREFIX-hijack blocked ok"; fi
+  if TCS_PREFIX=$t/pfx PREFIX=$t/pfx bash "$0" _internal_guard "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"; then
+    echo "[selftest] PREFIX-consistent allowed ok"
+  else echo "[selftest] PREFIX-consistent WRONGLY refused"; rc=1; fi
   rm -rf "$t"
   echo "[selftest] $([ $rc -eq 0 ] && echo PASS || echo FAIL)"
   return $rc
@@ -211,6 +506,22 @@ selftest() {
 case ${1:-} in
   selftest) selftest ;;
   _internal_census) census "$2" "$3" ;;
+  _internal_guard) wrapper_guard "${2:-}" ;;
+  _internal_broker) broker_channel "$2" "$3" ;;
+  _internal_cleanup) EV_GPID=${EVTEST_GPID:-}; cleanup_all ;;
+  _internal_trap)
+    # redirect away from inherited stdout: a background job holding a
+    # command-substitution pipe would block the caller until timeout instead
+    # of exposing the real liveness state (fixture defect found in CI)
+    setsid sleep 60 >/dev/null 2>&1 & EV_GPID=$!
+    echo "LEADER=$EV_GPID"
+    trap 'cleanup_all' EXIT
+    trap 'cleanup_all; exit 0' INT TERM
+    case "${2:-EXIT}" in
+      LEAK) trap - EXIT INT TERM ;;  # control: NO cleanup — detector must catch this
+      TERM) kill -TERM $$ ;;
+      *) : ;;                          # plain exit -> EXIT trap path
+    esac ;;
   --noop) exit 0 ;;
   "") usage ;;
   *) CHROME=$1; LAUNCH=$1; shift; WS=. ; [ "${1:-}" = --ws ] && { WS=$2; shift 2; }

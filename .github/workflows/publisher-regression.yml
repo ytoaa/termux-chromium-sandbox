@@ -10,6 +10,7 @@ on:
       - '.github/workflows/publisher-regression.yml'
       - 'port/tests/**'
       - 'port/publish_release.py'
+      - 'port/bpf_evidence.sh'
   workflow_dispatch:
 
 permissions:
