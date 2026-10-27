@@ -1,14 +1,14 @@
 {
  "validated": {
   "upstream_version": "156.0.8078.47",
-  "deb_version": "156.0.8078.47-2",
+  "deb_version": "156.0.8078.47-4",
   "port_version": "0.1.0",
-  "port_sha": "554da59a8f021bc65f9c3aab4c25841a0768f373",
+  "port_sha": "688edfad53a99610d3a6dc751d4f461da9d323a8",
   "termux_sha": "de1dd3d18e239ef514e5c55ad744e6485e408c65",
-  "deb_sha256": "cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d",
-  "ci_run": 40104615699,
-  "build_signature": "ad5b0fdb8c7a9777",
-  "note": "Manual human-approved promotion 2026-10-25 (Phase B CI + C/C.1/C.2 gates). Automation MUST NOT mutate; promotions happen via port.toml + this branch by humans. First baseline run #31 (plain 156.0.8078.47, deb 29c4080d..., ci 39976822670) preserved in candidates[0]."
+  "deb_sha256": "6de791e29fc7389c999464bf9afa814d1029a34cba6e29451112abfdda7310e2",
+  "ci_run": 40382174596,
+  "build_signature": "0aa721739cab92e1",
+  "note": "Manual human-approved promotion 2026-10-27 (Plan B, promotion PR): validated baseline -4 run 40382174596 (same binary, R11 diagnostics retained, no rebuild; signature 0aa721739cab92e1 invariant). Replaces -2 baseline (cf2cb2a8..., ci 40104615699, sig ad5b0fdb8c7a9777) preserved verbatim in port.toml [gates].device_gate_history and candidates[]. First baseline run #31 (plain, deb 29c4080d..., ci 39976822670) preserved as candidates[0]. Device audit issue #12; original RESULT_CODE_INVALID_SANDBOX_STATE remains INCONCLUSIVE (non-reproduced on the identified site, not claimed solved); AV1 NOT VERIFIED. Engine MUST NOT mutate validated; promotions happen via port.toml + this ledger by humans."
  },
  "last_successful_build": {
   "upstream_version": "156.0.8078.47",
@@ -65,6 +65,29 @@
    "artifact_verified": true,
    "recorded_at": "2026-10-24T14:55:08Z",
    "validated": true
+  },
+  {
+   "upstream_version": "156.0.8078.47",
+   "revision": 4,
+   "package_version": "156.0.8078.47-4",
+   "deb_version": "156.0.8078.47-4",
+   "pkg_revision_env": "4",
+   "termux_ref": "de1dd3d18e239ef514e5c55ad744e6485e408c65",
+   "port_sha": "061ae7ead9c3b2b8",
+   "signature": "0aa721739cab92e1",
+   "signature_schema": 2,
+   "recipe_sha": "7c5c20eb1182e197",
+   "host_sha": "34b799517be2a99a",
+   "is_revision": true,
+   "status": "BUILD_VERIFIED_CANDIDATE",
+   "deb_sha256": "6de791e29fc7389c999464bf9afa814d1029a34cba6e29451112abfdda7310e2",
+   "termux_sha": "de1dd3d18e239ef514e5c55ad744e6485e408c65",
+   "ci_run": 40382174596,
+   "ci_url": "https://github.com/ytoaa/termux-chromium-sandbox/actions/runs/40382174596",
+   "artifact": "build-40382174596",
+   "artifact_verified": true,
+   "recorded_at": "2026-10-27T09:00:00Z",
+   "note": "R11 diagnostic build; device-verified 2026-10-27 (issue #12 audit comments: BPF census, Aquarium A/B, cleanup/broker instrument fixes); CI-verified candidate only - validated baseline unchanged"
   }
  ],
  "blocked": {},
@@ -72,6 +95,10 @@
   {
    "at": "2026-10-25T00:00:00Z",
    "manual_promotion": "validated -> 156.0.8078.47-2 run 40104615699 (human approval; replaces #31 baseline, #31 kept as history)"
+  },
+  {
+   "at": "2026-10-27T09:45:00Z",
+   "manual_promotion": "validated -> 156.0.8078.47-4 run 40382174596 (human approval Plan B; replaces -2 baseline, -2 kept as history + candidates[1])"
   }
  ]
 }

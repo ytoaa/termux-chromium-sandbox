@@ -329,8 +329,8 @@ python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS
   || fail "[35] maintenance engine scenarios"
 
 # [36] Round 15/16 static verification (mode fail-closed matrix + migrations).
-python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=79 FAIL=0$' \
-  && pass "[36] maintenance static workflow+seed 79/79" \
+python3 "port/tests/maintenance_static_test.py" 2>&1 | grep -q '^MAINTENANCE-STATIC PASS=81 FAIL=0$' \
+  && pass "[36] maintenance static workflow+seed 81/81" \
   || fail "[36] maintenance static checks"
 
 # [37] TERMUX_PKG_REVISION injection behavior (default-off reproducibility).

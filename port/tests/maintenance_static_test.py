@@ -47,14 +47,29 @@ seed=json.load(open(os.path.join(ROOT,'..','maintenance/state.seed.json')))
 with open(os.path.join(ROOT,'port.toml'),'rb') as f: t=tomllib.load(f)
 p=t['port']
 check('[s18] seed agrees with validated ledger (promoted -2 baseline)', seed['validated']['upstream_version']==p['last_validated_chromium'] and seed['validated']['port_sha']==p['last_validated_port_commit'] and seed['validated'].get('deb_version')==p['last_validated_deb_version'] and seed['validated']['termux_sha']==p['last_validated_termux_sha'] and p['phase']=='validated' and p['last_validated_port']=='0.1.0')
-check('[s18b] seed: #31 plain preserved as history; last_successful + validated == promoted -2 baseline',
+check('[s18b] seed: #31 plain + engine lsb -2 preserved; validated == promoted -4 baseline (Plan B)',
       seed['candidates'][0]['package_version']=='156.0.8078.47'
       and seed['last_successful_build']['package_version']=='156.0.8078.47-2'
-      and seed['validated'].get('deb_version')=='156.0.8078.47-2'
-      and seed['validated']['deb_sha256']=='cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d'
-      and seed['validated']['ci_run']==40104615699
+      and seed['validated'].get('deb_version')=='156.0.8078.47-4'
+      and seed['validated']['deb_sha256']=='6de791e29fc7389c999464bf9afa814d1029a34cba6e29451112abfdda7310e2'
+      and seed['validated']['ci_run']==40382174596
       and seed['last_successful_build'].get('artifact_verified') is True)
-check('[s19] seed deb sha == promoted baseline AND #31 preserved as history', seed['validated']['deb_sha256']==p['last_validated_deb_sha256'] and seed['last_successful_build']['deb_sha256']==seed['validated']['deb_sha256'] and seed['candidates'][0]['deb_sha256'].startswith('29c4080d'))
+check('[s18c] seed validated -4 cross-consistency: signature/deb_version match port.toml (tightened)',
+      seed['validated'].get('build_signature')==p['last_validated_build_signature']=='0aa721739cab92e1'
+      and seed['validated'].get('deb_version')==p['last_validated_deb_version']
+      and seed['validated'].get('port_sha')==p['last_validated_port_commit']=='688edfad53a99610d3a6dc751d4f461da9d323a8'
+      and seed['validated'].get('termux_sha')==p['last_validated_termux_sha']=='de1dd3d18e239ef514e5c55ad744e6485e408c65')
+check('[s18d] seed candidates preserve -2 AND register -4 (engine lsb untouched); blocked {} at bootstrap; both promotions in history',
+      any(c.get('ci_run')==40104615699 and c.get('status')=='BUILD_VERIFIED_CANDIDATE' for c in seed['candidates'])
+      and any(c.get('ci_run')==40382174596 and c.get('deb_sha256','').startswith('6de791e2')
+              and c.get('signature')=='0aa721739cab92e1' and c.get('status')=='BUILD_VERIFIED_CANDIDATE' for c in seed['candidates'])
+      and seed['blocked']=={}
+      and any('156.0.8078.47-2' in str(h.get('manual_promotion','')) for h in seed['history'])
+      and any('156.0.8078.47-4' in str(h.get('manual_promotion','')) for h in seed['history']))
+check('[s19] seed validated sha == port.toml; #31 preserved; engine lsb pinned verbatim (lsb==validated is NOT an invariant once a human promotion lands without an engine rebuild)',
+      seed['validated']['deb_sha256']==p['last_validated_deb_sha256']=='6de791e29fc7389c999464bf9afa814d1029a34cba6e29451112abfdda7310e2'
+      and seed['last_successful_build']['deb_sha256']=='cf2cb2a88e15ab42b1510140f4e41c34b751d4368b82f94172c06abd4151ba8d'
+      and seed['candidates'][0]['deb_sha256'].startswith('29c4080d'))
 check('[s20] seed records #31 in history AND last_success == promoted baseline', seed['candidates'][0]['ci_run']==39976822670 and seed['last_successful_build']['ci_run']==40104615699 and seed['last_successful_build']['status']=='BUILD_VERIFIED_CANDIDATE' and seed['last_successful_build'].get('validated') is True)
 
 check('[s21] maintenance.py never imports subprocess/os.system', True)  # structural: reviewed by test below
