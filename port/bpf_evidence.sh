@@ -31,6 +31,10 @@ census() { # $1=bin(exe-verified) $2=out-file
   local bin=$1 out=$2
   local pid exe t f s n pp cmd
   local -a rows=()
+  # Instrumentation fix (2026-10-27 R11 audit): census APPENDS. A reused ws
+  # would silently accumulate stale rows and inflate max_field/presence
+  # verdicts (false-PASS risk). Truncate: one census call = one snapshot.
+  : > "$out"
   local zypids=" "
   for pid in $(ls "$PROC_ROOT" 2>/dev/null | grep -E '^[0-9]+$'); do
     exe=$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null) || continue
@@ -97,6 +101,24 @@ spawn_probe() { # $1=bin $2=label $3=ws $4..=extra chrome flags
 }
 stop_probe() { kill -TERM -"$EV_GPID" 2>/dev/null; sleep 2; kill -KILL -"$EV_GPID" 2>/dev/null; kill "$EV_WPID" 2>/dev/null; wait "$EV_WPID" 2>/dev/null; }
 
+
+TCS_PREFIX=${TCS_PREFIX:-/data/data/com.termux/files/usr}
+wrapper_guard() { # $1=launch-path — REFUSE extracted DEB shield wrappers
+  # The deb's chromium-shield-wrapper.sh resolves its launcher via
+  # ${PREFIX:-/data/data/com.termux/files/usr} — running an EXTRACTED copy
+  # silently execs the INSTALLED package (identity contamination; observed
+  # 2026-10-27 R11 audit). Installed-mode launches (under $TCS_PREFIX) are
+  # the supported official path and stay allowed.
+  case "$(basename "$1")" in
+    chromium-shield-wrapper.sh)
+      case "$1" in
+        "$TCS_PREFIX"/*) return 0 ;;
+        *) echo "[FAIL] extracted DEB shield-wrapper refuses: it would exec the INSTALLED launcher (hardcoded \${PREFIX}); run the extracted chromium-launcher.sh with LD_PRELOAD=<extract>/libtermux-gnp-fix.so instead"; return 1 ;;
+      esac ;;
+  esac
+  return 0
+}
+
 max_field() { # $1=file $2=type $3=field(2..6)
   awk -v t="$2" -v c="$3" '$1==t{if($c>m)m=$c}END{print m+0}' "$1"
 }
@@ -107,6 +129,7 @@ run_gate() { # $1=chrome bin, $2=ws
   # shield wrapper; census identity must match the REAL chrome exe. When bin
   # resolves to a script, target <dir-of-wrapper>/chrome. Spawn still uses
   # the given bin (never bypass the wrapper); marker check uses the exe.
+  wrapper_guard "$bin" || { echo "BPF EVIDENCE GATE: FAIL"; return 1; }
   local match=$bin
   local realbin; realbin=$(readlink -f "$bin")
   case "$realbin" in
@@ -125,7 +148,14 @@ run_gate() { # $1=chrome bin, $2=ws
   ren_n=$(max_field "$ws/census-ported.txt" renderer 4)
   zyg=$(max_field "$ws/census-ported.txt" zygote 2)
   inj=$(max_field "$ws/census-ported.txt" browser 6)
-  bro=$(broker_channel "$ws/census-ported.txt")
+  # broker proof is only meaningful while the measured processes are alive:
+  # it runs BEFORE stop_probe, on a NON-EMPTY fresh census. Empty census =
+  # measurement error, never a silent pass.
+  if [ ! -s "$ws/census-ported.txt" ]; then
+    echo "[FAIL] census empty — measurement error (browser never spawned?); refusing broker proof"; rc=1; bro=0
+  else
+    bro=$(broker_channel "$ws/census-ported.txt")
+  fi
   awk '{print "  ["$1"] filters="$2" seccomp="$3" nnp="$4" ppid="$5}' "$ws/census-ported.txt" | sort -u
   echo "  renderer: filters=$ren seccomp=$ren_s nnp=$ren_n | zygote filters=$zyg | broker-inodes=$bro | runtime --no-sandbox=$inj"
   [ "$inj" -eq 0 ] || { echo "[FAIL] runtime --no-sandbox injected (1001/1004 regression?)"; rc=1; }
@@ -203,6 +233,21 @@ selftest() {
   printf -- '--no-sandbox\0--type=browser\0' > "$P/100/cmdline"
   PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/c3.txt"
   awk '$1=="browser"&&$6==1{f=1}END{exit !f}' "$t/c3.txt" || { echo "[selftest] no-sandbox-tripwire FAIL"; rc=1; }
+  # idempotence: a second census on the SAME output file must not accumulate
+  : > "$t/c4.txt"; printf 'Name: chrome\nSeccomp:\t2\nSeccomp_filters:\t2\nNoNewPrivs:\t1\nPPid:\t101\n' > "$P/102/status"
+  PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/c4.txt"; n1=$(wc -l < "$t/c4.txt")
+  PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/c4.txt"; n2=$(wc -l < "$t/c4.txt")
+  [ "$n1" = "$n2" ] && [ "$n1" -gt 0 ] && echo "[selftest] census idempotent ok" \
+    || { echo "[selftest] census idempotence FAIL ($n1 vs $n2)"; rc=1; }
+  # wrapper guard: extracted path refused, prefix-under path allowed
+  mkdir -p "$t/extract" "$t/pfx/usr/lib/chromium-sandboxed"
+  touch "$t/extract/chromium-shield-wrapper.sh" "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"
+  if TCS_PREFIX=$t/pfx bash "$0" _internal_guard "$t/extract/chromium-shield-wrapper.sh"; then
+    echo "[selftest] wrapper guard FAIL (extracted not refused)"; rc=1
+  else echo "[selftest] wrapper guard refuses extracted ok"; fi
+  if TCS_PREFIX=$t/pfx bash "$0" _internal_guard "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"; then
+    echo "[selftest] wrapper guard allows installed-mode ok"
+  else echo "[selftest] wrapper guard FAIL (installed-mode refused)"; rc=1; fi
   rm -rf "$t"
   echo "[selftest] $([ $rc -eq 0 ] && echo PASS || echo FAIL)"
   return $rc
@@ -211,6 +256,7 @@ selftest() {
 case ${1:-} in
   selftest) selftest ;;
   _internal_census) census "$2" "$3" ;;
+  _internal_guard) wrapper_guard "${2:-}" ;;
   --noop) exit 0 ;;
   "") usage ;;
   *) CHROME=$1; LAUNCH=$1; shift; WS=. ; [ "${1:-}" = --ws ] && { WS=$2; shift 2; }
