@@ -130,7 +130,7 @@ spawn_probe() { # $1=bin $2=label $3=ws $4..=extra chrome flags
   ( sleep 75; kill -KILL -"$EV_GPID" 2>/dev/null ) & EV_WPID=$!
   sleep 14
 }
-stop_probe() { kill -TERM -"$EV_GPID" 2>/dev/null; sleep 2; kill -KILL -"$EV_GPID" 2>/dev/null; kill "$EV_WPID" 2>/dev/null; wait "$EV_WPID" 2>/dev/null; }
+stop_probe() { kill -TERM -"$EV_GPID" 2>/dev/null; sleep 2; kill -KILL -"$EV_GPID" 2>/dev/null; kill "$EV_WPID" 2>/dev/null; wait "$EV_WPID" 2>/dev/null; wait "$EV_GPID" 2>/dev/null; }
 
 
 TCS_PREFIX=${TCS_PREFIX:-/data/data/com.termux/files/usr}
@@ -169,9 +169,41 @@ wrapper_guard() { # $1=launch-path — refuse EXTRACTED DEB shield wrappers
   esac
 }
 
+probe_gone() { # $1=pid [$2=grace_s(8)] — 0 = gone/zombie, 1 = still running.
+  # SIGKILL delivery is asynchronous and can lag on loaded runners (GitHub
+  # ubuntu runners vs Termux); a one-shot kill -0 + state read races. State is
+  # parsed from the FIRST CHARACTER AFTER ') ' (immune to spaces/parens in comm).
+  local pid=$1 grace=${2:-8} waited=0 st
+  while [ "$waited" -lt "$((grace*2))" ]; do
+    st=$(cat "/proc/$pid/stat" 2>/dev/null) || return 0
+    st=${st##*') '}
+    st=${st%% *}
+    [ "$st" = Z ] && return 0
+    sleep 0.5
+    waited=$((waited+1))
+  done
+  return 1
+}
+
 cleanup_all() { # idempotent probe cleanup (normal, error, interrupt, timeout)
-  [ -n "${EV_GPID:-}" ] && kill -KILL -"$EV_GPID" 2>/dev/null
-  [ -n "${EV_WPID:-}" ] && kill "$EV_WPID" 2>/dev/null
+  # Race-proof against setsid(1) not having completed when the trap fires:
+  # at that instant the new process group does not exist yet, so a single
+  # 'kill -KILL -PGID' can ESRCH and the probe later becomes an orphan
+  # (reproduced on GitHub ubuntu-26.04 runner; timing-dependent on Termux
+  # too). Strategy: group kill, direct-pid fallback, then a short re-kill
+  # loop until the pid is gone or zombie.
+  local g=${EV_GPID:-} w=${EV_WPID:-} i st state
+  if [ -n "$g" ]; then
+    for i in 1 2 3 4; do
+      kill -KILL -"$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null || true
+      st=$(cat "/proc/$g/stat" 2>/dev/null) || break
+      state=${st##*') '}
+      state=${state%% *}
+      [ "$state" = Z ] && break
+      sleep 0.3
+    done
+  fi
+  [ -n "$w" ] && kill "$w" 2>/dev/null
   return 0
 }
 trap 'cleanup_all' EXIT INT TERM
@@ -408,14 +440,27 @@ selftest() {
   n2=$(grep -acE 'Activated seccomp-bpf sandbox' "$t/real.log")
   [ "$n1" = 1 ] && [ "$n2" = 1 ] && echo "[selftest] genuine crash lines detected" \
     || { echo "[selftest] log classifier MISSED real lines n1=$n1 n2=$n2"; rc=1; }
-  # ---- cleanup trap: SIGKILL the probe group via _internal_cleanup ----
+  # ---- cleanup paths: EXIT trap / TERM trap / direct cleanup_all / LEAK control ----
   setsid sleep 120 & EVTEST_GPID=$!
   sleep 1
-  EVTEST_GPID=$EVTEST_GPID bash "$0" _internal_cleanup
-  if kill -0 "$EVTEST_GPID" 2>/dev/null && ! awk '$3 ~ /Z/ {exit 0}END{exit 1}' /proc/$EVTEST_GPID/stat 2>/dev/null; then
-    echo "[selftest] cleanup trap FAILED to reap probe group"; rc=1
-  else echo "[selftest] cleanup trap reaps probe group ok"; fi
-  kill -KILL -"$EVTEST_GPID" 2>/dev/null; wait "$EVTEST_GPID" 2>/dev/null
+  EVTEST_GPID=$EVTEST_GPID bash "$SELF" _internal_cleanup
+  wait "$EVTEST_GPID" 2>/dev/null
+  if probe_gone "$EVTEST_GPID" 8; then
+    echo "[selftest] direct cleanup_all reaps probe group (grace-polled)"
+  else echo "[selftest] cleanup trap FAILED to reap probe group"; rc=1; kill -KILL -"$EVTEST_GPID" 2>/dev/null; fi
+  for tp in EXIT TERM; do
+    lpid=$(bash "$SELF" _internal_trap "$tp" 2>/dev/null | sed -n 's/^LEADER=//p')
+    if [ -z "$lpid" ]; then echo "[selftest] trap $tp: no leader captured"; rc=1; continue; fi
+    if probe_gone "$lpid" 8; then echo "[selftest] trap path $tp reaps probe group";
+    else echo "[selftest] trap path $tp LEAK (probe survived)"; rc=1; kill -KILL -"$lpid" 2>/dev/null; fi
+  done
+  lpid=$(bash "$SELF" _internal_trap LEAK 2>/dev/null | sed -n 's/^LEADER=//p')
+  if [ -n "$lpid" ] && ! probe_gone "$lpid" 2; then
+    echo "[selftest] LEAK control survived — detector CAN fail (injection ok)"
+  else
+    echo "[selftest] leak detector BROKEN (LEAK control not detected as alive)"; rc=1
+  fi
+  if [ -n "$lpid" ]; then kill -KILL -"$lpid" 2>/dev/null; wait "$lpid" 2>/dev/null; fi
   # ---- wrapper guard matrix: symlink/relative/nested/renamed/PREFIX-hijack ----
   mkdir -p "$t/ex/bin" "$t/bin" "$t/pfx/usr/lib/chromium-sandboxed"
   WCONTENT='#!/data/data/com.termux/files/usr/bin/bash
@@ -464,6 +509,19 @@ case ${1:-} in
   _internal_guard) wrapper_guard "${2:-}" ;;
   _internal_broker) broker_channel "$2" "$3" ;;
   _internal_cleanup) EV_GPID=${EVTEST_GPID:-}; cleanup_all ;;
+  _internal_trap)
+    # redirect away from inherited stdout: a background job holding a
+    # command-substitution pipe would block the caller until timeout instead
+    # of exposing the real liveness state (fixture defect found in CI)
+    setsid sleep 60 >/dev/null 2>&1 & EV_GPID=$!
+    echo "LEADER=$EV_GPID"
+    trap 'cleanup_all' EXIT
+    trap 'cleanup_all; exit 0' INT TERM
+    case "${2:-EXIT}" in
+      LEAK) trap - EXIT INT TERM ;;  # control: NO cleanup — detector must catch this
+      TERM) kill -TERM $$ ;;
+      *) : ;;                          # plain exit -> EXIT trap path
+    esac ;;
   --noop) exit 0 ;;
   "") usage ;;
   *) CHROME=$1; LAUNCH=$1; shift; WS=. ; [ "${1:-}" = --ws ] && { WS=$2; shift 2; }
