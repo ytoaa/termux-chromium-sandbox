@@ -4,12 +4,9 @@
 name: DIAG node24 attribution
 
 on:
-  workflow_dispatch:
-    inputs:
-      skip_purge:
-        description: Skip the apt-purge probe (still tests rm probes)
-        type: boolean
-        default: true
+  push:
+    branches: [diag/ci-node24]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -99,8 +96,7 @@ jobs:
           sudo rm -rf /var/lib/containerd/io.containerd.content.v1.content/ 2>/dev/null || true
           node-probe P6-after
       - name: P7 apt purge (mirror of free-space.sh, opt-in)
-        if: ${{ inputs.skip_purge == false }}
-        continue-on-error: true
+          continue-on-error: true
         run: |
           node-probe P7-before
           # shellcheck disable=SC2046
