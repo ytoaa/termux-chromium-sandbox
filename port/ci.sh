@@ -33,6 +33,48 @@ docker_volume_args() {
   echo "--volume $d/.sccache:/home/builder/.cache/sccache --volume $d/.termux-depcache/aarch64:/home/builder/.termux-build/_cache-aarch64"
 }
 
+docker_perms_smoke() {
+  # REAL-container permission contract (fail-closed). Runs inside the builder
+  # container as the image user and verifies, in order:
+  #   1) mkdir under /home/builder/.termux-build  (the exact EACCES surface of
+  #      run 40717335376 — bind-mount parent must be builder-writable)
+  #   2) file create/read/remove inside the build dir
+  #   3) dep-cache leaf writable
+  #   4) restored dep-cache content readable (warm) or clean-empty (cold)
+  #   5) sccache leaf writable SIMULTANEOUSLY (both bind mounts coexist)
+  #   6) evidence: container uid/gid, ls -ld of every level, /proc/mounts rows
+  # Host-side evidence (host uid, host dir ownership, docker Mounts) printed
+  # by the caller. Container-recreation coverage lives in prepare_builder.
+  local d
+  d="$(need_termux_dir "${1:?}")"
+  export TERMUX_DOCKER_RUN_EXTRA_ARGS="$(docker_volume_args "$d")"
+  run_docker "$d" bash -lc '
+    set -euo pipefail
+    echo "SMOKE uid=$(id -u) gid=$(id -g) user=$(id -un)"
+    grep -E "termux-build/_cache-aarch64|cache/sccache" /proc/mounts >/dev/null \
+      || { echo "SMOKE FAIL: expected bind mounts absent from /proc/mounts"; exit 1; }
+    echo "SMOKE ownership evidence:"
+    ls -ld /home/builder /home/builder/.cache /home/builder/.cache/sccache \
+           /home/builder/.termux-build /home/builder/.termux-build/_cache-aarch64
+    b=/home/builder/.termux-build/smoke-$$
+    mkdir -p "$b/sub"
+    echo payload > "$b/sub/f"
+    [ "$(cat "$b/sub/f")" = payload ]
+    rm -rf "$b"
+    c=/home/builder/.termux-build/_cache-aarch64
+    echo w > "$c/.smoke-write" && rm "$c/.smoke-write"
+    n=$(find "$c" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    if [ "$n" -gt 0 ]; then
+      sha256sum "$(find "$c" -maxdepth 1 -type f | head -1)" >/dev/null \
+        && echo "SMOKE dep-cache warm: files=$n first-entry sha readable"
+    else
+      echo "SMOKE dep-cache cold: empty mount, writable"
+    fi
+    s=/home/builder/.cache/sccache
+    echo w > "$s/.smoke-write" && rm "$s/.smoke-write"
+    echo "SMOKE OK"'
+}
+
 dep_cache_prune() {
   # Keep .termux-depcache bounded (age then size). Never touches anything
   # outside <termux-packages>/.termux-depcache.
@@ -64,35 +106,79 @@ dep_cache_prune() {
 # into the deb key, so any switch is visible in build inputs. Fails FAST
 # (<5 min) instead of letting build-package curl(28)-loop for hours.
 OFFICIAL_APT_HOSTS="packages.termux.dev packages-cf.termux.dev"
+_official_host_p() { case " $OFFICIAL_APT_HOSTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 _probe_repo() {
   # $1=repo base url, $2=distribution (from repo.json — root repo uses
-  # dists/root, NOT stable; hardcoding distributions false-blocked builds)
-  local url="$1" dist="${2:-stable}" code
-  code=$(timeout 25 curl -fsS --connect-timeout 8 --retry 1 --retry-delay 2 \
-    --speed-limit 2000 --speed-time 20 -o /dev/null -w '%{http_code} %{speed_download}' "$url/dists/$dist/Release" 2>/dev/null) \
-    || code="000 0"
-  echo "$code"
+  # dists/root, NOT stable; hardcoding distributions false-blocked builds),
+  # $3=optional payload path under dists/$dist/ (real-transfer probe).
+  # Prints "http_code speed_download rc effective_host". curl -w output is
+  # emitted on -f-style failures too, so the HTTP status survives (a bare
+  # `|| code=000` used to erase the 404-vs-timeout distinction the post-
+  # mortem needed). -L follows redirects (max 5) BUT the effective host is
+  # returned and MUST pass the official whitelist — a redirect must never
+  # silently move us to an unverified origin.
+  local url="$1" dist="${2:-stable}" payload="${3:-}" out rc
+  local -a args=(-fsSL --max-redirs 5 --connect-timeout 8 --retry 1
+                 --retry-delay 2 --speed-limit 2000 --speed-time 20
+                 -o /dev/null -w '%{http_code} %{speed_download} %{url_effective}')
+  if [ -n "$payload" ]; then
+    args+=(--max-time 60 -r 0-1048575)   # bounded 1 MiB REAL transfer
+    url="$url/dists/$dist/$payload"
+  else
+    url="$url/dists/$dist/Release"
+  fi
+  # NOTE: `out=$(cmd); rc=$?` would abort the whole step under set -e the
+  # moment curl fails (same silent-death trap that bit "Compute cache keys"
+  # pre-e800770). Guard the status capture explicitly.
+  out=$(timeout 90 curl "${args[@]}" "$url" 2>/dev/null) && rc=0 || rc=$?
+  [ -n "$out" ] || out="000 0 $url"
+  local code speed eff host
+  set -- $out
+  code="${1:-000}"; speed="${2:-0}"; eff="${3:-$url}"
+  host="${eff#*://}"; host="${host%%/*}"; host="${host%%:*}"
+  echo "$code $speed $rc $host"
+}
+_probe_entry() {
+  # One repo entry is HEALTHY only when BOTH the metadata (Release, 200)
+  # AND an actual 1 MiB ranged transfer of its Packages index succeed on
+  # official hosts. Release-200 alone does not prove the 85 MB-class .deb
+  # pipeline works (that is exactly how run 40662494279 slipped through a
+  # healthy-looking head while downloads crawled at 1.5–40 KB/s).
+  local url="$1" dist="$2" code speed rc eff p="" pec psp prc peff p_path=none
+  read -r code speed rc eff <<<"$(_probe_repo "$url" "$dist")"
+  echo "PREFLIGHT probe url=$url dist=$dist Release http=$code rc=$rc speed=${speed:-0} eff_host=${eff:-?}"
+  [ "$rc" = "0" ] && [ "$code" = "200" ] || return 1
+  _official_host_p "${eff:-?}" || { echo "PREFLIGHT FAIL: Release redirected off-whitelist: $url -> ${eff:-?}" >&2; return 1; }
+  for p in binary-aarch64/Packages.xz binary-aarch64/Packages.gz binary-aarch64/Packages; do
+    read -r pec psp prc peff <<<"$(_probe_repo "$url" "$dist" "$p")"
+    [ "${prc:-1}" = "0" ] || continue
+    case "${pec:-000}" in 200|206) ;; *) continue ;; esac
+    _official_host_p "${peff:-?}" || { echo "PREFLIGHT FAIL: Packages redirected off-whitelist: $url/$p -> ${peff:-?}" >&2; return 1; }
+    p_path="$p"; break
+  done
+  echo "PREFLIGHT probe url=$url dist=$dist Packages path=$p_path http=${pec:-000} rc=${prc:-?} speed=${psp:-0} eff_host=${peff:-?} (1MiB ranged transfer)"
+  if [ "$p_path" = "none" ]; then
+    echo "PREFLIGHT FAIL: Release OK but Packages transfer failed at $url dist=$dist — Release-200 alone is not trusted for multi-hundred-MB dependency pulls; refusing to start the build." >&2
+    return 1
+  fi
+  return 0
 }
 download_preflight() {
-  local d repo host urls entry url base healthy rc=0
+  local d repo host urls entry url dist healthy rc=0
   d="$(need_termux_dir "${1:?}")"
   repo="$d/repo.json"
   test -f "$repo" || { echo "PREFLIGHT FAIL: repo.json missing" >&2; return 1; }
   echo "PREFLIGHT begin $(date -u +%FT%TZ) repo.json=$(sha256sum "$repo" | cut -c1-16)"
   jq -r 'del(.pkg_format) | .[] | .url + " " + .distribution' "$repo" | while IFS=' ' read -r url dist; do
     host="${url#*://}"; host="${host%%/*}"; host="${host%%:*}"
-    case " $OFFICIAL_APT_HOSTS " in *" $host "*) ;; *)
-      echo "PREFLIGHT FAIL: non-official repo host in repo.json: $host" >&2; exit 1 ;;
-    esac
-    read -r code speed <<<"$(_probe_repo "$url" "$dist")"
-    echo "PREFLIGHT probe url=$url dist=$dist http=$code speed=${speed:-0}"
-    if [ "$code" != "200" ]; then
+    _official_host_p "$host" || {
+      echo "PREFLIGHT FAIL: non-official repo host in repo.json: $host" >&2; exit 1; }
+    if ! _probe_entry "$url" "$dist"; then
       for alt in $OFFICIAL_APT_HOSTS; do
         [ "$alt" = "$host" ] && continue
         local_url="https://$alt/${url#*://$host/}"
-        read -r code speed <<<"$(_probe_repo "$local_url" "$dist")"
-        echo "PREFLIGHT probe alt url=$local_url dist=$dist http=$code speed=${speed:-0}"
-        if [ "$code" = "200" ]; then
+        echo "PREFLIGHT switching $url -> $local_url (official whitelist only)"
+        if _probe_entry "$local_url" "$dist"; then
           cp -f "$repo" "$d/repo.json.orig-backup"
           jq --arg old "$url" --arg new "$local_url" \
              'walk(if type=="object" and .url==$old then .url=$new else . end)' \
@@ -103,13 +189,13 @@ download_preflight() {
       done
     fi
   done || rc=1
-  # Final gate: every repo entry must currently answer 200 on its selected host.
+  # Final gate: every repo entry must currently pass Release AND Packages
+  # transfer probes on its selected (official) host.
   jq -r 'del(.pkg_format) | .[] | .url + " " + .distribution' "$repo" | while IFS=' ' read -r url dist; do
-    read -r code speed <<<"$(_probe_repo "$url" "$dist")"
-    if [ "$code" != "200" ]; then
-      echo "PREFLIGHT FAIL: repo unreachable/slow: $url dist=$dist (http=$code). Refusing to start a multi-hour build; no unverified mirror or stale-dep fallback is permitted." >&2
+    _probe_entry "$url" "$dist" || {
+      echo "PREFLIGHT FAIL: repo unreachable/slow: $url dist=$dist. Refusing to start a multi-hour build; no unverified mirror or stale-dep fallback is permitted." >&2
       exit 1
-    fi
+    }
   done || rc=1
   echo "PREFLIGHT done rc=$rc $(date -u +%FT%TZ) effective_repo_sha=$(sha256sum "$repo" | cut -c1-16)"
   return $rc
@@ -221,20 +307,48 @@ prepare_builder() {
   pulled=0
   for attempt in 1 2 3 4 5; do docker pull "$base" && { pulled=1; break; }; sleep $((attempt*15)); done
   [ "$pulled" -eq 1 ] || { docker build -t "$base" "$d/scripts/"; docker buildx prune -af || true; }
+  # PRE-CREATE the bind-mount PARENTS, builder-owned. Root cause of run
+  # 40717335376 (step15, 15:38:47Z): "mkdir: cannot create directory
+  # '/home/builder/.termux-build/chromium-sandboxed': Permission denied".
+  # dockerd runs as root and auto-creates any MISSING target path of a
+  # -v/--volume mount as root:root 0755 INSIDE the container. Our dep-cache
+  # mount targets .../.termux-build/_cache-aarch64; the image never had
+  # .termux-build (upstream creates it at build runtime as builder), so the
+  # leaf mount made dockerd plant a root-owned .termux-build and the builder
+  # user could no longer create the package dir under it. The leaf itself is
+  # irrelevant (replaced by the bind, host-dir uid decides access, same
+  # mechanism that made the sccache mount work since run #10). Fix is
+  # ownership-correct pre-creation only — NO chmod -R 777, no new mounts.
+  # .termux-build stays a builder-owned normal dir (upstream layout intact;
+  # host tool-build artifacts like _cache/python-3.14 live alongside and are
+  # deliberately NOT bind-mounted over — that is why we mount at the
+  # _cache-aarch64 LEAF and never at .termux-build level).
   cat > /tmp/Dockerfile.chromium-sccache <<'DOCKERFILE'
 FROM ghcr.io/termux/package-builder:latest
 USER root
 RUN apt-get update \
     && apt-get install -yq --no-install-recommends sccache python3 \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/builder/.termux-build/_cache-aarch64 /home/builder/.cache/sccache \
+    && chown -R builder:builder /home/builder/.termux-build /home/builder/.cache/sccache
 USER builder:builder
 WORKDIR /home/builder/termux-packages
 DOCKERFILE
   docker build -f /tmp/Dockerfile.chromium-sccache -t "$TERMUX_BUILDER_IMAGE_NAME" "$d"
   docker rm -f termux-package-builder 2>/dev/null || true
   export TERMUX_DOCKER_RUN_EXTRA_ARGS="$(docker_volume_args "$d")"
+  # Host-side evidence for the permission contract (see docker_perms_smoke).
+  echo "SMOKE host uid=$(id -u) gid=$(id -g) user=$(id -un)"
+  stat -c 'SMOKE hostdir %a %U:%G %n' "$d/.sccache" "$d/.termux-depcache/aarch64" || true
   run_docker "$d" true
+  docker inspect -f 'SMOKE mount {{.Source}} -> {{.Destination}}' termux-package-builder || true
+  docker_perms_smoke "$d"
+  # Check 6 of the contract: everything must still hold after the container
+  # is destroyed and recreated from the same image + same volume args.
+  echo "SMOKE container-recreation: rm -f + re-create"
+  docker rm -f termux-package-builder 2>/dev/null || true
+  docker_perms_smoke "$d"
   run_docker "$d" bash -lc 'set -euxo pipefail; export SCCACHE_DIR=/home/builder/.cache/sccache SCCACHE_CACHE_SIZE=6G; command -v sccache; python3 --version; echo test > "$SCCACHE_DIR/.write-test"; rm "$SCCACHE_DIR/.write-test"'
   # --- free-space replacement (runner-safe subset) ---------------------
   # Upstream scripts/free-space.sh (pin de1dd3d1) contains
@@ -390,6 +504,7 @@ case "$cmd" in
     ;;
   prepare-zram-workspace) prepare_zram_workspace "${2:?usage: ci.sh prepare-zram-workspace <termux-packages>}" ;;
   prepare-builder)        prepare_builder "${2:?usage: ci.sh prepare-builder <termux-packages>}" ;;
+  docker-perms-smoke)    docker_perms_smoke "${2:?usage: ci.sh docker-perms-smoke <termux-packages>}" ;;
   build)                  build_chromium "${2:?usage: ci.sh build <termux-packages>}" ;;
   dep-cache-prune)     dep_cache_prune "${2:?usage: ci.sh dep-cache-prune <termux-packages>}" ;;
   download-preflight)  download_preflight "${2:?usage: ci.sh download-preflight <termux-packages>}" ;;
@@ -401,7 +516,7 @@ case "$cmd" in
     gh api --method GET "repos/termux/termux-packages/commits/${2:-master}" --jq .sha
     ;;
   *)
-    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | prepare-zram-workspace <tp> | prepare-builder <tp> | build <tp> | dep-cache-prune <tp> | download-preflight <tp> | deb-key <tp> | deb-reuse-verify <tp> | deb-reuse-save <tp> | resolve-ref [ref]" >&2
+    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | prepare-zram-workspace <tp> | prepare-builder <tp> | docker-perms-smoke <tp> | build <tp> | dep-cache-prune <tp> | download-preflight <tp> | deb-key <tp> | deb-reuse-verify <tp> | deb-reuse-save <tp> | resolve-ref [ref]" >&2
     exit 2
     ;;
 esac

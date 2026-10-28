@@ -1496,3 +1496,55 @@ Protections re-tested, never weakened: seccomp policy files byte-identical
 (T15), no `contents:write`, no fallback mirror, no gate bypass, a cache-save
 failure can never flip build success, and code-level `rm -rf` of runner
 cache paths is forbidden (T14) preserving the node24 fix.
+
+## Round 21 — Docker bind-mount parent fix + real-container smoke contract
+
+Post-mortem run 40717335376 (15:38:47Z): `mkdir: cannot create directory
+'/home/builder/.termux-build/chromium-sandboxed': Permission denied`,
+BUILD_RC=1 before ninja. Root cause (proven by the pinned upstream
+`scripts/run-docker.sh`): the Termux builder reuses ONE detached container;
+dockerd creates any *missing* bind-mount target path **as root:root** inside
+the image's filesystem. Our Layer-1 mount targets
+`/home/builder/.termux-build/_cache-aarch64`; the image never ships
+`.termux-build` (upstream creates it at build runtime as builder), so the
+leaf mount made dockerd plant a root-owned `.termux-build` parent and
+`build-package.sh` lost write access to its own top dir. The sccache mount
+never showed this because nothing mkdirs *beside* `.cache/sccache` —
+bind-mounted leaves inherit host-dir uid semantics, only intermediate
+parents are root-created.
+
+Fix (ownership-correct, minimal, no `chmod -R 777`, no new mounts):
+`Dockerfile.chromium-sccache` pre-creates `/home/builder/.termux-build/
+_cache-aarch64` and `/home/builder/.cache/sccache` `chown -R builder:builder`
+in the image. `.termux-build` is deliberately NOT bind-mounted at its own
+level — it also hosts non-cache state (`chromium-sandboxed` build dir,
+`_cache/python-3.14` host-tool artifacts); only the per-arch download leaf
+is mounted.
+
+Contract now *verified in the real container* by `docker_perms_smoke`
+(prepare-builder runs it twice: fresh create + after `rm -f` recreate):
+uid/gid + `docker inspect` Mounts + host dir ownership evidence,
+/proc/mounts rows for BOTH volumes, mkdir under `.termux-build`,
+create/read/remove inside it, dep-cache leaf write, restored dep-cache
+entries sha-readable (warm) or clean-empty (cold), sccache leaf writable
+simultaneously. Any failure aborts the job at ~20 min, not at timeout.
+
+Adjacent hardenings in this round:
+* preflight now demands a *real* transfer — Release 200 AND a bounded 1 MiB
+  ranged GET of `binary-aarch64/Packages(.xz|.gz)` per repo entry; a
+  Release-200-only pass no longer blesses multi-hundred-MB dependency pulls
+  (run 40662494279 lesson). Redirects are followed but the EFFECTIVE host
+  must still be official (off-whitelist → hard fail); curl rc is preserved
+  next to http code (404 vs 28 vs 7 vs TLS distinguishable in the log).
+* `docker_smoke_only` dispatch input: infrastructure-validation runs stop
+  after prepare-builder; compile, package gates and deb-reuse steps are
+  gated there ONLY — every normal run executes the security gates
+  unconditionally.
+* Save-guard: sccache/dep-cache saves are skipped unless the dirs hold
+  ≥10/≥1 files. Early-failed runs previously archived empty caches under
+  real keys; restores then risked choosing an empty archive over an older
+  healthy one. Existing caches are never modified by a skipped save.
+* Completed-DEB reuse flipped to explicit **opt-in** (`allow_deb_reuse`
+  default false). The fail-closed verifier is strong, but until two
+  independent full builds prove cross-run key stability in production,
+  skipping compilation must be a deliberate choice, not a default.

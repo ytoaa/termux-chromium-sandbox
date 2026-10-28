@@ -105,24 +105,34 @@ vol_arm = W / "dep-cache" / "arm"
 vol_arm.mkdir(parents=True)
 ok("T5 arch namespaces are separate dirs", str(vol) != str(vol_arm) and (vol / "libfoo_1.0_aarch64.deb").exists())
 
-# ---------- T6: preflight fail-fast + whitelist ----------
+# Whitelisted variant of ci.sh (127.0.0.1 accepted as "official") for
+# behavior tests that must exercise the probe paths instead of the
+# host-whitelist refusal.
 tp = W / "termux-packages"
 (tp / "scripts").mkdir(parents=True)
 (tp / "build-package.sh").write_text("#!/bin/sh\nexit 0\n")
 (tp / "scripts" / "run-docker.sh").write_text("#!/bin/sh\nexit 0\n")
 for f in (tp / "build-package.sh", tp / "scripts" / "run-docker.sh"):
     f.chmod(0o755)
+ci2 = W / "ci-whitelisted.sh"
+src = Path(str(CI)).read_text()
+import re as _re
+src2 = _re.sub(r'^OFFICIAL_APT_HOSTS="[^"]*"', 'OFFICIAL_APT_HOSTS="127.0.0.1"', src, count=1, flags=_re.M)
+assert src2 != src
+ci2.write_text(src2); ci2.chmod(0o755)
 # dead repo (port closed) -> PREFLIGHT FAIL
 (tp / "repo.json").write_text(json.dumps({
     "pkg_format": "debian",
     "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
                  "url": "http://127.0.0.1:9/apt/termux-main"}}))
-r = run(["bash", str(CI), "download-preflight", str(tp)], timeout=300)
+r = run(["bash", str(ci2), "download-preflight", str(tp)], timeout=300)
 ok("T6a preflight fails fast on dead repo", r.returncode != 0 and "PREFLIGHT FAIL" in (r.stdout + r.stderr),
    (r.stdout + r.stderr)[-200:])
 # non-official host -> refusal even if reachable
 SERVE_ROOT["/apt/termux-main/dists/stable/Release"] = b"Origin: evil\n"
 SERVE_ROOT["/apt/termux-root/dists/root/Release"] = b"Origin: evil-root\n"
+SERVE_ROOT["/apt/termux-main/dists/stable/binary-aarch64/Packages.xz"] = b"PKGS" * 40
+SERVE_ROOT["/apt/termux-root/dists/root/binary-aarch64/Packages.xz"] = b"PKGSROOT" * 40
 (tp / "repo.json").write_text(json.dumps({
     "pkg_format": "debian",
     "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
@@ -141,15 +151,10 @@ ok("T6b non-official mirror host refused", r.returncode != 0 and "non-official" 
                  "url": f"http://127.0.0.1:{PORT}/apt/termux-main"},
     "root-packages": {"name": "termux-root", "distribution": "root", "component": "stable",
                  "url": f"http://127.0.0.1:{PORT}/apt/termux-root"}}))
-ci2 = W / "ci-whitelisted.sh"
-src = Path(str(CI)).read_text()
-import re as _re
-src2 = _re.sub(r'^OFFICIAL_APT_HOSTS="[^"]*"', 'OFFICIAL_APT_HOSTS="127.0.0.1"', src, count=1, flags=_re.M)
-assert src2 != src
-ci2.write_text(src2); ci2.chmod(0o755)
 r = run(["bash", str(ci2), "download-preflight", str(tp2)], timeout=300)
 ok("T6c per-distribution probe (root passes when up; main+x11 too)",
-   r.returncode == 0 and "dist=root" in r.stdout and "http=200" in r.stdout,
+   r.returncode == 0 and "dist=root" in r.stdout and "http=200" in r.stdout
+   and "1MiB ranged transfer" in r.stdout,
    (r.stdout + r.stderr)[-250:])
 
 # ---------- T7/T8: deb_key stability & sensitivity ----------
@@ -261,9 +266,9 @@ ok("T15 R12 policy/rules/fixtures unchanged on perf branch", diffp == "", diffp)
 
 # ---------- T16: inner script + watchdog ----------
 inner = re.search(r"<<'SCCACHE_PROFILE_SCRIPT'\n(.*?)\nSCCACHE_PROFILE_SCRIPT", ci_txt, re.S)
-ok("T16a inner ticker present", bool(inner) and "SCCACHE_TICK_JSON" in inner.group(1)
+ok("T15b inner ticker present", bool(inner) and "SCCACHE_TICK_JSON" in inner.group(1)
    and "timeout 14400" in inner.group(1) and "BUILD_TIMEOUT_GUARD" in inner.group(1))
-ok("T16b watchdog uses tick/ninja signals", "last_tick" in ci_txt and "ninja_started" in ci_txt)
+ok("T15c watchdog uses tick/ninja signals", "last_tick" in ci_txt and "ninja_started" in ci_txt)
 
 # ---------- T17: workflow step ordering ----------
 wf = (ROOT / ".github/workflows/build-chromium.yml").read_text()
@@ -272,9 +277,58 @@ def pos(pat):
     return m.start() if m else -1
 ok("T17 preflight before prepare-builder; gates unconditional; save-deb success-only",
    0 < pos(r"Download preflight") < pos(r"Prepare Termux builder") and
-   pos(r"if: steps\.debcheck\.outputs\.reused != '1'\s*\n\s*run: bash port/ci\.sh build") > 0 and
+   pos(r"if: inputs\.docker_smoke_only != true && steps\.debcheck\.outputs\.reused != '1'\s*\n\s*run: bash port/ci\.sh build") > 0 and
    pos(r"Package gates") > pos(r"Build chromium-sandboxed") and
-   "if: success() && inputs.allow_deb_reuse && steps.debcheck.outputs.reused != '1'" in wf)
+   "if: success() && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'" in wf)
+
+# ---------- T16: preflight regressions via fake curl (no real network) ------
+FAKE_NET = HERE / "fixtures" / "net"
+tpf = W / "tp-preflight"
+(tpf / "scripts").mkdir(parents=True, exist_ok=True)
+(tpf / "build-package.sh").write_text("#!/bin/sh\ntrue\n"); (tpf / "scripts" / "run-docker.sh").write_text("#!/bin/sh\ntrue\n")
+(tpf / "build-package.sh").chmod(0o755); (tpf / "scripts" / "run-docker.sh").chmod(0o755)
+
+
+def preflight(env_extra, repo_main="https://packages.termux.dev/apt/termux-main"):
+    (tpf / "repo.json").write_text(json.dumps({
+        "pkg_format": "debian",
+        "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
+                     "url": repo_main}}))
+    env = dict(os.environ, PATH=f"{FAKE_NET}:{os.environ['PATH']}", **env_extra)
+    return run(["bash", str(CI), "download-preflight", str(tpf)], env=env, timeout=300)
+
+
+r = preflight({})
+ok("T16a all-200 healthy pass incl. Packages 1MiB transfer",
+   r.returncode == 0 and "1MiB ranged transfer" in r.stdout, (r.stdout + r.stderr)[-250:])
+r = preflight({"FAKE_EFF": "https://evil.example/apt/termux-main"})
+ok("T16b redirect off official whitelist -> refused",
+   r.returncode != 0 and "off-whitelist" in (r.stdout + r.stderr), (r.stdout + r.stderr)[-250:])
+r = preflight({"FAKE_P_RC": "28", "FAKE_SILENT": "1"})
+ok("T16c Release-200 but Packages transfer fails -> refuse (Release alone NOT trusted)",
+   r.returncode != 0 and "Packages transfer failed" in (r.stdout + r.stderr), (r.stdout + r.stderr)[-250:])
+r = preflight({"FAKE_RC": "28", "FAKE_CODE": "000", "FAKE_SILENT": "1"})
+ok("T16d timeout classified rc=28 in log + fail",
+   r.returncode != 0 and "rc=28" in r.stdout, (r.stdout + r.stderr)[-250:])
+r = preflight({"FAKE_EFF": "https://packages-cf.termux.dev/apt/termux-main"})
+ok("T16e redirect between official hosts accepted", r.returncode == 0, (r.stdout + r.stderr)[-250:])
+r = preflight({"FAKE_FAIL_HOST": "packages.termux.dev"})
+ok("T16f primary down -> bounded MIRROR-SWITCH to official alt, exit 0",
+   r.returncode == 0 and "MIRROR-SWITCH" in r.stdout, (r.stdout + r.stderr)[-250:])
+
+# ---------- T18: docker permission fix + smoke + save-guard invariants ------
+ok("T18a image pre-creates .termux-build builder-owned (bind-parent fix)",
+   "mkdir -p /home/builder/.termux-build/_cache-aarch64" in ci_txt
+   and "chown -R builder:builder /home/builder/.termux-build" in ci_txt)
+ok("T18b real-container perms smoke wired (6 checks; fresh AND recreated)",
+   "docker_perms_smoke" in ci_txt and ci_txt.count('docker_perms_smoke "$d"') >= 2
+   and "SMOKE OK" in ci_txt and "/proc/mounts" in ci_txt and "SMOKE mount" in ci_txt)
+ok("T18c workflow: smoke-only gates compile/gates/deb-reuse; reuse default OFF (opt-in)",
+   "docker_smoke_only" in wf and "inputs.docker_smoke_only != true" in wf
+   and re.search(r"allow_deb_reuse:[\s\S]{0,400}?default: false", wf) is not None)
+ok("T18d no empty-cache promotion: both save steps gated by guard outputs",
+   "steps.guard.outputs.sccache_nonempty" in wf and "steps.guard.outputs.dep_nonempty" in wf
+   and "Guard cache saves" in wf)
 
 print(f"\nCACHE-LAYERS PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)

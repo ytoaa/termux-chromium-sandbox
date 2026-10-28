@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Deterministic curl stand-in for preflight regression tests (T16*).
+# Emulates ONLY the surface _probe_repo uses: last arg = URL, and the -w
+# triad "http_code speed_download url_effective" on stdout. Behavior is
+# driven entirely by environment:
+#   FAKE_CODE/FAKE_SPEED/FAKE_RC/FAKE_EFF          Release (and default)
+#   FAKE_P_CODE/FAKE_P_RC/FAKE_P_EFF               *Packages* URLs
+#   FAKE_FAIL_HOST=<substr>                        URLs containing it fail rc=7 silently
+#   FAKE_SILENT=1                                  suppress -w output when rc != 0
+set -u
+url="${@: -1}"
+code="${FAKE_CODE:-200}"; speed="${FAKE_SPEED:-900000}"; rc="${FAKE_RC:-0}"; eff="${FAKE_EFF:-$url}"
+case "$url" in *Packages*) code="${FAKE_P_CODE:-$code}"; rc="${FAKE_P_RC:-$rc}"; eff="${FAKE_P_EFF:-$eff}" ;; esac
+if [ -n "${FAKE_FAIL_HOST:-}" ] && [[ "$url" == *"$FAKE_FAIL_HOST"* ]]; then rc=7; code=000; fi
+if [ "$rc" != "0" ] && [ -n "${FAKE_SILENT:-}" ]; then exit "$rc"; fi
+echo "$code $speed $eff"
+exit "$rc"
