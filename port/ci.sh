@@ -125,7 +125,7 @@ deb_key() {
   d="$(need_termux_dir "${1:?}")"
   termux_sha=$(git -C "$d" rev-parse HEAD 2>/dev/null || true)
   [ -n "$termux_sha" ] || { echo "DEB KEY FAIL: termux dir is not a git checkout" >&2; return 1; }
-  port_hash=$(cd "$here/.." && python3 port/maintenance.py port-input-hash --root . 2>/dev/null | tail -1)
+  port_hash=$(cd "$here/.." && python3 port/maintenance.py port-input-hash --root . | tail -1)
   [ -n "$port_hash" ] || { echo "DEB KEY FAIL: port-input-hash empty" >&2; return 1; }
   recipe_sha=$(find "$d/packages/chromium-sandboxed" -type f \( -name '*.sh' -o -name '*.sub' -o -name 'RECIPE*' \) -print0 2>/dev/null | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)
   upstream=$(grep -oE 'TERMUX_PKG_VERSION="[0-9.]+"' "$d/packages/chromium-sandboxed/.."/*chromium*/build.sh 2>/dev/null | head -1 | cut -d'"' -f2)

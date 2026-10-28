@@ -122,8 +122,12 @@ jobs:
           test -n "$ph"
           base=$(printf '%s\n' "termux=$termux_sha" "rev=${TERMUX_SANDBOXED_REVISION:-}" "port=$ph" | sha256sum | cut -d' ' -f1)
           echo "base=$base" >> "$GITHUB_OUTPUT"
-          dk=$(bash port/ci.sh deb-key "$PWD/termux-packages" | tail -1 | cut -d= -f2)
-          test -n "$dk"
+          if ! dkraw=$(bash port/ci.sh deb-key "$PWD/termux-packages" 2>&1); then
+            echo "DEB-KEY step FAILED: $dkraw" >&2
+            exit 1
+          fi
+          dk=$(printf '%s' "$dkraw" | tail -1 | cut -d= -f2)
+          test -n "$dk" || { echo "DEB-KEY empty output: $dkraw" >&2; exit 1; }
           echo "debkey=$dk" >> "$GITHUB_OUTPUT"
           echo "cache base=$base deb key=$dk"
       - name: Restore sccache
