@@ -1,0 +1,119 @@
+# DIAGNOSTIC ONLY (branch diag/ci-node24): attribute the node24 externals
+# disappearance seen in build jobs since 2026-10-27. No build, no publish,
+# no policy content. workflow_dispatch only; permissions stay read.
+name: DIAG node24 attribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_purge:
+        description: Skip the apt-purge probe (still tests rm probes)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: ENV baseline
+        continue-on-error: true
+        run: |
+          echo "=== whoami/home ==="; id; echo "HOME=$HOME"
+          echo "=== runner env ==="; env | grep -E '^RUNNER_|AGENT_TOOLS|GITHUB_' | sort
+          echo "=== actions-runner tree (top) ==="; ls -la ~/actions-runner 2>&1 | head -20
+          echo "=== cached dir ==="; ls -laR ~/actions-runner/cached 2>&1 | head -40
+          echo "=== find node24 binaries ==="; find ~/actions-runner /opt -maxdepth 6 -name node -type f 2>/dev/null | head -10
+          echo "=== symlinks on the path ==="; namei -l ~/actions-runner/cached/2.338.0/externals/node24/bin/node 2>&1 || true
+          echo "=== /opt ==="; ls -la /opt 2>&1
+          echo "=== mount info ==="; findmnt -o TARGET,SOURCE,FSTYPE | grep -Ei 'runner|opt|cache' || true
+          echo "=== df before ==="; df -h; df -i
+          echo "=== node runtime version dirs ==="; ls ~/actions-runner/bin 2>&1 | head
+      - name: NODE-PROBE (helper installed)
+        continue-on-error: true
+        run: |
+          sudo tee /usr/local/bin/node-probe >/dev/null <<'PROBE'
+          #!/bin/bash
+          # prints marker line: NODEPROBE tag=... exists=... exec=... target=...
+          tag="$1"
+          n=$(find ~/actions-runner/cached -type f -name node -path '*node24*' 2>/dev/null | head -1)
+          if [ -n "$n" ]; then
+            ex=YES; if "$n" -v >/dev/null 2>&1; then execv="OK:$("$n" -v)"; else execv="FAIL"; fi
+            tgt=$(readlink -f "$n" 2>/dev/null)
+          else ex=NO; execv=NA; tgt=NA; fi
+          echo "NODEPROBE tag=$tag exists=$ex exec=$execv target=$tgt"
+          ls -d /opt/runner-cache /opt/hostedtoolcache /opt/actionarchivecache "${AGENT_TOOLSDIRECTORY:-UNSET}" /usr/local 2>&1 | sed 's/^/DIRS /'
+          df -h / | tail -1 | sed 's/^/DF /'
+          PROBE
+          sudo chmod +x /usr/local/bin/node-probe
+          node-probe baseline
+      - name: Checkout termux (for real free-space.sh)
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: termux/termux-packages
+          ref: de1dd3d18e239ef514e5c55ad744e6485e408c65
+          path: tp
+          sparse-checkout: scripts/free-space.sh
+      - name: Node action check BEFORE deletes
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: core.setOutput('ok','yes')
+      - name: P1 safe dirs (ghc/az/pipx/dotnet/swift/...)
+        continue-on-error: true
+        run: |
+          node-probe P1-before
+          sudo rm -rf /opt/ghc /opt/az /opt/pipx /usr/share/dotnet /usr/share/swift /usr/share/miniconda /usr/share/az_* /usr/share/gradle-* /usr/share/java /home/runner/.rustup /etc/skel /home/packer /home/linuxbrew /usr/src
+          node-probe P1-after
+      - name: P2 runner-cache
+        continue-on-error: true
+        run: |
+          node-probe P2-before
+          sudo rm -rf /opt/runner-cache
+          node-probe P2-after
+      - name: P3 hostedtoolcache+actionarchivecache
+        continue-on-error: true
+        run: |
+          node-probe P3-before
+          sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache
+          node-probe P3-after
+      - name: P4 AGENT_TOOLSDIRECTORY
+        continue-on-error: true
+        run: |
+          node-probe P4-before
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/nonexistent}"
+          node-probe P4-after
+      - name: P5 /usr/local
+        continue-on-error: true
+        run: |
+          node-probe P5-before
+          sudo rm -rf /usr/local
+          node-probe P5-after
+      - name: P6 containerd content junk
+        continue-on-error: true
+        run: |
+          node-probe P6-before
+          sudo rm -rf /var/lib/containerd/io.containerd.content.v1.content/ 2>/dev/null || true
+          node-probe P6-after
+      - name: P7 apt purge (mirror of free-space.sh, opt-in)
+        if: ${{ inputs.skip_purge == false }}
+        continue-on-error: true
+        run: |
+          node-probe P7-before
+          # shellcheck disable=SC2046
+          sudo apt purge -yq --allow-remove-essential $(dpkg -l | grep '^ii' | awk '{print $2}' | grep -P '(ant|aspnetcore|cabal-|clang|cpp-|dotnet-|g\+\+-|gcc-12|gcc-13|gcc-14|gcc-15|gfortran-|ghc-|google-cloud-cli|grub-|grub2-|liblldb-|liblua|libmono|llvm|mecab|mesa-|mongodb-|mysql-|netstandard-|postgresql-|python3|ruby-|shim-signed|temurin-)' || true) >/dev/null 2>&1 || true
+          node-probe P7-after
+      - name: Node action check AFTER deletes
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: core.setOutput('ok','yes')
+      - name: Upload diag report
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: node24-diag
+          path: /tmp/diag.log
