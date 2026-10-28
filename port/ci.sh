@@ -80,7 +80,7 @@ download_preflight() {
   test -f "$repo" || { echo "PREFLIGHT FAIL: repo.json missing" >&2; return 1; }
   echo "PREFLIGHT begin $(date -u +%FT%TZ) repo.json=$(sha256sum "$repo" | cut -c1-16)"
   jq -r 'del(.pkg_format) | .[] | .url + " " + .distribution' "$repo" | while IFS=' ' read -r url dist; do
-    host="${url#https://}"; host="${url#http://}"; host="${host%%/*}"; host="${host%%:*}"
+    host="${url#*://}"; host="${host%%/*}"; host="${host%%:*}"
     case " $OFFICIAL_APT_HOSTS " in *" $host "*) ;; *)
       echo "PREFLIGHT FAIL: non-official repo host in repo.json: $host" >&2; exit 1 ;;
     esac
