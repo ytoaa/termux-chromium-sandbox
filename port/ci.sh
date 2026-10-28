@@ -110,10 +110,40 @@ build_chromium() {
     # run #17: pipefail must be set INSIDE the bash -c (the subshell option
     # does not propagate) - otherwise tee's exit 0 masks ninja failures and
     # the build step falsely reports success.
+    # R12 diagnostic: capture cache hit/miss statistics in the SAME
+    # container process/session as the compiler. An external Docker step
+    # could launch a fresh sccache server and incorrectly report zero hits.
+    # The script lives only in the temporary termux-packages workspace.
+    cat > .r12-sccache-profile.sh <<'SCCACHE_PROFILE_SCRIPT'
+#!/usr/bin/env bash
+set -u
+echo "SCCACHE_PROFILE_BEGIN"
+echo "SCCACHE_PROFILE_CACHE_DIR=$SCCACHE_DIR"
+if command -v sccache >/dev/null 2>&1; then
+  sccache --version || true
+  sccache --zero-stats >/dev/null 2>&1 || echo "SCCACHE_PROFILE_WARN zero-stats failed"
+else
+  echo "SCCACHE_PROFILE_WARN sccache executable missing"
+fi
+build_started=$(date +%s)
+./build-package.sh -f -I -a aarch64 chromium-sandboxed
+build_rc=$?
+build_finished=$(date +%s)
+echo "SCCACHE_PROFILE_BUILD_SECONDS=$((build_finished - build_started))"
+echo "SCCACHE_PROFILE_BUILD_RC=$build_rc"
+if command -v sccache >/dev/null 2>&1; then
+  echo "SCCACHE_STATS_JSON_BEGIN"
+  sccache --show-stats --stats-format=json || echo "SCCACHE_STATS_UNAVAILABLE"
+  echo "SCCACHE_STATS_JSON_END"
+fi
+echo "SCCACHE_PROFILE_END"
+exit "$build_rc"
+SCCACHE_PROFILE_SCRIPT
+    chmod 755 .r12-sccache-profile.sh
     setsid bash -c 'set -o pipefail; ./scripts/run-docker.sh env \
       SCCACHE_DIR=/home/builder/.cache/sccache \
       SCCACHE_CACHE_SIZE=6G \
-      ./build-package.sh -f -I -a aarch64 chromium-sandboxed 2>&1 | tee chromium-build.log' &
+      bash ./.r12-sccache-profile.sh 2>&1 | tee chromium-build.log' &
     local bpid=$!
     # Early evidence gate: after 30 min the sccache dir MUST have objects.
     # Zero/near-zero means interception is dead (cc_wrapper/volume wiring) —
