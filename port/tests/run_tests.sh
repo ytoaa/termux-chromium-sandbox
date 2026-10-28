@@ -451,8 +451,8 @@ out=$(python3 "port/tests/r12_set_tid_address_test.py" 2>&1); got=$?
 # preflight fail-fast/whitelist, prune caps, deb-reuse fail-closed gates,
 # runner/node24 protections, R12 policy immutability (22 checks).
 out=$(python3 "port/tests/cache_layers_test.py" 2>&1); got=$?
-[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=22 FAIL=0$' \
-  && pass "[52] cache layers suite (22 checks)" \
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=23 FAIL=0$' \
+  && pass "[52] cache layers suite (23 checks)" \
   || { fail "[52] cache layers suite"; printf '%s\n' "$out" | tail -40; }
 
 exit $rc

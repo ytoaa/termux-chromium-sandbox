@@ -122,12 +122,35 @@ ok("T6a preflight fails fast on dead repo", r.returncode != 0 and "PREFLIGHT FAI
    (r.stdout + r.stderr)[-200:])
 # non-official host -> refusal even if reachable
 SERVE_ROOT["/apt/termux-main/dists/stable/Release"] = b"Origin: evil\n"
+SERVE_ROOT["/apt/termux-root/dists/root/Release"] = b"Origin: evil-root\n"
 (tp / "repo.json").write_text(json.dumps({
     "pkg_format": "debian",
     "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
                  "url": f"http://127.0.0.1:{PORT}/apt/termux-main"}}))
 r = run(["bash", str(CI), "download-preflight", str(tp)], timeout=300)
 ok("T6b non-official mirror host refused", r.returncode != 0 and "non-official" in (r.stdout + r.stderr))
+
+# ---------- T6c: distribution-aware probing (root repo uses dists/root) ----------
+(tp2 := W / "tp-t6c")
+(tp2 / "scripts").mkdir(parents=True, exist_ok=True)
+(tp2 / "build-package.sh").write_text("#!/bin/sh\ntrue\n"); (tp2 / "scripts" / "run-docker.sh").write_text("#!/bin/sh\ntrue\n")
+(tp2 / "build-package.sh").chmod(0o755); (tp2 / "scripts" / "run-docker.sh").chmod(0o755)
+(tp2 / "repo.json").write_text(json.dumps({
+    "pkg_format": "debian",
+    "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
+                 "url": f"http://127.0.0.1:{PORT}/apt/termux-main"},
+    "root-packages": {"name": "termux-root", "distribution": "root", "component": "stable",
+                 "url": f"http://127.0.0.1:{PORT}/apt/termux-root"}}))
+ci2 = W / "ci-whitelisted.sh"
+src = Path(str(CI)).read_text()
+import re as _re
+src2 = _re.sub(r'^OFFICIAL_APT_HOSTS="[^"]*"', 'OFFICIAL_APT_HOSTS="127.0.0.1"', src, count=1, flags=_re.M)
+assert src2 != src
+ci2.write_text(src2); ci2.chmod(0o755)
+r = run(["bash", str(ci2), "download-preflight", str(tp2)], timeout=300)
+ok("T6c per-distribution probe (root passes when up; main+x11 too)",
+   r.returncode == 0 and "dist=root" in r.stdout and "http=200" in r.stdout,
+   (r.stdout + r.stderr)[-250:])
 
 # ---------- T7/T8: deb_key stability & sensitivity ----------
 subprocess.run(["git", "-C", str(tp), "init", "-q"], check=True)

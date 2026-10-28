@@ -65,11 +65,11 @@ dep_cache_prune() {
 # (<5 min) instead of letting build-package curl(28)-loop for hours.
 OFFICIAL_APT_HOSTS="packages.termux.dev packages-cf.termux.dev"
 _probe_repo() {
-  local url="$1" code speed
+  # $1=repo base url, $2=distribution (from repo.json — root repo uses
+  # dists/root, NOT stable; hardcoding distributions false-blocked builds)
+  local url="$1" dist="${2:-stable}" code
   code=$(timeout 25 curl -fsS --connect-timeout 8 --retry 1 --retry-delay 2 \
-    --speed-limit 2000 --speed-time 20 -o /dev/null -w '%{http_code} %{speed_download}' "$1/dists/stable/Release" 2>/dev/null) \
-    || code=$(timeout 25 curl -fsS --connect-timeout 8 --retry 1 --retry-delay 2 \
-    --speed-limit 2000 --speed-time 20 -o /dev/null -w '%{http_code} %{speed_download}' "$1/dists/x11/Release" 2>/dev/null) \
+    --speed-limit 2000 --speed-time 20 -o /dev/null -w '%{http_code} %{speed_download}' "$url/dists/$dist/Release" 2>/dev/null) \
     || code="000 0"
   echo "$code"
 }
@@ -79,39 +79,35 @@ download_preflight() {
   repo="$d/repo.json"
   test -f "$repo" || { echo "PREFLIGHT FAIL: repo.json missing" >&2; return 1; }
   echo "PREFLIGHT begin $(date -u +%FT%TZ) repo.json=$(sha256sum "$repo" | cut -c1-16)"
-  jq -r 'del(.pkg_format) | .[] | .url' "$repo" | while IFS= read -r url; do
-    host="${url#https://}"; host="${host%%/*}"
+  jq -r 'del(.pkg_format) | .[] | .url + " " + .distribution' "$repo" | while IFS=' ' read -r url dist; do
+    host="${url#https://}"; host="${url#http://}"; host="${host%%/*}"; host="${host%%:*}"
     case " $OFFICIAL_APT_HOSTS " in *" $host "*) ;; *)
       echo "PREFLIGHT FAIL: non-official repo host in repo.json: $host" >&2; exit 1 ;;
     esac
-    read -r code speed <<<"$(_probe_repo "$url")"
-    echo "PREFLIGHT probe url=$url http=$code speed=${speed:-0}"
+    read -r code speed <<<"$(_probe_repo "$url" "$dist")"
+    echo "PREFLIGHT probe url=$url dist=$dist http=$code speed=${speed:-0}"
     if [ "$code" != "200" ]; then
-      # try the other official host for the same repo path
       for alt in $OFFICIAL_APT_HOSTS; do
         [ "$alt" = "$host" ] && continue
-        local_url="https://$alt/${url#https://$host/}"
-        read -r code speed <<<"$(_probe_repo "$local_url")"
-        echo "PREFLIGHT probe alt url=$local_url http=$code speed=${speed:-0}"
+        local_url="https://$alt/${url#*://$host/}"
+        read -r code speed <<<"$(_probe_repo "$local_url" "$dist")"
+        echo "PREFLIGHT probe alt url=$local_url dist=$dist http=$code speed=${speed:-0}"
         if [ "$code" = "200" ]; then
           cp -f "$repo" "$d/repo.json.orig-backup"
           jq --arg old "$url" --arg new "$local_url" \
              'walk(if type=="object" and .url==$old then .url=$new else . end)' \
              "$d/repo.json.orig-backup" > "$repo.tmp" && mv "$repo.tmp" "$repo"
-          echo "PREFLIGHT MIRROR-SWITCH $url -> $local_url (verified official hosts only; integrity chain unchanged)"
+          echo "PREFLIGHT MIRROR-SWITCH $url -> $local_url (official whitelist only; integrity chain unchanged)"
           break
         fi
       done
-      if ! grep -q "MIRROR-SWITCH $url" /dev/null 2>/dev/null && [ "$code" != "200" ]; then
-        :
-      fi
     fi
   done || rc=1
   # Final gate: every repo entry must currently answer 200 on its selected host.
-  jq -r 'del(.pkg_format) | .[] | .url' "$repo" | while IFS= read -r url; do
-    read -r code speed <<<"$(_probe_repo "$url")"
+  jq -r 'del(.pkg_format) | .[] | .url + " " + .distribution' "$repo" | while IFS=' ' read -r url dist; do
+    read -r code speed <<<"$(_probe_repo "$url" "$dist")"
     if [ "$code" != "200" ]; then
-      echo "PREFLIGHT FAIL: repo unreachable/slow: $url (http=$code). Refusing to start a multi-hour build; no unverified mirror or stale-dep fallback is permitted." >&2
+      echo "PREFLIGHT FAIL: repo unreachable/slow: $url dist=$dist (http=$code). Refusing to start a multi-hour build; no unverified mirror or stale-dep fallback is permitted." >&2
       exit 1
     fi
   done || rc=1
