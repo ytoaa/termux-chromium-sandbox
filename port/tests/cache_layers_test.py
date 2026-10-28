@@ -129,10 +129,12 @@ r = run(["bash", str(ci2), "download-preflight", str(tp)], timeout=300)
 ok("T6a preflight fails fast on dead repo", r.returncode != 0 and "PREFLIGHT FAIL" in (r.stdout + r.stderr),
    (r.stdout + r.stderr)[-200:])
 # non-official host -> refusal even if reachable
-SERVE_ROOT["/apt/termux-main/dists/stable/Release"] = b"Origin: evil\n"
-SERVE_ROOT["/apt/termux-root/dists/root/Release"] = b"Origin: evil-root\n"
-SERVE_ROOT["/apt/termux-main/dists/stable/binary-aarch64/Packages.xz"] = b"PKGS" * 40
-SERVE_ROOT["/apt/termux-root/dists/root/binary-aarch64/Packages.xz"] = b"PKGSROOT" * 40
+SERVE_ROOT["/apt/termux-main/dists/stable/Release"] = (
+    b"Origin: evil\n\nSHA256:\n " + b"a" * 64 + b"  160  main/binary-aarch64/Packages.xz\n")
+SERVE_ROOT["/apt/termux-root/dists/root/Release"] = (
+    b"Origin: evil-root\n\nSHA256:\n " + b"b" * 64 + b"  160  root/binary-aarch64/Packages.xz\n")
+SERVE_ROOT["/apt/termux-main/dists/stable/main/binary-aarch64/Packages.xz"] = b"PKGS" * 40
+SERVE_ROOT["/apt/termux-root/dists/root/root/binary-aarch64/Packages.xz"] = b"PKGSROOT" * 40
 (tp / "repo.json").write_text(json.dumps({
     "pkg_format": "debian",
     "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
@@ -149,12 +151,14 @@ ok("T6b non-official mirror host refused", r.returncode != 0 and "non-official" 
     "pkg_format": "debian",
     "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
                  "url": f"http://127.0.0.1:{PORT}/apt/termux-main"},
-    "root-packages": {"name": "termux-root", "distribution": "root", "component": "stable",
+    "root-packages": {"name": "termux-root", "distribution": "root", "component": "root",
                  "url": f"http://127.0.0.1:{PORT}/apt/termux-root"}}))
 r = run(["bash", str(ci2), "download-preflight", str(tp2)], timeout=300)
 ok("T6c per-distribution probe (root passes when up; main+x11 too)",
    r.returncode == 0 and "dist=root" in r.stdout and "http=200" in r.stdout
-   and "1MiB ranged transfer" in r.stdout,
+   and "1MiB ranged transfer" in r.stdout
+   and "path=main/binary-aarch64/Packages.xz" in r.stdout
+   and "path=root/binary-aarch64/Packages.xz" in r.stdout,
    (r.stdout + r.stderr)[-250:])
 
 # ---------- T7/T8: deb_key stability & sensitivity ----------

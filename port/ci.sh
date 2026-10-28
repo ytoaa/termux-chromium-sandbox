@@ -107,30 +107,24 @@ dep_cache_prune() {
 # (<5 min) instead of letting build-package curl(28)-loop for hours.
 OFFICIAL_APT_HOSTS="packages.termux.dev packages-cf.termux.dev"
 _official_host_p() { case " $OFFICIAL_APT_HOSTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
-_probe_repo() {
-  # $1=repo base url, $2=distribution (from repo.json — root repo uses
-  # dists/root, NOT stable; hardcoding distributions false-blocked builds),
-  # $3=optional payload path under dists/$dist/ (real-transfer probe).
+_probe_raw() {
+  # $1=url, $2=output file for body ('' = discard), rest=extra curl args.
   # Prints "http_code speed_download rc effective_host". curl -w output is
   # emitted on -f-style failures too, so the HTTP status survives (a bare
   # `|| code=000` used to erase the 404-vs-timeout distinction the post-
   # mortem needed). -L follows redirects (max 5) BUT the effective host is
   # returned and MUST pass the official whitelist — a redirect must never
   # silently move us to an unverified origin.
-  local url="$1" dist="${2:-stable}" payload="${3:-}" out rc
+  local url="$1" out_file="$2"; shift 2
+  local out rc
   local -a args=(-fsSL --max-redirs 5 --connect-timeout 8 --retry 1
                  --retry-delay 2 --speed-limit 2000 --speed-time 20
-                 -o /dev/null -w '%{http_code} %{speed_download} %{url_effective}')
-  if [ -n "$payload" ]; then
-    args+=(--max-time 60 -r 0-1048575)   # bounded 1 MiB REAL transfer
-    url="$url/dists/$dist/$payload"
-  else
-    url="$url/dists/$dist/Release"
-  fi
+                 -w '%{http_code} %{speed_download} %{url_effective}')
+  [ -n "$out_file" ] && args+=(-o "$out_file") || args+=(-o /dev/null)
   # NOTE: `out=$(cmd); rc=$?` would abort the whole step under set -e the
   # moment curl fails (same silent-death trap that bit "Compute cache keys"
   # pre-e800770). Guard the status capture explicitly.
-  out=$(timeout 90 curl "${args[@]}" "$url" 2>/dev/null) && rc=0 || rc=$?
+  out=$(timeout 90 curl "${args[@]}" "$@" "$url" 2>/dev/null) && rc=0 || rc=$?
   [ -n "$out" ] || out="000 0 $url"
   local code speed eff host
   set -- $out
@@ -139,26 +133,52 @@ _probe_repo() {
   echo "$code $speed $rc $host"
 }
 _probe_entry() {
-  # One repo entry is HEALTHY only when BOTH the metadata (Release, 200)
-  # AND an actual 1 MiB ranged transfer of its Packages index succeed on
-  # official hosts. Release-200 alone does not prove the 85 MB-class .deb
-  # pipeline works (that is exactly how run 40662494279 slipped through a
-  # healthy-looking head while downloads crawled at 1.5–40 KB/s).
-  local url="$1" dist="$2" code speed rc eff p="" pec psp prc peff p_path=none
-  read -r code speed rc eff <<<"$(_probe_repo "$url" "$dist")"
+  # One repo entry is HEALTHY only when (a) Release fetches 200 from an
+  # official host, (b) the Release body names a real Packages index and
+  # (c) a bounded 1 MiB ranged GET of THAT index actually transfers.
+  # Release-200 alone does not prove the 85 MB-class .deb pipeline works
+  # (run 40662494279: healthy-looking HEAD while downloads crawled at
+  # 1.5-40 KB/s); the path is PARSED FROM the Release checksum table
+  # (Debian layout is dists/<dist>/<component>/binary-aarch64/Packages...)
+  # instead of guessed, so a layout/component change cannot false-block.
+  local url="$1" dist="$2" component="${3:-main}"
+  local tmpb code speed rc eff ppath="" parsed_ppath="" pec psp prc peff p_path=none
+  tmpb=$(mktemp)
+  read -r code speed rc eff <<<"$(_probe_raw "$url/dists/$dist/Release" "$tmpb")"
   echo "PREFLIGHT probe url=$url dist=$dist Release http=$code rc=$rc speed=${speed:-0} eff_host=${eff:-?}"
-  [ "$rc" = "0" ] && [ "$code" = "200" ] || return 1
-  _official_host_p "${eff:-?}" || { echo "PREFLIGHT FAIL: Release redirected off-whitelist: $url -> ${eff:-?}" >&2; return 1; }
-  for p in binary-aarch64/Packages.xz binary-aarch64/Packages.gz binary-aarch64/Packages; do
-    read -r pec psp prc peff <<<"$(_probe_repo "$url" "$dist" "$p")"
-    [ "${prc:-1}" = "0" ] || continue
-    case "${pec:-000}" in 200|206) ;; *) continue ;; esac
-    _official_host_p "${peff:-?}" || { echo "PREFLIGHT FAIL: Packages redirected off-whitelist: $url/$p -> ${peff:-?}" >&2; return 1; }
-    p_path="$p"; break
-  done
-  echo "PREFLIGHT probe url=$url dist=$dist Packages path=$p_path http=${pec:-000} rc=${prc:-?} speed=${psp:-0} eff_host=${peff:-?} (1MiB ranged transfer)"
+  if ! _official_host_p "${eff:-?}"; then
+    echo "PREFLIGHT FAIL: Release redirected off-whitelist: $url -> ${eff:-?}" >&2
+    rm -f "$tmpb"; return 1
+  fi
+  [ "$rc" = "0" ] && [ "$code" = "200" ] || { rm -f "$tmpb"; return 1; }
+  # checksum-table rows are "  <hash> <size> <path>" -> path is $3
+  ppath=$(awk '{ if ($3 ~ /\/binary-aarch64\/Packages(\.[a-z0-9]+)?$/) { print $3; exit } }' "$tmpb" 2>/dev/null || true)
+  rm -f "$tmpb"
+  parsed_ppath="$ppath"
+  [ -n "$ppath" ] || ppath="$component/binary-aarch64/Packages.xz"
+  read -r pec psp prc peff <<<"$(_probe_raw "$url/dists/$dist/$ppath" "" --max-time 60 -r 0-1048575)"
+  p_path="$ppath"
+  case "$prc:${pec:-000}" in
+    0:200|0:206) ;;
+    *)
+      if [ "$ppath" != "$component/binary-aarch64/Packages.xz" ]; then
+        # parsed path failed — retry the component-guessed path once
+        ppath="$component/binary-aarch64/Packages.xz"
+        read -r pec psp prc peff <<<"$(_probe_raw "$url/dists/$dist/$ppath" "" --max-time 60 -r 0-1048575)"
+        p_path="$ppath"
+        case "$prc:${pec:-000}" in 0:200|0:206) ;; *) p_path=none ;; esac
+      else
+        p_path=none
+      fi
+      ;;
+  esac
+  echo "PREFLIGHT probe url=$url dist=$dist Packages path=$p_path parsed=${parsed_ppath:-none} fallback=$component/binary-aarch64/Packages.xz http=${pec:-000} rc=${prc:-?} speed=${psp:-0} eff_host=${peff:-?} (1MiB ranged transfer)"
   if [ "$p_path" = "none" ]; then
     echo "PREFLIGHT FAIL: Release OK but Packages transfer failed at $url dist=$dist — Release-200 alone is not trusted for multi-hundred-MB dependency pulls; refusing to start the build." >&2
+    return 1
+  fi
+  if ! _official_host_p "${peff:-?}"; then
+    echo "PREFLIGHT FAIL: Packages redirected off-whitelist: $url -> ${peff:-?}" >&2
     return 1
   fi
   return 0
@@ -169,16 +189,16 @@ download_preflight() {
   repo="$d/repo.json"
   test -f "$repo" || { echo "PREFLIGHT FAIL: repo.json missing" >&2; return 1; }
   echo "PREFLIGHT begin $(date -u +%FT%TZ) repo.json=$(sha256sum "$repo" | cut -c1-16)"
-  jq -r 'del(.pkg_format) | .[] | .url + " " + .distribution' "$repo" | while IFS=' ' read -r url dist; do
+  jq -r 'del(.pkg_format) | .[] | .url + " " + .distribution + " " + (.component // "main")' "$repo" | while IFS=' ' read -r url dist component; do
     host="${url#*://}"; host="${host%%/*}"; host="${host%%:*}"
     _official_host_p "$host" || {
       echo "PREFLIGHT FAIL: non-official repo host in repo.json: $host" >&2; exit 1; }
-    if ! _probe_entry "$url" "$dist"; then
+    if ! _probe_entry "$url" "$dist" "$component"; then
       for alt in $OFFICIAL_APT_HOSTS; do
         [ "$alt" = "$host" ] && continue
         local_url="https://$alt/${url#*://$host/}"
         echo "PREFLIGHT switching $url -> $local_url (official whitelist only)"
-        if _probe_entry "$local_url" "$dist"; then
+        if _probe_entry "$local_url" "$dist" "$component"; then
           cp -f "$repo" "$d/repo.json.orig-backup"
           jq --arg old "$url" --arg new "$local_url" \
              'walk(if type=="object" and .url==$old then .url=$new else . end)' \
@@ -191,8 +211,8 @@ download_preflight() {
   done || rc=1
   # Final gate: every repo entry must currently pass Release AND Packages
   # transfer probes on its selected (official) host.
-  jq -r 'del(.pkg_format) | .[] | .url + " " + .distribution' "$repo" | while IFS=' ' read -r url dist; do
-    _probe_entry "$url" "$dist" || {
+  jq -r 'del(.pkg_format) | .[] | .url + " " + .distribution + " " + (.component // "main")' "$repo" | while IFS=' ' read -r url dist component; do
+    _probe_entry "$url" "$dist" "$component" || {
       echo "PREFLIGHT FAIL: repo unreachable/slow: $url dist=$dist. Refusing to start a multi-hour build; no unverified mirror or stale-dep fallback is permitted." >&2
       exit 1
     }
