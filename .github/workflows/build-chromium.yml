@@ -111,8 +111,16 @@ jobs:
       - name: Compute cache keys
         id: keys
         run: |
-          set -euo pipefail
-          base=$(printf '%s\n' "termux=$termux_sha" "rev=${TERMUX_SANDBOXED_REVISION:-}" "port=$(python3 port/maintenance.py port-input-hash --root . | tail -1)" | sha256sum | cut -d' ' -f1)
+          set -uo pipefail
+          echo "PWD=$(pwd) PY=$(command -v python3) VER=$(python3 -V 2>&1)"
+          if ! ph=$(python3 port/maintenance.py port-input-hash --root . 2>&1); then
+            echo "port-input-hash FAILED rc=$? out=$ph" >&2
+            ls -la port/ | head -12 >&2
+            exit 1
+          fi
+          ph=$(printf '%s' "$ph" | tail -1)
+          test -n "$ph"
+          base=$(printf '%s\n' "termux=$termux_sha" "rev=${TERMUX_SANDBOXED_REVISION:-}" "port=$ph" | sha256sum | cut -d' ' -f1)
           echo "base=$base" >> "$GITHUB_OUTPUT"
           dk=$(bash port/ci.sh deb-key "$PWD/termux-packages" | tail -1 | cut -d= -f2)
           test -n "$dk"
