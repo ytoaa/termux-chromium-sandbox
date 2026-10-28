@@ -134,7 +134,7 @@ jobs:
           # a rule; absence is a WARN, not a veto.
           log=$(find termux-packages -name 'port-apply*.log' 2>/dev/null | head -1 || true)
           if [ -n "$log" ]; then
-            for r in R1 R2 R3 R4 R5 R9a; do
+            for r in R1 R2 R3 R4 R5 R9a R12; do
               grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q "$r" || { echo "$r not applied"; exit 1; }
             done
             echo "port-apply log evidence ok ($log)"

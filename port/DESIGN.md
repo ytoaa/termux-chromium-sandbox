@@ -1406,3 +1406,53 @@ s58 (exact-code propagation, no unescaped backticks in executable step
 code), s59 (lookup is read-only), s60 (publisher never PUTs state or
 creates issues). Suite: publish 64 checks (19-row table + classify +
 l1–l11 + e1–e6 + x1–x3), static 76/76, harness green, selftest RC=0.
+
+## Round 19 — R12: renderer Bionic set_tid_address allow (Issue #12 root cause, 2026-10-28)
+
+Root cause (CONFIRMED, Issue #12 comment 6450693236; full evidence
+chromium-evidence/r11-sigsys-investigation/REPORT-R11-SIGSYS-INVESTIGATION.md):
+the renderer baseline chain routes __NR_set_tid_address to CrashSIGSYS
+(baseline_policy.cc IsBaselinePolicyAllowed -> SyscallSets::
+IsAllowedProcessStartOrDeath default:false fall-through, syscall_sets.cc).
+Bionic's detached-pthread exit calls set_tid_address(NULL) immediately
+after rt_sigprocmask(SIG_BLOCK, ~[]) blocks every signal; a seccomp
+RET_TRAP delivered to a thread with SIGSYS blocked is force_sig'd by the
+kernel — Chromium's SIGSYS handler never runs, crashpad never fires, and
+the WHOLE renderer dies with raw wait-status 31 (the historical tab
+deaths shown as RESULT_CODE_INVALID_SANDBOX_STATE). 21/21 instrumented
+strace captures show si_syscall=__NR_set_tid_address si_code=SYS_SECCOMP
+si_errno=EPERM (trap index 1); control traps (openat/sched_getparam) on
+UNBLOCKED threads ran the handler (rt_sigreturn) and survived — proving
+blocked-mask force_sig as the silence mechanism, not a missing handler.
+Upstream Android allows the exact syscall unconditionally in
+BaselinePolicyAndroid (baseline_policy_android.cc:188); this port builds
+os=linux (IS_ANDROID=false) so that list is compiled out — the same
+bionic blind-spot class as R3 (prctl PAC) and R9a (getsockopt SO_DOMAIN).
+
+Fix (R12, experimental candidate): RendererProcessPolicy::EvaluateSyscall
+gains exactly ONE case arm under #if defined(__BIONIC__) —
+`case __NR_set_tid_address: VLOG(1) << marker; return Allow();` — plus the
+guarded base/logging include. Renderer-only (the observed death site;
+zygote covered by R4, GPU BPF never engages on device, network utility has
+its own policy), no parameter relaxation, no disposition (KILL/TRAP)
+change, no other syscall touched. Verifier gates: marker count == 3
+(include+comment+VLOG), approved block verbatim once, set_tid_address arm
+exactly once, guarded include present; contract suite
+port/tests/r12_set_tid_address_test.py (19 checks incl. drift/missing/
+dup-arm/unguard/widened/killswap negatives); harness [47]-[51]; CI package
+gate greps R12 APPLIED; binary strings gate via port.toml binary_markers;
+runtime per-activation gate = VLOG line count == Activated-renderer count
+(--v=1). Non-bionic desktop builds: preprocessor strips the block — byte
+behavior unchanged.
+
+Gate (REGRESSION.md §Experimental R12): candidate DEB built from this
+branch ONLY (workflow_dispatch publish=false, revision 12, termux pin
+de1dd3d1); extract-only execution (NEVER dpkg — installed -4 untouched);
+E-burst >=40 consecutive with ZERO renderer SIGSYS deaths is the core
+regression gate against the -4 baseline (8/8 = 100% burst reproduction);
+instrumented strace must show set_tid_address returning 0 with no SIGSYS;
+census invariants renderer Seccomp=2 filters=2 NNP=1; dangerous-syscall
+block matrix via static per-syscall policy citation + live trap controls
+(openat/sched_getparam traps still fire + rt_sigreturn survival) + P2b
+causality (--disable-seccomp-filter-sandbox 2->1). Promotion, publication,
+validated-state and Publisher untouched — separate approvals required.

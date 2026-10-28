@@ -45,6 +45,7 @@ R10_MARKER = "Termux seccomp-only bionic-sigsys:"
 R11_BEFORE_MARKER = "Termux seccomp-only r11-before-reset:"
 R11_TRAP_MARKER = "Termux seccomp-only r11-trap-owner:"
 R11_REG_MARKER = "Termux seccomp-only r11-trap-create:"
+R12_MARKER = "Termux seccomp-only r12-bionic-tid:"
 
 
 class PortError(RuntimeError):
@@ -115,6 +116,7 @@ class Port:
     TRAP = "sandbox/linux/seccomp-bpf/trap.cc"
     SYSCALL_RESTRICT = "sandbox/linux/seccomp-bpf-helpers/syscall_parameters_restrictions.cc"
     NETWORK_POLICY = "sandbox/policy/linux/bpf_network_policy_linux.cc"
+    RENDERER_POLICY = "sandbox/policy/linux/bpf_renderer_policy_linux.cc"
     STACK_TRACE = "base/debug/stack_trace.cc"
     PA_STACK_TRACE = ("base/allocator/partition_allocator/src/partition_alloc/"
                       "partition_alloc_base/debug/stack_trace.cc")
@@ -397,6 +399,57 @@ const pthread_t g_termux_main_thread = pthread_self();
           .Default(CrashSIGSYSSockopt());"""
 
 
+    # R12 (Issue #12 root cause, 2026-10-28): the renderer baseline chain
+    # (baseline_policy.cc IsBaselinePolicyAllowed -> SyscallSets::
+    # IsAllowedProcessStartOrDeath, syscall_sets.cc) does NOT list
+    # __NR_set_tid_address on any arch: the case falls through to
+    # default:false and the tail of EvaluateSyscallImpl returns
+    # CrashSIGSYS(). Bionic's detached-pthread exit calls
+    # set_tid_address(NULL) immediately after rt_sigprocmask(SIG_BLOCK,
+    # ~[]) blocks EVERY signal; a seccomp RET_TRAP delivered to a thread
+    # with SIGSYS blocked is force_sig'd by the kernel, so Chromium's
+    # handler never runs and the WHOLE renderer dies silently with
+    # wait-status 31 (the historical RESULT_CODE_INVALID_SANDBOX_STATE tab
+    # deaths; crashpad never sees it). 21/21 strace siginfo captures:
+    # si_syscall=__NR_set_tid_address si_code=SYS_SECCOMP si_errno=EPERM
+    # (trap index 1); control traps on unblocked threads ran the handler
+    # (rt_sigreturn) and survived. Upstream Android allows this exact
+    # syscall unconditionally in BaselinePolicyAndroid
+    # (baseline_policy_android.cc); this port builds with os=linux
+    # (IS_ANDROID=false) so that list is compiled out — the same bionic
+    # blind-spot class as R3 (prctl PAC) and R9a (SO_DOMAIN).
+    # Scope lock: renderer policy only (the observed death site; zygote is
+    # covered by R4, GPU never engages BPF on device, network utility has
+    # its own policy), exactly ONE syscall arm, __BIONIC__ guard, no
+    # parameter relaxation (the kernel only writes the tid to a caller
+    # pointer), no KILL/TRAP disposition changes. The VLOG marker gives
+    # both a binary strings gate and a per-activation runtime gate.
+    R12_INCLUDE_OLD = '#include "build/build_config.h"'
+    R12_INCLUDE_NEW = '''#include "build/build_config.h"
+#if defined(__BIONIC__)
+#include "base/logging.h"  // ''' + R12_MARKER + ''' VLOG (R12)
+#endif'''
+    R12_OLD = '''#if defined(__arm__) || defined(__aarch64__)
+    case __NR_getcpu:
+#endif
+      return Allow();'''
+    R12_NEW = '''#if defined(__arm__) || defined(__aarch64__)
+    case __NR_getcpu:
+#endif
+#if defined(__BIONIC__)
+    // ''' + R12_MARKER + ''' bionic detached-pthread exit calls
+    // set_tid_address(NULL) with every signal blocked; RET_TRAP there is
+    // force_sig'd by the kernel and kills the whole renderer without ever
+    // running the SIGSYS handler (silent wait-status 31, Issue #12).
+    // Upstream BaselinePolicyAndroid allows __NR_set_tid_address
+    // unconditionally; os=linux builds compile that list out. Single
+    // syscall arm, bionic guard only — see port/DESIGN.md Round 19.
+    case __NR_set_tid_address:
+      VLOG(1) << "Termux seccomp-only r12-bionic-tid: renderer allow active";
+      return Allow();
+#endif
+      return Allow();'''
+
     # R10: Android's app zygote installs a seccomp policy AND SIGSYS
     # handler. Chromium's Android SeccompStarterAndroid::StartSandbox
     # explicitly resets SIGSYS to SIG_DFL before initializing Trap, but
@@ -506,6 +559,10 @@ const pthread_t g_termux_main_thread = pthread_self();
                           self.R11_REG_OLD, self.R11_REG_NEW)
         self.replace_once(self.SYSCALL_RESTRICT, "R3 bionic prctl options (arm64-Android)",
                           self.R3_OLD, self.R3_NEW)
+        self.replace_once(self.RENDERER_POLICY, "R12 logging include (Bionic)",
+                          self.R12_INCLUDE_OLD, self.R12_INCLUDE_NEW)
+        self.replace_once(self.RENDERER_POLICY, "R12 bionic set_tid_address renderer allow",
+                          self.R12_OLD, self.R12_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R4 zygote passthrough (Bionic)",
                           self.R4_OLD, self.R4_NEW)
         self.replace_once(self.SANDBOX_LINUX, "R5 stack-top decl (Bionic)",
@@ -533,6 +590,7 @@ const pthread_t g_termux_main_thread = pthread_self();
             (self.SANDBOX_LINUX, R2_MARKER, "R2"),
             (self.SYSCALL_RESTRICT, R3_MARKER, "R3"),
             (self.NETWORK_POLICY, R9A_MARKER, "R9a"),
+            (self.RENDERER_POLICY, R12_MARKER, "R12"),
             (self.SANDBOX_LINUX, R10_MARKER, "R10"),
             (self.SANDBOX_LINUX, R11_BEFORE_MARKER, "R11 pre"),
             (self.TRAP, R11_TRAP_MARKER, "R11 trap"),
@@ -588,6 +646,23 @@ const pthread_t g_termux_main_thread = pthread_self();
                 and trap.count("global_trap_ = new Trap();") == 1):
             raise PortError("verifier: R11 Trap owner/create probe drift")
         print("[     VERIFIED] R11 read-only signal owner/order probes; BPF policy unchanged")
+        # R12: fail closed on any scope drift in the renderer policy. The
+        # patch must be the EXACT approved block (bionic-guarded, single
+        # syscall arm), the include must be guarded, the marker must appear
+        # exactly 3 times (include comment, policy comment, VLOG string) and
+        # __NR_set_tid_address must be the only case added anywhere in the
+        # file. Anything else rejects the candidate instead of shipping a
+        # widened filter.
+        rend = self.p(self.RENDERER_POLICY).read_text()
+        if rend.count(R12_MARKER) != 3:
+            raise PortError("verifier: R12 marker count drift (want include+comment+VLOG)")
+        if rend.count(self.R12_NEW) != 1 or rend.count(self.R12_INCLUDE_NEW) != 1:
+            raise PortError("verifier: R12 approved block/include drift")
+        if rend.count("case __NR_set_tid_address:") != 1:
+            raise PortError("verifier: R12 set_tid_address arm not exactly once")
+        if '#include "base/logging.h"' not in rend:
+            raise PortError("verifier: R12 missing guarded logging include")
+        print("[     VERIFIED] R12 renderer-only bionic set_tid_address allow; scope intact")
         # Gate 3: vendored PA patches must be present WHENEVER the subtree is
         # shipped (silently skipping them would ship a build that still calls
         # pthread_getattr_np after the filter - the exact boot-loop we fix).

@@ -400,4 +400,46 @@ else
   printf '%s\n' "$out" | tail -55
 fi
 
+# [47] R12 renderer-only bionic set_tid_address allow (Issue #12 fix).
+fresh
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+RP="$WORK/src/sandbox/policy/linux/bpf_renderer_policy_linux.cc"
+[ $got -eq 0 ] && echo "$out" | grep -q 'APPLIED.*R12' \
+  && [ "$(grep -c 'Termux seccomp-only r12-bionic-tid:' "$RP")" = "3" ] \
+  && grep -q 'case __NR_set_tid_address:' "$RP" \
+  || { fail "[47] R12 apply/marker"; echo "$out"; }
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+echo "$out" | grep -q 'ALREADY_PRESENT.*R12' \
+  && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
+  && pass "[47] R12 applied+verified+idempotent" || fail "[47] R12 (idempotence/verify)"
+
+# [48] R12 anchor drift -> PORT ERROR (fail closed: candidate must not ship unpatched)
+fresh
+sed -i 's/    case __NR_getcpu:/    case __NR_getcpu_DRIFT:/' "$WORK/src/sandbox/policy/linux/bpf_renderer_policy_linux.cc"
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+[ $got -ne 0 ] && echo "$out" | grep -q 'R12' && pass "[48] R12 anchor drift -> PORT ERROR" || { fail "[48] R12 drift"; echo "$out"; }
+
+# [49] R12 missing file -> PORT ERROR (renderer policy is REQUIRED, not optional)
+fresh; rm "$WORK/src/sandbox/policy/linux/bpf_renderer_policy_linux.cc"
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+[ $got -ne 0 ] && echo "$out" | grep -qi 'missing\|R12' && pass "[49] R12 missing file -> PORT ERROR" || { fail "[49] R12 missing"; echo "$out"; }
+
+# [50] R12 scope guard: exactly one added arm, allow-only, no KILL/TRAP/Error in the block
+fresh; python3 $PORT apply --src "$WORK/src" >/dev/null 2>&1
+RP="$WORK/src/sandbox/policy/linux/bpf_renderer_policy_linux.cc"
+n_tid=$(grep -c 'case __NR_set_tid_address:' "$RP")
+n_mark=$(grep -c 'Termux seccomp-only r12-bionic-tid:' "$RP")
+blk=$(sed -n '/#if defined(__BIONIC__)/,/^#endif/p' "$RP" | grep -A9 'r12-bionic-tid: bionic')
+[ "$n_tid" -eq 1 ] && [ "$n_mark" -eq 3 ] \
+  && grep -q 'VLOG(1) << "Termux seccomp-only r12-bionic-tid: renderer allow active";' "$RP" \
+  && ! grep -qE 'KillProcess|KillThread|CrashSIGSYS|Error\(|Trap\(' <<< "$blk" \
+  && pass "[50] R12 scope: 1 arm, VLOG marker, allow-only, no disposition change" \
+  || fail "[50] R12 scope guard"
+
+# [51] R12 standalone contract suite (19 checks incl. tamper negatives).
+out=$(python3 "port/tests/r12_set_tid_address_test.py" 2>&1); got=$?
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^R12-TESTS PASS=19 FAIL=0$' \
+  && pass "[51] R12 contract suite (19 checks)" \
+  || { fail "[51] R12 contract suite"; printf '%s\n' "$out" | tail -40; }
+
 exit $rc

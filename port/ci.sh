@@ -58,8 +58,37 @@ DOCKERFILE
   export TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume ${cache}:/home/builder/.cache/sccache"
   run_docker "$d" true
   run_docker "$d" bash -lc 'set -euxo pipefail; export SCCACHE_DIR=/home/builder/.cache/sccache SCCACHE_CACHE_SIZE=6G; command -v sccache; python3 --version; echo test > "$SCCACHE_DIR/.write-test"; rm "$SCCACHE_DIR/.write-test"'
-  [ -f "$d/scripts/free-space.sh" ] && sed -i '/ruby3\.2-doc/d' "$d/scripts/free-space.sh" || true
-  df -h; (cd "$d" && ./scripts/free-space.sh) || true; df -h
+  # --- free-space replacement (runner-safe subset) ---------------------
+  # Upstream scripts/free-space.sh (pin de1dd3d1) contains
+  #   sudo rm -rf /opt/ghc /opt/az /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache
+  # Since 2026-10-27 this runner fleet symlinks
+  #   ~/actions-runner/cached/<runnerVer>/externals -> /opt/runner-cache/externals
+  # so that rm SEVERS THE ACTION RUNTIME (node24) and every later node-based
+  # step dies with "externals/node24/bin/node: No such file or directory"
+  # (Save sccache / Upload artifacts / Post checkout; reproduced 6/6 long
+  # builds since run 40569099539; attribution proof: diag run 40656237966 —
+  # DIRS GONE /opt/runner-cache immediately after that single rm; disk was
+  # NOT pressured, ruling out the GC hypothesis). Run only the
+  # runner-independent cleanup subset here; keep df evidence inline.
+  ( cd "$d" && sudo rm -rf /opt/ghc /opt/az /opt/pipx \
+      /usr/share/dotnet /usr/share/swift /usr/share/miniconda /usr/share/az_* \
+      /usr/share/gradle-* /usr/share/java /home/runner/.rustup /etc/skel \
+      /home/packer /home/linuxbrew /usr/src \
+      /var/lib/containerd/io.containerd.content.v1.content ) || true
+  df -h
+  # Early presence gate for the runner action runtime (diagnostic only —
+  # never fabricates success; if the fleet layout regresses again this step
+  # fails FAST with the cause in its log instead of 90 minutes later).
+  n24=""
+  for cand in "$HOME"/actions-runner/cached/*/externals/node24/bin/node; do
+    [ -x "$cand" ] && "$cand" -v >/dev/null 2>&1 && n24="$cand" && break
+  done
+  if [ -z "$n24" ]; then
+    echo "NODE24 PRESENT-CHECK FAILED: runner action runtime missing/dangling (externals symlink target gone?)" >&2
+    ls -la "$HOME"/actions-runner/cached/*/externals 2>&1 >&2 || true
+    exit 1
+  fi
+  echo "NODE24 PRESENT: $n24 ($("$n24" -v))"
 }
 
 build_chromium() {
@@ -81,10 +110,40 @@ build_chromium() {
     # run #17: pipefail must be set INSIDE the bash -c (the subshell option
     # does not propagate) - otherwise tee's exit 0 masks ninja failures and
     # the build step falsely reports success.
+    # R12 diagnostic: capture cache hit/miss statistics in the SAME
+    # container process/session as the compiler. An external Docker step
+    # could launch a fresh sccache server and incorrectly report zero hits.
+    # The script lives only in the temporary termux-packages workspace.
+    cat > .r12-sccache-profile.sh <<'SCCACHE_PROFILE_SCRIPT'
+#!/usr/bin/env bash
+set -u
+echo "SCCACHE_PROFILE_BEGIN"
+echo "SCCACHE_PROFILE_CACHE_DIR=$SCCACHE_DIR"
+if command -v sccache >/dev/null 2>&1; then
+  sccache --version || true
+  sccache --zero-stats >/dev/null 2>&1 || echo "SCCACHE_PROFILE_WARN zero-stats failed"
+else
+  echo "SCCACHE_PROFILE_WARN sccache executable missing"
+fi
+build_started=$(date +%s)
+./build-package.sh -f -I -a aarch64 chromium-sandboxed
+build_rc=$?
+build_finished=$(date +%s)
+echo "SCCACHE_PROFILE_BUILD_SECONDS=$((build_finished - build_started))"
+echo "SCCACHE_PROFILE_BUILD_RC=$build_rc"
+if command -v sccache >/dev/null 2>&1; then
+  echo "SCCACHE_STATS_JSON_BEGIN"
+  sccache --show-stats --stats-format=json || echo "SCCACHE_STATS_UNAVAILABLE"
+  echo "SCCACHE_STATS_JSON_END"
+fi
+echo "SCCACHE_PROFILE_END"
+exit "$build_rc"
+SCCACHE_PROFILE_SCRIPT
+    chmod 755 .r12-sccache-profile.sh
     setsid bash -c 'set -o pipefail; ./scripts/run-docker.sh env \
       SCCACHE_DIR=/home/builder/.cache/sccache \
       SCCACHE_CACHE_SIZE=6G \
-      ./build-package.sh -f -I -a aarch64 chromium-sandboxed 2>&1 | tee chromium-build.log' &
+      bash ./.r12-sccache-profile.sh 2>&1 | tee chromium-build.log' &
     local bpid=$!
     # Early evidence gate: after 30 min the sccache dir MUST have objects.
     # Zero/near-zero means interception is dead (cc_wrapper/volume wiring) —
