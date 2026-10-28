@@ -75,10 +75,8 @@ def termux_download(url, dest, checksum, tmpdir):
                env=env, timeout=180)
 
 
-W = Path("/data/data/com.termux/files/home/Project/chromium-evidence/r12/cache-layers-work")
-if W.exists():
-    shutil.rmtree(W)
-W.mkdir(parents=True)
+import tempfile
+W = Path(tempfile.mkdtemp(prefix="cache-layers-"))
 
 # ---------- T1..T5: official termux_download cache contract on our volume ----------
 vol = W / "dep-cache" / "aarch64"
