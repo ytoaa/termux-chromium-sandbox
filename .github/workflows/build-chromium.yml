@@ -22,6 +22,10 @@ on:
         description: Publish a successful direct build as GitHub Pre-release (Round 17; opt-out=false)
         type: boolean
         default: true
+      allow_deb_reuse:
+        description: Reuse a fully-verified completed DEB when all build inputs hash-identical (cache layer 3)
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       termux_ref:
@@ -104,19 +108,64 @@ jobs:
           git -C termux-packages rev-parse HEAD > termux-pin.txt
       - name: Prepare chromium-sandboxed recipe (identity + injected hook)
         run: bash port/ci.sh recipe-prepare "$PWD/termux-packages"
+      - name: Compute cache keys
+        id: keys
+        run: |
+          set -euo pipefail
+          base=$(printf '%s\n' "termux=$termux_sha" "rev=${TERMUX_SANDBOXED_REVISION:-}" "port=$(python3 port/maintenance.py port-input-hash --root . | tail -1)" | sha256sum | cut -d' ' -f1)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          dk=$(bash port/ci.sh deb-key "$PWD/termux-packages" | tail -1 | cut -d= -f2)
+          test -n "$dk"
+          echo "debkey=$dk" >> "$GITHUB_OUTPUT"
+          echo "cache base=$base deb key=$dk"
       - name: Restore sccache
         uses: actions/cache/restore@v4
         with:
           path: termux-packages/.sccache
-          key: chromium-sccache-aarch64-${{ env.termux_sha }}
-          restore-keys: chromium-sccache-aarch64-
+          key: chromium-sccache-aarch64-${{ steps.keys.outputs.base }}-${{ github.run_id }}
+          restore-keys: |
+            chromium-sccache-aarch64-${{ steps.keys.outputs.base }}-
+            chromium-sccache-aarch64-
+      # Layer 1: termux_download-depped .deb/Packages cache (integrity is
+      # re-enforced per-file by termux against GPG-verified repo metadata on
+      # every run, so stale/corrupted entries self-heal via re-download).
+      - name: Restore termux dep cache
+        uses: actions/cache/restore@v4
+        with:
+          path: termux-packages/.termux-depcache
+          key: termux-depcache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
+          restore-keys: termux-depcache-aarch64-${{ env.termux_sha }}-
+      # Layer 6: fail fast (<10 min) if official apt repos are unreachable or
+      # crawling; switches only between whitelisted official mirrors.
+      - name: Download preflight (official mirrors)
+        run: timeout 900 bash port/ci.sh download-preflight "$PWD/termux-packages"
       - name: Prepare Termux zram workspace bridge
         run: bash port/ci.sh prepare-zram-workspace "$PWD/termux-packages"
       - name: Enable zram
         uses: ./.github/actions/zram
       - name: Prepare Termux builder (docker + sccache image)
         run: bash port/ci.sh prepare-builder "$PWD/termux-packages"
+      - name: Restore cached completed deb
+        if: inputs.allow_deb_reuse
+        uses: actions/cache/restore@v4
+        with:
+          path: termux-packages/.deb-cache
+          key: chromium-deb-v1-${{ steps.keys.outputs.debkey }}
+      - name: Verify cached completed deb (fail-closed reuse gate)
+        if: inputs.allow_deb_reuse
+        id: debcheck
+        continue-on-error: true
+        env:
+          DEB_KEY: ${{ steps.keys.outputs.debkey }}
+        run: |
+          set -euo pipefail
+          if bash port/ci.sh deb-reuse-verify "$PWD/termux-packages"; then
+            echo "reused=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "reused=0" >> "$GITHUB_OUTPUT"
+          fi
       - name: Build chromium-sandboxed (port hook runs at post_get_source)
+        if: steps.debcheck.outputs.reused != '1'
         run: bash port/ci.sh build "$PWD/termux-packages"
       - name: Package gates (separate identity, port applied)
         run: |
@@ -175,15 +224,35 @@ jobs:
           fi
           echo "termux_sha=$(cat termux-pin.txt 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
           echo "port_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Prune termux dep cache
+        if: always()
+        run: bash port/ci.sh dep-cache-prune "$PWD/termux-packages"
+      - name: Save termux dep cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: termux-packages/.termux-depcache
+          key: termux-depcache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
       - name: Save sccache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: termux-packages/.sccache
-          key: chromium-sccache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
+          key: chromium-sccache-aarch64-${{ steps.keys.outputs.base }}-${{ github.run_id }}
       # The completed workflow_run payload does NOT reliably expose the
       # workflow_dispatch inputs. Bind the caller's publish consent to
       # the build artifact itself; never infer consent from a missing field.
+      - name: Save completed deb to reuse cache
+        if: success() && inputs.allow_deb_reuse && steps.debcheck.outputs.reused != '1'
+        env:
+          DEB_KEY: ${{ steps.keys.outputs.debkey }}
+        run: bash port/ci.sh deb-reuse-save "$PWD/termux-packages"
+      - name: Cache completed deb
+        if: success() && inputs.allow_deb_reuse && steps.debcheck.outputs.reused != '1'
+        uses: actions/cache/save@v4
+        with:
+          path: termux-packages/.deb-cache
+          key: chromium-deb-v1-${{ steps.keys.outputs.debkey }}
       - name: Record manual publish intent (fail closed)
         if: always()
         env:

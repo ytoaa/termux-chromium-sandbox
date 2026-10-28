@@ -1456,3 +1456,43 @@ block matrix via static per-syscall policy citation + live trap controls
 (openat/sched_getparam traps still fire + rt_sigreturn survival) + P2b
 causality (--disable-seccomp-filter-sandbox 2->1). Promotion, publication,
 validated-state and Publisher untouched — separate approvals required.
+
+## Round 20 — CI cache layers (perf/ci-cache-layers, evidence-driven)
+Motivated by the 40662494279 forensics (issue #12 audit trail): pre-ninja
+dependency downloads collapsed (19 × curl(28) to packages-cf.termux.dev) and
+the job later hung 2.5h before timing out mid-compile — compilation itself
+was never the bottleneck while warm caches existed. Three tiers now cooperate:
+
+1. **Dependency tier** — `.termux-depcache/aarch64` ↔ container
+   `_cache-aarch64` (bind volume + actions/cache). Integrity is delegated
+   VERBATIM to the official pipeline: Release(+.gpg) is always re-fetched and
+   `gpg --verify`-ed per run (`termux_get_repo_files.sh`); Packages/.deb names
+   are content-addressed with hashes from that verified metadata and
+   re-checked by `termux_download` (sha256-skip cache). Corrupted or
+   version/arch-mismatched entries self-heal by re-download (tests T1–T5).
+   Prune: 30d age + 2 GiB cap (env override), path-fenced.
+2. **sccache tier** — unchanged storage, hardened keys: restore key
+   `chromium-sccache-aarch64-<base>-<run>` with dual prefix fallback
+   (`<base>-` then legacy), `base = sha256(termux_sha|REVISION|port-input-hash)`;
+   in-container 10-min `SCCACHE_TICK_JSON` (stats JSON + file count) makes
+   hits/misses observable DURING the build; the 30-min watchdog now demands
+   real progress (ninja start or nonzero compile counters) instead of raw
+   file counts; `timeout 14400` converts a hang into a natural failure so
+   diagnostics/artifact steps still run before the 350-min job kill.
+3. **Completed-DEB tier** (input `allow_deb_reuse`, default true) —
+   actions/cache under `chromium-deb-v1-<debkey>`, where
+   `debkey = sha256(pkg|rev|arch|upstream-version|termux_sha|port-input-hash|recipe-dir|repo.json|builder-image)`.
+   Restore alone never skips work: the fail-closed verifier requires
+   manifest-matched deb sha256 + key equality + dpkg metadata + chrome-binary
+   sha256 + `r12-bionic-tid` marker; package security gates ALWAYS re-run
+   against whatever lands in `output/`. Any policy/patch/recipe/repo change
+   flips the key → full build. `reuse-decision.json` records the outcome.
+4. **Download resilience** — `download-preflight` probes every repo.json
+   entry (bounded curl, speed-timeout) and fails the job in <10 min rather
+   than hours of curl(28) loops; switches only between whitelisted official
+   hosts (packages.termux.dev / packages-cf.termux.dev); non-official hosts
+   abort; effective repo.json hash is in the deb key (provenance-visible).
+Protections re-tested, never weakened: seccomp policy files byte-identical
+(T15), no `contents:write`, no fallback mirror, no gate bypass, a cache-save
+failure can never flip build success, and code-level `rm -rf` of runner
+cache paths is forbidden (T14) preserving the node24 fix.
