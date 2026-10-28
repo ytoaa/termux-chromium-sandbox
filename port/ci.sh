@@ -14,6 +14,186 @@ need_termux_dir() {
 
 run_docker() { local d="$1"; shift; ( cd "$d" && ./scripts/run-docker.sh "$@" ); }
 
+# --- cache-layer helpers ---------------------------------------------------
+# Bind-mount BOTH caches into the builder container:
+#   .sccache            -> /home/builder/.cache/sccache           (Layer 2)
+#   .termux-depcache/aarch64 -> /home/builder/.termux-build/_cache-aarch64
+#                          (Layer 1: termux_download content-addressed
+#                           .deb + Packages cache; integrity is enforced by
+#                           the OFFICIAL pipeline — Release(.gpg) is always
+#                           re-downloaded and GPG-verified per
+#                           termux_get_repo_files.sh, Packages/.deb hashes
+#                           come from that verified metadata and are
+#                           sha256-checked by termux_download on every use,
+#                           so a corrupted/version-mismatched cache entry is
+#                           transparently re-downloaded.)
+docker_volume_args() {
+  local d="$1"
+  mkdir -p "$d/.sccache" "$d/.termux-depcache/aarch64"
+  echo "--volume $d/.sccache:/home/builder/.cache/sccache --volume $d/.termux-depcache/aarch64:/home/builder/.termux-build/_cache-aarch64"
+}
+
+dep_cache_prune() {
+  # Keep .termux-depcache bounded (age then size). Never touches anything
+  # outside <termux-packages>/.termux-depcache.
+  local d root cap_bytes total f
+  d="$(need_termux_dir "${1:?}")"
+  root="$(cd "$d" && mkdir -p .termux-depcache && realpath .termux-depcache)"
+  case "$root" in
+    */.termux-depcache) ;;
+    *) echo "PRUNE REFUSAL: unexpected path: $root" >&2; return 2 ;;
+  esac
+  cap_bytes=$(( ${TERMUX_DEPCACHE_CAP_MB:-2048} * 1024 * 1024 ))
+  find "$root" -type f -mtime +30 -delete 2>/dev/null || true
+  total=$(du -sb "$root" 2>/dev/null | cut -f1); total=${total:-0}
+  if [ "$total" -gt "$cap_bytes" ]; then
+    echo "DEPCACHE over cap ($total B > $cap_bytes B); pruning oldest first"
+    find "$root" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2- | \
+    while IFS= read -r f; do
+      total=$(du -sb "$root" | cut -f1)
+      [ "$total" -le "$cap_bytes" ] && break
+      rm -f -- "$f"
+    done
+  fi
+  echo "DEPCACHE size: $(du -sh "$root" 2>/dev/null | cut -f1)"
+}
+
+# Layer 6: bounded pre-build connectivity probe against OFFICIAL termux
+# mirrors only. Never trusts an unlisted mirror; switching only happens
+# between whitelisted official hosts and the effective repo.json is hashed
+# into the deb key, so any switch is visible in build inputs. Fails FAST
+# (<5 min) instead of letting build-package curl(28)-loop for hours.
+OFFICIAL_APT_HOSTS="packages.termux.dev packages-cf.termux.dev"
+_probe_repo() {
+  local url="$1" code speed
+  code=$(timeout 25 curl -fsS --connect-timeout 8 --retry 1 --retry-delay 2 \
+    --speed-limit 2000 --speed-time 20 -o /dev/null -w '%{http_code} %{speed_download}' "$1/dists/stable/Release" 2>/dev/null) \
+    || code=$(timeout 25 curl -fsS --connect-timeout 8 --retry 1 --retry-delay 2 \
+    --speed-limit 2000 --speed-time 20 -o /dev/null -w '%{http_code} %{speed_download}' "$1/dists/x11/Release" 2>/dev/null) \
+    || code="000 0"
+  echo "$code"
+}
+download_preflight() {
+  local d repo host urls entry url base healthy rc=0
+  d="$(need_termux_dir "${1:?}")"
+  repo="$d/repo.json"
+  test -f "$repo" || { echo "PREFLIGHT FAIL: repo.json missing" >&2; return 1; }
+  echo "PREFLIGHT begin $(date -u +%FT%TZ) repo.json=$(sha256sum "$repo" | cut -c1-16)"
+  jq -r 'del(.pkg_format) | .[] | .url' "$repo" | while IFS= read -r url; do
+    host="${url#https://}"; host="${host%%/*}"
+    case " $OFFICIAL_APT_HOSTS " in *" $host "*) ;; *)
+      echo "PREFLIGHT FAIL: non-official repo host in repo.json: $host" >&2; exit 1 ;;
+    esac
+    read -r code speed <<<"$(_probe_repo "$url")"
+    echo "PREFLIGHT probe url=$url http=$code speed=${speed:-0}"
+    if [ "$code" != "200" ]; then
+      # try the other official host for the same repo path
+      for alt in $OFFICIAL_APT_HOSTS; do
+        [ "$alt" = "$host" ] && continue
+        local_url="https://$alt/${url#https://$host/}"
+        read -r code speed <<<"$(_probe_repo "$local_url")"
+        echo "PREFLIGHT probe alt url=$local_url http=$code speed=${speed:-0}"
+        if [ "$code" = "200" ]; then
+          cp -f "$repo" "$d/repo.json.orig-backup"
+          jq --arg old "$url" --arg new "$local_url" \
+             'walk(if type=="object" and .url==$old then .url=$new else . end)' \
+             "$d/repo.json.orig-backup" > "$repo.tmp" && mv "$repo.tmp" "$repo"
+          echo "PREFLIGHT MIRROR-SWITCH $url -> $local_url (verified official hosts only; integrity chain unchanged)"
+          break
+        fi
+      done
+      if ! grep -q "MIRROR-SWITCH $url" /dev/null 2>/dev/null && [ "$code" != "200" ]; then
+        :
+      fi
+    fi
+  done || rc=1
+  # Final gate: every repo entry must currently answer 200 on its selected host.
+  jq -r 'del(.pkg_format) | .[] | .url' "$repo" | while IFS= read -r url; do
+    read -r code speed <<<"$(_probe_repo "$url")"
+    if [ "$code" != "200" ]; then
+      echo "PREFLIGHT FAIL: repo unreachable/slow: $url (http=$code). Refusing to start a multi-hour build; no unverified mirror or stale-dep fallback is permitted." >&2
+      exit 1
+    fi
+  done || rc=1
+  echo "PREFLIGHT done rc=$rc $(date -u +%FT%TZ) effective_repo_sha=$(sha256sum "$repo" | cut -c1-16)"
+  return $rc
+}
+
+# Layer 3: composite, immutable key over ALL build-affecting inputs.
+deb_key() {
+  local d termux_sha port_hash recipe_sha upstream ver arch rev repo_sha k
+  d="$(need_termux_dir "${1:?}")"
+  termux_sha=$(git -C "$d" rev-parse HEAD 2>/dev/null || true)
+  [ -n "$termux_sha" ] || { echo "DEB KEY FAIL: termux dir is not a git checkout" >&2; return 1; }
+  port_hash=$(cd "$here/.." && python3 port/maintenance.py port-input-hash --root . 2>/dev/null | tail -1)
+  [ -n "$port_hash" ] || { echo "DEB KEY FAIL: port-input-hash empty" >&2; return 1; }
+  recipe_sha=$(find "$d/packages/chromium-sandboxed" -type f \( -name '*.sh' -o -name '*.sub' -o -name 'RECIPE*' \) -print0 2>/dev/null | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)
+  upstream=$(grep -oE 'TERMUX_PKG_VERSION="[0-9.]+"' "$d/packages/chromium-sandboxed/.."/*chromium*/build.sh 2>/dev/null | head -1 | cut -d'"' -f2)
+  [ -n "$upstream" ] || upstream=$(grep -m1 -oE '156\.[0-9.]+' "$d/packages/chromium-sandboxed/../../port/port.toml" 2>/dev/null || true)
+  repo_sha=$(sha256sum "$d/repo.json" 2>/dev/null | cut -d' ' -f1)
+  rev="${TERMUX_SANDBOXED_REVISION:-?}"
+  arch="aarch64"
+  ver="chromium-sandboxed"
+  k=$(printf '%s\n' "pkg=$ver" "rev=$rev" "arch=$arch" "upstream=${upstream:-unknown}" "termux=$termux_sha" "port=$port_hash" "recipe=$recipe_sha" "repojson=$repo_sha" "image=$TERMUX_BUILDER_IMAGE_NAME" | sha256sum | cut -d' ' -f1)
+  echo "DEB_KEY=$k"
+}
+
+deb_reuse_verify() {
+  # FAIL-CLOSED reuse gate: only an artifact whose manifest hashes match the
+  # CACHED deb exactly (and whose DEB_KEY equals the current key) may skip
+  # compilation. Any mismatch -> REUSED=0, normal build proceeds. The
+  # package security gates ALWAYS run afterwards regardless of reuse.
+  local d cache deb manifest want have wantc havec version
+  d="$(need_termux_dir "${1:?}")"
+  cache="$d/.deb-cache"
+  mkdir -p "$cache"
+  fail_reuse() { printf '{"reused":false,"reason":"%s","deb_key":"%s","at":"%s"}\n' "$1" "${DEB_KEY:-?}" "$(date -u +%FT%TZ)" > "$cache/reuse-decision.json"; echo "REUSED=0 REASON=$1"; return 1; }
+  deb=$(ls "$cache"/*.deb 2>/dev/null | head -1 || true)
+  manifest="$cache/deb-manifest.json"
+  if [ -z "$deb" ] || [ ! -f "$manifest" ]; then
+    fail_reuse "no-cached-deb"
+  fi
+  want=$(jq -r '.deb_sha256' "$manifest"); wantc=$(jq -r '.chrome_sha256' "$manifest")
+  have=$(sha256sum "$deb" | cut -d' ' -f1)
+  if [ "$want" != "$have" ]; then rm -f "$cache"/*.deb "$manifest"; fail_reuse "deb-sha-mismatch"; fi
+  if [ "$(jq -r '.deb_key' "$manifest")" != "${DEB_KEY:-}" ]; then fail_reuse "key-mismatch"; fi
+  version=$(dpkg-deb -W --showformat='${Package} ${Version} ${Architecture}\n' "$deb" 2>/dev/null || true)
+  case "$version" in chromium-sandboxed\ *) ;; *) fail_reuse "dpkg-meta";; esac
+  if [ "$(jq -r '.version_arch' "$manifest")" != "$version" ]; then fail_reuse "version-arch-mismatch"; fi
+  wantc_have=$(dpkg-deb --fsys-tarfile "$deb" 2>/dev/null | tar -xO ./data/data/com.termux/files/usr/lib/chromium-sandboxed/chrome 2>/dev/null | sha256sum | cut -d' ' -f1)
+  if [ "$wantc_have" != "$wantc" ]; then fail_reuse "chrome-sha-mismatch"; fi
+  dpkg-deb --fsys-tarfile "$deb" 2>/dev/null | tar -xO ./data/data/com.termux/files/usr/lib/chromium-sandboxed/chrome 2>/dev/null \
+    | grep -ac "Termux seccomp-only r12-bionic-tid" >/dev/null 2>&1 || { fail_reuse "r12-marker-missing"; }
+  mkdir -p "$d/output"
+  cp -f "$deb" "$d/output/$(basename "$deb")"
+  printf '{"reused":true,"deb":"%s","deb_key":"%s","at":"%s"}\n' "$(basename "$deb")" "${DEB_KEY:-?}" "$(date -u +%FT%TZ)" > "$cache/reuse-decision.json"
+  echo "REUSED=1 DEB=$(basename "$deb") KEY=${DEB_KEY:-?}"
+  return 0
+}
+
+deb_reuse_save() {
+  local d deb manifest
+  d="$(need_termux_dir "${1:?}")"
+  deb=$(ls "$d"/output/chromium-sandboxed_*_aarch64.deb 2>/dev/null | head -1 || true)
+  [ -n "$deb" ] || { echo "DEB SAVE SKIP: no built deb"; return 0; }
+  mkdir -p "$d/.deb-cache"
+  manifest="$d/.deb-cache/deb-manifest.json"
+  local chromesha
+  chromesha=$(dpkg-deb --fsys-tarfile "$deb" 2>/dev/null | tar -xO ./data/data/com.termux/files/usr/lib/chromium-sandboxed/chrome 2>/dev/null | sha256sum | cut -d' ' -f1)
+  jq -n \
+    --arg deb_sha256 "$(sha256sum "$deb" | cut -d' ' -f1)" \
+    --arg chrome_sha256 "$chromesha" \
+    --arg version_arch "$(dpkg-deb -W --showformat='${Package} ${Version} ${Architecture}\n' "$deb")" \
+    --arg deb_key "${DEB_KEY:?deb-reuse-save requires DEB_KEY env}" \
+    --arg termux_sha "$(git -C "$d" rev-parse HEAD)" \
+    --arg run_id "${GITHUB_RUN_ID:-local}" \
+    --arg generated_at "$(date -u +%FT%TZ)" \
+    '{deb_sha256:$deb_sha256,chrome_sha256:$chrome_sha256,version_arch:$version_arch,deb_key:$deb_key,termux_sha:$termux_sha,run_id:$run_id,generated_at:$generated_at}' \
+    > "$manifest"
+  cp -f "$deb" "$d/.deb-cache/$(basename "$deb")"
+  echo "DEB SAVE ok $(basename "$deb") key=$DEB_KEY"
+}
+
 prepare_zram_workspace() {
   local d workspace action key
   d="$(realpath "${1:?}")"
@@ -55,7 +235,7 @@ WORKDIR /home/builder/termux-packages
 DOCKERFILE
   docker build -f /tmp/Dockerfile.chromium-sccache -t "$TERMUX_BUILDER_IMAGE_NAME" "$d"
   docker rm -f termux-package-builder 2>/dev/null || true
-  export TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume ${cache}:/home/builder/.cache/sccache"
+  export TERMUX_DOCKER_RUN_EXTRA_ARGS="$(docker_volume_args "$d")"
   run_docker "$d" true
   run_docker "$d" bash -lc 'set -euxo pipefail; export SCCACHE_DIR=/home/builder/.cache/sccache SCCACHE_CACHE_SIZE=6G; command -v sccache; python3 --version; echo test > "$SCCACHE_DIR/.write-test"; rm "$SCCACHE_DIR/.write-test"'
   # --- free-space replacement (runner-safe subset) ---------------------
@@ -98,7 +278,7 @@ build_chromium() {
   # died with its own step (run #10 post-mortem: build container had no sccache
   # volume). Re-export HERE, in the same shell that starts run-docker.
   mkdir -p "$d/.sccache"
-  export TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume $d/.sccache:/home/builder/.cache/sccache"
+  export TERMUX_DOCKER_RUN_EXTRA_ARGS="$(docker_volume_args "$d")"
   (
     cd "$d"
     set -o pipefail
@@ -126,8 +306,20 @@ else
   echo "SCCACHE_PROFILE_WARN sccache executable missing"
 fi
 build_started=$(date +%s)
-./build-package.sh -f -I -a aarch64 chromium-sandboxed
+( while :; do
+    sleep 600
+    el=$(( $(date +%s) - build_started ))
+    stats=$(sccache --show-stats --stats-format=json 2>/dev/null | tr -d '\n ' | head -c 1200)
+    files=$(find "$SCCACHE_DIR" -type f 2>/dev/null | wc -l)
+    echo "SCCACHE_TICK_JSON elapsed=${el}s sccache_files=${files} stats=${stats:-unavailable}"
+  done ) & tickpid=$!
+timeout 14400 ./build-package.sh -f -I -a aarch64 chromium-sandboxed
 build_rc=$?
+kill "$tickpid" 2>/dev/null || true
+wait "$tickpid" 2>/dev/null || true
+if [ "$build_rc" = 124 ]; then
+  echo "BUILD_TIMEOUT_GUARD: build-package.sh exceeded 240 minutes; failing naturally (not silently) so diagnostics/artifact steps still run"
+fi
 build_finished=$(date +%s)
 echo "SCCACHE_PROFILE_BUILD_SECONDS=$((build_finished - build_started))"
 echo "SCCACHE_PROFILE_BUILD_RC=$build_rc"
@@ -151,11 +343,18 @@ SCCACHE_PROFILE_SCRIPT
     (
       sleep 1800
       n=$(find "$d/.sccache" -type f 2>/dev/null | wc -l)
-      if [ "$n" -lt 50 ]; then
-        echo "SCCACHE DEAD: $n cache files after 30min (expect thousands) — cc_wrapper wiring or volume mount broken. Aborting early."
+      # Distinguish REAL compile activity from restored stale files:
+      # ninja start marker or nonzero sccache counters in a tick line.
+      ninja_started=$(grep -acE '\[1/[0-9]{4,}\]' "$d/chromium-build.log" 2>/dev/null || true)
+      tick=$(grep -a 'SCCACHE_TICK_JSON' "$d/chromium-build.log" 2>/dev/null | tail -1 || true)
+      active=0
+      [ "${ninja_started:-0}" -gt 0 ] && active=1
+      case "$tick" in *'"compile_requests":0'*) ;; '') ;; *) [ -n "$tick" ] && ! printf '%s' "$tick" | grep -q '"compile_requests":0[^0-9]' && active=1 ;; esac
+      if [ "$n" -lt 50 ] && [ "$active" = 0 ]; then
+        echo "SCCACHE DEAD: $n cache files, no ninja start, no compile activity in ticks after 30min — cc_wrapper wiring/volume or download phase broken. Aborting early."
         kill -TERM -"$bpid" 2>/dev/null || true; sleep 5; kill -KILL -"$bpid" 2>/dev/null || true
       else
-        echo "SCCACHE ALIVE: $n cache files at 30min — interception working."
+        echo "SCCACHE ALIVE at 30min: files=$n ninja_started=${ninja_started:-0} last_tick=${tick:-none}"
       fi
     ) &
     local wpid=$!
@@ -194,12 +393,17 @@ case "$cmd" in
   prepare-zram-workspace) prepare_zram_workspace "${2:?usage: ci.sh prepare-zram-workspace <termux-packages>}" ;;
   prepare-builder)        prepare_builder "${2:?usage: ci.sh prepare-builder <termux-packages>}" ;;
   build)                  build_chromium "${2:?usage: ci.sh build <termux-packages>}" ;;
+  dep-cache-prune)     dep_cache_prune "${2:?usage: ci.sh dep-cache-prune <termux-packages>}" ;;
+  download-preflight)  download_preflight "${2:?usage: ci.sh download-preflight <termux-packages>}" ;;
+  deb-key)             deb_key "${2:?usage: ci.sh deb-key <termux-packages>}" ;;
+  deb-reuse-verify)    deb_reuse_verify "${2:?usage: ci.sh deb-reuse-verify <termux-packages>}" ;;
+  deb-reuse-save)      deb_reuse_save "${2:?usage: ci.sh deb-reuse-save <termux-packages>}" ;;
   resolve-ref)
     : "${GITHUB_TOKEN:=${GH_TOKEN:?need GITHUB_TOKEN or GH_TOKEN}}"
     gh api --method GET "repos/termux/termux-packages/commits/${2:-master}" --jq .sha
     ;;
   *)
-    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | prepare-zram-workspace <tp> | prepare-builder <tp> | build <tp> | resolve-ref [ref]" >&2
+    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | prepare-zram-workspace <tp> | prepare-builder <tp> | build <tp> | dep-cache-prune <tp> | download-preflight <tp> | deb-key <tp> | deb-reuse-verify <tp> | deb-reuse-save <tp> | resolve-ref [ref]" >&2
     exit 2
     ;;
 esac
