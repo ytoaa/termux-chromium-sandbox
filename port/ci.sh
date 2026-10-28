@@ -362,7 +362,7 @@ DOCKERFILE
   echo "SMOKE host uid=$(id -u) gid=$(id -g) user=$(id -un)"
   stat -c 'SMOKE hostdir %a %U:%G %n' "$d/.sccache" "$d/.termux-depcache/aarch64" || true
   run_docker "$d" true
-  docker inspect -f 'SMOKE mount {{.Source}} -> {{.Destination}}' termux-package-builder || true
+  docker inspect -f '{{range .Mounts}}SMOKE mount {{.Source}} -> {{.Destination}}\n{{end}}' termux-package-builder || true
   docker_perms_smoke "$d"
   # Check 6 of the contract: everything must still hold after the container
   # is destroyed and recreated from the same image + same volume args.
