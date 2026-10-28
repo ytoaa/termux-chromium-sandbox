@@ -161,9 +161,10 @@ r12_fallback_upload() {
   git -C "$tmp" commit -qm "r12 candidate artifacts run-$rid" || true
   rc=1
   for attempt in 1 2; do
-    if git -C "$tmp" push -q origin "HEAD:refs/heads/$br" 2>/dev/null; then
+    if git -C "$tmp" push origin "HEAD:refs/heads/$br" >"$tmp/pushlog" 2>&1; then
       rc=0; break
     fi
+    tail -c 400 "$tmp/pushlog" 2>/dev/null | tr '\n' '|' | sed 's/^/R12-FALLBACK push-err: /'
     sleep 20
     rm -rf "$tmp"; tmp=$(mktemp -d)
     git clone -q --depth 1 -b "$br" "$url" "$tmp" 2>/dev/null || { rm -rf "$tmp"; tmp=""; break; }

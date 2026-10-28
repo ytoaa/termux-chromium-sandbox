@@ -82,6 +82,14 @@ jobs:
     needs: gate
     runs-on: ubuntu-26.04
     timeout-minutes: 350
+    # R12 BRANCH-ONLY EXPERIMENT: the bash artifact mirror (below) pushes
+    # split volumes to the orphan branch r12-artifacts because this runner
+    # pool loses actions-runner cached node24 mid-build, killing
+    # actions/upload-artifact (runs 40569099539/40596560130/40607546581).
+    # contents:write is required ONLY for that git push. Remove with the
+    # branch; never promote this permissions change.
+    permissions:
+      contents: write
     env:
       TERMUX_SANDBOXED_REVISION: ${{ inputs.pkg_revision }}
     outputs:
