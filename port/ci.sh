@@ -58,8 +58,37 @@ DOCKERFILE
   export TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume ${cache}:/home/builder/.cache/sccache"
   run_docker "$d" true
   run_docker "$d" bash -lc 'set -euxo pipefail; export SCCACHE_DIR=/home/builder/.cache/sccache SCCACHE_CACHE_SIZE=6G; command -v sccache; python3 --version; echo test > "$SCCACHE_DIR/.write-test"; rm "$SCCACHE_DIR/.write-test"'
-  [ -f "$d/scripts/free-space.sh" ] && sed -i '/ruby3\.2-doc/d' "$d/scripts/free-space.sh" || true
-  df -h; (cd "$d" && ./scripts/free-space.sh) || true; df -h
+  # --- free-space replacement (runner-safe subset) ---------------------
+  # Upstream scripts/free-space.sh (pin de1dd3d1) contains
+  #   sudo rm -rf /opt/ghc /opt/az /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache
+  # Since 2026-10-27 this runner fleet symlinks
+  #   ~/actions-runner/cached/<runnerVer>/externals -> /opt/runner-cache/externals
+  # so that rm SEVERS THE ACTION RUNTIME (node24) and every later node-based
+  # step dies with "externals/node24/bin/node: No such file or directory"
+  # (Save sccache / Upload artifacts / Post checkout; reproduced 6/6 long
+  # builds since run 40569099539; attribution proof: diag run 40656237966 —
+  # DIRS GONE /opt/runner-cache immediately after that single rm; disk was
+  # NOT pressured, ruling out the GC hypothesis). Run only the
+  # runner-independent cleanup subset here; keep df evidence inline.
+  ( cd "$d" && sudo rm -rf /opt/ghc /opt/az /opt/pipx \
+      /usr/share/dotnet /usr/share/swift /usr/share/miniconda /usr/share/az_* \
+      /usr/share/gradle-* /usr/share/java /home/runner/.rustup /etc/skel \
+      /home/packer /home/linuxbrew /usr/src \
+      /var/lib/containerd/io.containerd.content.v1.content ) || true
+  df -h
+  # Early presence gate for the runner action runtime (diagnostic only —
+  # never fabricates success; if the fleet layout regresses again this step
+  # fails FAST with the cause in its log instead of 90 minutes later).
+  n24=""
+  for cand in "$HOME"/actions-runner/cached/*/externals/node24/bin/node; do
+    [ -x "$cand" ] && "$cand" -v >/dev/null 2>&1 && n24="$cand" && break
+  done
+  if [ -z "$n24" ]; then
+    echo "NODE24 PRESENT-CHECK FAILED: runner action runtime missing/dangling (externals symlink target gone?)" >&2
+    ls -la "$HOME"/actions-runner/cached/*/externals 2>&1 >&2 || true
+    exit 1
+  fi
+  echo "NODE24 PRESENT: $n24 ($("$n24" -v))"
 }
 
 build_chromium() {
