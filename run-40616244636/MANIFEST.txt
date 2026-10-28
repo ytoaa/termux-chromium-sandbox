@@ -1,0 +1,7 @@
+run_id=40616244636
+run_attempt=1
+head_sha=85125e36fbf19d9f34840b895abb149c1ed37c16
+event=workflow_dispatch
+deb_name=chromium-sandboxed_156.0.8078.47-12_aarch64.deb
+deb_bytes=159571332
+deb_sha256=07ee85eb97dbda6ca97582dea614cb60284a4c99bbc69ab84a1fe65a5602fd40  /home/runner/work/termux-chromium-sandbox/termux-chromium-sandbox/termux-packages/output/chromium-sandboxed_156.0.8078.47-12_aarch64.deb
