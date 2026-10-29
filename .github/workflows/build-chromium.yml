@@ -270,6 +270,8 @@ jobs:
           if [ "$new" -gt 0 ]; then echo "has_new=1" >> "$GITHUB_OUTPUT"; else echo "has_new=0" >> "$GITHUB_OUTPUT"; fi
       - name: Package gates (separate identity, port applied)
         if: inputs.docker_smoke_only != true
+        env:
+          DEB_REUSED: ${{ steps.debcheck.outputs.reused }}
         run: |
           set -euo pipefail
           deb=$(find termux-packages/output -name 'chromium-sandboxed_*_aarch64.deb' | head -1)
@@ -278,19 +280,29 @@ jobs:
           ver=$(dpkg-deb -f "$deb" Version)
           [ "$pkg" = "chromium-sandboxed" ] || { echo "wrong package name: $pkg"; exit 1; }
           echo "artifact: $pkg $ver"
-          # Fail-closed rule enforcement lives IN the hook (post_get_source
-          # exits 1 unless >=5 rules applied; runs inside the build container).
-          # Here the log mirror is best-effort evidence (container->host mirror
-          # proved flaky, runs #18-#20): hard-fail only if it EXISTS but lacks
-          # a rule; absence is a WARN, not a veto.
+          # Fail-closed rule enforcement lives IN the hook (DESIGN Round 25:
+          # transformer rc + per-rule records + scan marker, independent of
+          # the builder's shell options). Here the host mirror is the primary
+          # evidence; when it is absent on a FRESH build the build log itself
+          # (tee'd from the container step) is the fallback — an empty
+          # evidence chain on a fresh build now REFUSES (audit round);
+          # REUSED=1 skips evidence discovery entirely: the deb came from a
+          # run that passed these gates, and the manifest/sha/marker chain
+          # below re-verifies the bytes.
+          # NOTE: rule ids are matched as "] <id> " — plain substring "R1"
+          # also matched R10/R11/R12 lines (audit fix).
           log=$(find termux-packages -name 'port-apply*.log' 2>/dev/null | head -1 || true)
-          if [ -n "$log" ]; then
-            for r in R1 R2 R3 R4 R5 R9a R12; do
-              grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -q "$r" || { echo "$r not applied"; exit 1; }
+          if [ -z "$log" ] && [ "${DEB_REUSED:-0}" != "1" ]; then log=termux-packages/chromium-build.log; fi
+          if [ "${DEB_REUSED:-0}" = "1" ] && [ -z "$(find termux-packages -name 'port-apply*.log' 2>/dev/null | head -1)" ]; then
+            echo "port-apply evidence skipped on REUSED=1 (validated on originating run)"
+          elif [ -n "$log" ] && [ -s "$log" ]; then
+            for r in R1 R2 R3 R4 R5 R7 R9a R10 R11 R12; do
+              grep -E 'APPLIED|ALREADY_PRESENT' "$log" | grep -qE "\] ${r} " || { echo "$r not applied"; exit 1; }
             done
+            grep -q "anti-injection scan" "$log" || { echo "anti-injection scan completion not evidenced"; exit 1; }
             echo "port-apply log evidence ok ($log)"
           else
-            echo "WARN: port-apply mirror absent; relying on hook-side counter (fail-closed at source)"
+            echo "port-apply evidence chain empty on a fresh build — refusing"; exit 1
           fi
           # bionic shield packaging gates (run #25 lesson: 'cat > symlink'
           # clobbered the launcher, which then exec'd itself).
@@ -313,6 +325,19 @@ jobs:
           fi
           grep -q 'chromium-launcher.sh' "$tmpd/data/data/com.termux/files/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh" \
             || { echo "wrapper does not exec the real launcher"; rm -rf "$tmpd"; exit 1; }
+          # Audit round (DESIGN Round 25): the bin entry must be REPOINTED at
+          # the shield wrapper (ln -sfr from post_make_install); a build where
+          # the repoint silently vanished ships an unsheilded launcher entry.
+          case "$listing" in
+            *"bin/chromium-sandboxed -> "*chromium-shield-wrapper.sh*) : ;;
+            *) echo "bin/chromium-sandboxed not repointed to chromium-shield-wrapper.sh"; rm -rf "$tmpd"; exit 1 ;;
+          esac
+          # No maintainer scripts are owned by this port (design invariant):
+          # an unexpected pre/post inst/prm is packaging drift, refuse.
+          mkdir -p "$tmpd/DEBIAN"; dpkg-deb -e "$deb" "$tmpd/DEBIAN"
+          for s in preinst postinst prerm postrm; do
+            if [ -e "$tmpd/DEBIAN/$s" ]; then echo "unexpected maintainer script: $s"; rm -rf "$tmpd"; exit 1; fi
+          done
           rm -rf "$tmpd"
           echo "PORT GATES PASS: $pkg $ver"
       - name: Emit outputs (maintenance pipeline)
