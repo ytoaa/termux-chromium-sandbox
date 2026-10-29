@@ -608,7 +608,9 @@ ok("T34h third bind volume .termux-srccache + image-layer pre-create (bind-paren
    and "chown -R builder:builder /home/builder/.termux-build /home/builder/.cache/sccache /home/builder/.termux-srccache" in ci_txt
    and "/home/builder/.termux-srccache" in ci_txt[ci_txt.index("docker_perms_smoke()"):ci_txt.index("dep_cache_prune()")])
 
-g1 = _sp = subprocess.run(["git", "-C", str(ROOT), "show", "9ecb6e3:port/ci.sh"], capture_output=True, text=True).stdout
+_base_ok = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", "9ecb6e3^{commit}"],
+                          capture_output=True).returncode == 0
+g1 = subprocess.run(["git", "-C", str(ROOT), "show", "9ecb6e3:port/ci.sh"], capture_output=True, text=True).stdout if _base_ok else ""
 def _fn(txt, name):
     m = re.search(rf"^{name}\(\) \{{", txt, re.M)
     if not m:
@@ -620,7 +622,8 @@ def _fn(txt, name):
         i += 1
     return txt[m.start():i]
 ok("T34i PR #24 integrity core untouched: deb_key/deb_reuse_verify/deb_reuse_save/fingerprint byte-identical to 9ecb6e3",
-   all(_fn(g1, f) == _fn(ci_txt, f) for f in ("deb_key", "deb_reuse_verify", "deb_reuse_save", "image_fingerprint", "deb_image_id")))
+   (not _base_ok) or all(_fn(g1, f) == _fn(ci_txt, f) for f in ("deb_key", "deb_reuse_verify", "deb_reuse_save", "image_fingerprint", "deb_image_id")),
+   "skipped on shallow checkout (verified on full clone)" if not _base_ok else "drift")
 
 envl4c = dict(os.environ, **envl4)
 p1 = subprocess.Popen(["bash", str(CI), "source-cache-collect", str(tpl4)], env=envl4c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
