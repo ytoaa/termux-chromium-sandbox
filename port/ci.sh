@@ -129,9 +129,13 @@ dep_cache_prune() {
 #   SAVE gate: a file enters L4 only if its sha256 is ∈ the trust set T =
 #     (a) every 64-hex checksum declared in termux-packages */build.sh
 #         (TERMUX_PKG_SHA256 etc.), union
-#     (b) SHA256SUM values from the <repo>-json index maps that
-#         termux_get_repo_files.sh downloads and GPG-verifies (via
-#         Release) EVERY run. Files fetched WITHOUT a checksum
+#     (b) per-run GPG-anchored repo index hashes: SHA256SUM values of the
+#         <repo>-json maps (pacman format) and the SHA256 stanzas of the
+#         <repo>*-Packages files (debian format — the one repo.json here
+#         uses; run 40862002110 evidence: all-arch debs are anchored in
+#         Packages, NOT *-json), both re-downloaded and re-verified by
+#         termux_get_repo_files.sh
+#         EVERY run. Files fetched WITHOUT a checksum
 #         (SKIP_CHECKSUM / empty TERMUX_PKG_SHA256, see
 #         get_source/termux_download_src_archive.sh:10-14) can never be in
 #         T, so unverified content is NEVER persisted. Entries are stored
@@ -231,11 +235,22 @@ allset=$(mktemp) || { rm -f "$tset" "$jset"; exit 0; }
 # termux_download ... <sha>, arrays — any 64-hex token in any */build.sh.
 find "$TP" -mindepth 3 -maxdepth 3 -name build.sh -type f -print0 2>/dev/null \
   | xargs -0 grep -hoE '[0-9a-f]{64}' 2>/dev/null | sort -u > "$tset" || true
-# (b) SHA256SUM values from GPG-verified repo index maps (downloaded and
-# gpg --verified EVERY run by termux_get_repo_files.sh).
+# (b) GPG-anchored repo index hashes. Two pkg formats exist upstream:
+#   - pacman format: <repo>-json map with SHA256SUM fields
+#     (termux_get_repo_files.sh:25 writes them per run);
+#   - DEBIAN format (what repo.json declares here): the deb hashes are the
+#     SHA256 stanzas of the ${dl_prefix}-Packages files under the dep cache,
+#     which termux_get_repo_files.sh downloads with the PACKAGES_HASH taken
+#     from the gpg --verified Release file (lines 18-55). Both anchors are
+#     re-downloaded AND cryptographically re-verified EVERY run, so these
+#     sets reflect the live repo state, not a cached assertion.
 for j in "$TOP"/_cache-all/*-json "$TOP"/_cache-aarch64/*-json; do
   [ -f "$j" ] || continue
   jq -r '.[].SHA256SUM // empty' "$j" 2>/dev/null | grep -E '^[0-9a-f]{64}$' >> "$jset" || true
+done
+for pf in "$TOP"/_cache-all/*Packages "$TOP"/_cache-aarch64/*Packages; do
+  [ -f "$pf" ] || continue
+  awk '/^SHA256: /{print tolower($2)}' "$pf" 2>/dev/null | grep -E '^[0-9a-f]{64}$' >> "$jset" || true
 done
 sort -u "$tset" "$jset" > "$allset" 2>/dev/null || true
 new=0 bytes=0 kept=0 unverified=0
@@ -257,6 +272,7 @@ l4_accept() { # $1=src file, $2=namespace dir, $3=relpath inside namespace
     rm -f -- "$tmp"; echo "L4 COLLECT WARN: copy corrupted, dropped $rel"; return 0
   fi
   mv -f -- "$tmp" "$ent" 2>/dev/null || { rm -f -- "$tmp"; return 0; }
+  echo "L4 ACCEPT ${ent#"$L4"/} ($sz B)"
   new=$((new+1)); bytes=$((bytes+sz))
 }
 if [ -d "$TOP" ]; then

@@ -455,8 +455,8 @@ out=$(python3 "port/tests/r12_set_tid_address_test.py" 2>&1); got=$?
 # immutability, docker bind-parent fix + smoke + save-guard + L4
 # verified source cache (72 checks).
 out=$(python3 "port/tests/cache_layers_test.py" 2>&1); got=$?
-[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=72 FAIL=0$' \
-  && pass "[52] cache layers suite (72 checks)" \
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=73 FAIL=0$' \
+  && pass "[52] cache layers suite (73 checks)" \
   || { fail "[52] cache layers suite"; printf '%s\n' "$out" | tail -40; }
 
 exit $rc
