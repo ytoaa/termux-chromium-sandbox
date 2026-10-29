@@ -1591,3 +1591,18 @@ MIRROR-SWITCH reflected in the final key (function-executed, not
 string-grep), T24 step ordering, T25 single-key identity + drift guard,
 T26 compile-skip vs always-gates, T27 smoke-only/opt-in invariants.
 Suite total: 43 cache-layer checks.
+
+Round 22 addendum (run 40823773715): the first production attempt of the
+post-prepare key step died fail-closed with
+`blob sha256:58a7… expected at /var/lib/containerd/io.containerd.content.
+v1.content/blobs/…: blob not found` — our free-space replacement (node24
+era) deletes containerd's CONTENT store at the end of prepare_builder.
+Upstream free-space.sh ran before any docker use; relocated into
+prepare-builder it silently broke image-config inspection (the build kept
+working only because run-docker reuses the already-created detached
+container whose snapshot is extracted). Correct ordering is therefore
+enforced in code: `docker build` -> record `image inspect .Id` into
+`$d/.builder-image-id` + verify live container `.Image == imgid` (both
+while blobs exist) -> cleanup -> later steps consume the FILE and the
+CONTAINER metadata only; the workflow never inspects the image after
+prepare (regression-pinned by T28).
