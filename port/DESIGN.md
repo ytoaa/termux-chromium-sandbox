@@ -1606,3 +1606,44 @@ enforced in code: `docker build` -> record `image inspect .Id` into
 while blobs exist) -> cleanup -> later steps consume the FILE and the
 CONTAINER metadata only; the workflow never inspects the image after
 prepare (regression-pinned by T28).
+
+## Round 23 — deterministic builder-image fingerprint for the DEB key
+
+Task-C hypothesis CONFIRMED empirically: the raw `docker image inspect
+.Id` is NOT stable across rebuilds of identical inputs — run
+40825927463 recorded `7ccda63d…` and run 40834221022 (same commit,
+same base `:latest` digest `e2de051a…`, same Dockerfile) recorded
+`0b9d985a…`. The image config embeds a per-build `created` timestamp,
+so keying the DEB cache on the raw id rotated the key every run and
+made Layer-3 reuse unhittable (40834221022 hit `REUSED=0 no-cached-deb`
+and had to recompile).
+
+Fix: the DEB key now hashes `image_fingerprint = sha256(base image id +
+sorted `dpkg -W '${Package} ${Version}'` + Dockerfile content hash)` —
+three reproducible components. Security property preserved: any real
+environment change (base `:latest` drift, apt security update, Dockerfile
+edit) changes a component and rotates the key, so a stale DEB is NEVER
+reused under a different environment; an unchanged environment rebuilds
+to the same fingerprint and CAN reuse. We do not pin package versions
+(no security-update suppression); we do not map a changed image back to
+an old key. The raw docker image id is still recorded
+(`.builder-image-raw`) and the build step still asserts the live
+container's `.Image` equals it (same-image contract within a run); the
+fingerprint is recorded in `.builder-image-id`. Both are written by
+prepare_builder BEFORE the free-space step.
+
+Task-D: `prepare_builder`'s free-space subset no longer runs
+`rm -rf /var/lib/containerd/io.containerd.content.v1.content`. That
+directly gutted the docker daemon content store (broke post-prepare
+image inspection — run 40823773715; version-fragile; would starve other
+jobs on a shared runner) while disk pressure was absent (root fs
+94G avail / 36% used after the remaining cleanup). Replaced by
+daemon-managed `docker image prune -f` (reclaims the previous run's
+dangling rebuild of our tag). All node24 protections (forbidden
+runner-runtime paths) unchanged.
+
+Tests: T30a-e image_fingerprint determinism + base/pkg/dockerfile
+sensitivity + fail-closed; T31 deb_key reproducibility on the
+fingerprint; T32 no direct containerd/docker storage deletion +
+`docker image prune -f` present. T24/T28 updated for the two-file
+record. Suite 51 checks; full port suite 60/60.

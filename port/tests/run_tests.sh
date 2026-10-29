@@ -452,10 +452,10 @@ out=$(python3 "port/tests/r12_set_tid_address_test.py" 2>&1); got=$?
 # [52] cache-layer suites (perf/ci-cache-layers): dep-cache contract,
 # preflight fail-fast/whitelist/redirect+real-transfer probe, prune caps,
 # deb-reuse fail-closed gates + image-id binding (T19-T27), runner/node24 protections, R12 policy
-# immutability, docker bind-parent fix + smoke + save-guard (44 checks).
+# immutability, docker bind-parent fix + smoke + save-guard (51 checks).
 out=$(python3 "port/tests/cache_layers_test.py" 2>&1); got=$?
-[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=44 FAIL=0$' \
-  && pass "[52] cache layers suite (44 checks)" \
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=51 FAIL=0$' \
+  && pass "[52] cache layers suite (51 checks)" \
   || { fail "[52] cache layers suite"; printf '%s\n' "$out" | tail -40; }
 
 exit $rc
