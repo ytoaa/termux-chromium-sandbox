@@ -453,5 +453,218 @@ ok("T27 smoke-only skips key+reuse chain; reuse default OFF; key step opt-in-onl
    and re.search(r"allow_deb_reuse:[\s\S]{0,400}?default: false", wf) is not None
    and "inputs.docker_smoke_only != true" in build_block)
 
+# ---------- T33..T40: Layer-4 persistent VERIFIED source cache --------------
+def l4_cmd(sub, tp_, env_extra):
+    env = dict(os.environ, **env_extra)
+    return run(["bash", str(CI), sub, str(tp_)], env=env, timeout=180)
+
+tpl4 = W / "tp-l4"
+(tpl4 / "scripts").mkdir(parents=True, exist_ok=True)
+(tpl4 / "build-package.sh").write_text("#!/bin/sh\ntrue\n")
+# exec-shim: run the in-container scripts locally (env overrides redirect
+# the container paths; production defaults are /home/builder/...).
+(tpl4 / "scripts" / "run-docker.sh").write_text('#!/bin/sh\nexec "$@"\n')
+for f in (tpl4 / "build-package.sh", tpl4 / "scripts" / "run-docker.sh"):
+    f.chmod(0o755)
+L4ROOT = tpl4 / ".termux-srccache"
+TOP4 = W / "l4-top"
+TP4 = W / "l4-tree"
+(TP4 / "packages" / "ffmpeg").mkdir(parents=True)
+(TP4 / "packages" / "junkpkg").mkdir(parents=True)
+envl4 = {"TERMUX_L4_ROOT": str(L4ROOT), "TERMUX_L4_TOPDIR": str(TOP4), "TERMUX_L4_TP": str(TP4)}
+
+r = l4_cmd("source-cache-restore", tpl4, envl4)
+ok("T33a cold restore: empty/absent L4 -> no-op, rc=0 (never fails build)",
+   r.returncode == 0 and ("L4 RESTORE cold" in r.stdout or "restored=0" in r.stdout), r.stdout[-150:])
+
+ff_src = b"FFMPEG-SRC-DATA" * 400
+ff_sha = sha(ff_src)
+(TOP4 / "ffmpeg" / "cache").mkdir(parents=True)
+(TOP4 / "ffmpeg" / "cache" / "ffmpeg-9.0.2.tar.xz").write_bytes(ff_src)
+(TP4 / "packages" / "ffmpeg" / "build.sh").write_text(
+    f'TERMUX_PKG_SRCURL="https://www.ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz"\nTERMUX_PKG_SHA256={ff_sha}\n')
+(TOP4 / "ffmpeg" / "cache" / "unverified.tar.gz").write_bytes(b"NO-CHECKSUM-FILE")   # SKIP_CHECKSUM case
+(TOP4 / "junkpkg" / "cache").mkdir(parents=True)
+(TOP4 / "junkpkg" / "cache" / "evil.tar.xz").write_bytes(b"EVIL" * 100)              # sha not declared anywhere
+deb_payload_l4 = b"ALLDEB" * 900
+deb_sha_l4 = sha(deb_payload_l4)
+deb_rel = "pool/main/b/bash-completion/bash-completion_2.18.0_all.deb"
+(TOP4 / "_cache-all" / "pool" / "main" / "b" / "bash-completion").mkdir(parents=True)
+(TOP4 / "_cache-all" / deb_rel).write_bytes(deb_payload_l4)
+(TOP4 / "_cache-all" / "termux-main-json").write_text(json.dumps(
+    {"bash-completion": {"FILENAME": deb_rel, "SHA256SUM": deb_sha_l4, "VERSION": "2.18.0-1"}}))
+(TOP4 / "_cache-all" / "Packages-index").write_bytes(b"STALE-INDEX")                  # index must never be collected
+
+r = l4_cmd("source-cache-collect", tpl4, envl4)
+ents = sorted(p.relative_to(L4ROOT).as_posix() for p in L4ROOT.rglob("*") if p.is_file() and not p.name.startswith(".has-new"))
+ok("T33b collect accepts ONLY declared-checksum files (tarball+indexed deb; SKIP_CHECKSUM, undeclared, index rejected)",
+   r.returncode == 0 and "unverified=2" in r.stdout
+   and any(e.startswith("pkgs/ffmpeg/") and e.endswith("__ffmpeg-9.0.2.tar.xz") for e in ents)
+   and any(e.startswith("deb-all/") and e.endswith(deb_rel.replace("/", "%2F")) for e in ents)
+   and not any("unverified.tar.gz" in e or "evil.tar.xz" in e or "Packages-index" in e for e in ents),
+   (r.stdout[-150:], ents))
+
+TOP5 = W / "l4-top-warm"
+r = l4_cmd("source-cache-restore", tpl4, dict(envl4, TERMUX_L4_TOPDIR=str(TOP5)))
+tgt = TOP5 / "ffmpeg" / "cache" / "ffmpeg-9.0.2.tar.xz"
+debtgt = TOP5 / "_cache-all" / deb_rel
+ok("T33c warm restore byte-identical incl nested pool path",
+   r.returncode == 0 and "restored=2" in r.stdout
+   and tgt.exists() and tgt.read_bytes() == ff_src
+   and debtgt.exists() and debtgt.read_bytes() == deb_payload_l4, r.stdout[-150:])
+r = termux_download("http://127.0.0.1:9/releases/ffmpeg-9.0.2.tar.xz", str(tgt), ff_sha, W)
+ok("T33d warm = ZERO network: upstream termux_download keeps restored file without contacting dead host",
+   r.returncode == 0 and tgt.read_bytes() == ff_src, r.stderr[-200:])
+
+corrupt_ent = L4ROOT / "pkgs" / "ffmpeg" / (ff_sha[:12] + "__ffmpeg-9.0.2.tar.xz")
+corrupt_ent.write_bytes(b"CORRUPTED-CACHE-ENTRY")
+TOP6 = W / "l4-top-corrupt"
+r = l4_cmd("source-cache-restore", tpl4, dict(envl4, TERMUX_L4_TOPDIR=str(TOP6)))
+ok("T33e corrupted entry quarantined on restore (deleted, never placed)",
+   "quarantined=1" in r.stdout and not corrupt_ent.exists()
+   and not (TOP6 / "ffmpeg" / "cache" / "ffmpeg-9.0.2.tar.xz").exists(), r.stdout[-150:])
+# re-collect the good file to restore the entry for later tests
+r = l4_cmd("source-cache-collect", tpl4, envl4)
+
+# same basename / different content (version flip on identical URL path):
+(TOP4 / "ffmpeg" / "cache" / "ffmpeg-9.0.2.tar.xz").write_bytes(b"FFMPEG-10-CONTENT")
+ff10_sha = sha(b"FFMPEG-10-CONTENT")
+(TP4 / "packages" / "ffmpeg" / "build.sh").open("a").write(f"# bumped variant:\n# {ff10_sha}\n")
+r = l4_cmd("source-cache-collect", tpl4, envl4)
+ffents = sorted(p.name for p in (L4ROOT / "pkgs" / "ffmpeg").iterdir() if p.is_file())
+ok("T33f same basename / different sha coexist (no overwrite; version change keeps both)",
+   len([e for e in ffents if e.endswith("__ffmpeg-9.0.2.tar.xz")]) == 2
+   and any(e.startswith(ff_sha[:12]) for e in ffents) and any(e.startswith(ff10_sha[:12]) for e in ffents), ffents)
+TOP7 = W / "l4-top-collide"
+r = l4_cmd("source-cache-restore", tpl4, dict(envl4, TERMUX_L4_TOPDIR=str(TOP7)))
+placed = (TOP7 / "ffmpeg" / "cache" / "ffmpeg-9.0.2.tar.xz").read_bytes()
+ok("T33g collide restore places one verified variant; upstream sha-gate (T3/T33d) covers the wrong pick",
+   sha(placed) in (ff_sha, ff10_sha), placed[:30])
+(TOP4 / "ffmpeg" / "cache" / "ffmpeg-9.0.2.tar.xz").write_bytes(ff_src)  # restore original
+
+# caps: size then age
+for i in range(5):
+    payload = bytes([65 + i]) * 300_000
+    (TOP4 / "ffmpeg" / "cache" / f"blob{i}.tar.xz").write_bytes(payload)
+    (TP4 / "packages" / "ffmpeg" / "build.sh").open("a").write(f"# {sha(payload)}\n")
+r = l4_cmd("source-cache-collect", tpl4, dict(envl4, TERMUX_SRCCACHE_CAP_MB="1"))
+ok("T33h size cap enforced (prune oldest-first to <=1MB, keep survivors)",
+   r.returncode == 0 and "over cap" in r.stdout
+   and sum(p.stat().st_size for p in L4ROOT.rglob("*") if p.is_file()) <= 1024 * 1024
+   and any("__blob" in p.name for p in L4ROOT.rglob("*") if p.is_file()),
+   r.stdout[-200:])
+blobA = bytes([90]) * 50_000
+srcA = TOP4 / "ffmpeg" / "cache" / "blobA.tar.xz"
+srcA.write_bytes(blobA)
+(TP4 / "packages" / "ffmpeg" / "build.sh").open("a").write(f"# {sha(blobA)}\n")
+os.utime(srcA, (time.time() - 3 * 86400, time.time() - 3 * 86400))
+r = l4_cmd("source-cache-collect", tpl4, dict(envl4, TERMUX_SRCCACHE_AGE_DAYS="1"))
+ok("T33i age cap enforced (entry older than AGE_DAYS deleted; fresh ones kept)",
+   not any(p.name.endswith("__blobA.tar.xz") for p in L4ROOT.rglob("*")), r.stdout[-120:])
+os.utime(srcA, None)
+r = l4_cmd("source-cache-collect", tpl4, envl4)
+ok("T33j age-pruned entry re-collected once fresh (prune is policy, not breakage)",
+   any(p.name.endswith("__blobA.tar.xz") for p in L4ROOT.rglob("*")), r.stdout[-120:])
+
+# T33k: DEBIAN-format anchor — deb hash anchored in the GPG-verified
+# Packages index (repo.json here uses pkg_format=debian; *-json exists only
+# in pacman mode — run 40862002110 proved the json-only anchor rejected all
+# 29 _all debs). Acceptance must come from the SHA256 stanza instead.
+deb2_payload = b"ALLDEB2" * 700
+deb2_sha = sha(deb2_payload)
+deb2_rel = "pool/main/f/foo/foo_1.0_all.deb"
+(deb2_dir := (TOP4 / "_cache-all" / "pool" / "main" / "f" / "foo")).mkdir(parents=True)
+(deb2_dir / "foo_1.0_all.deb").write_bytes(deb2_payload)
+(TOP4 / "_cache-all" / "main-Packages").write_text(
+    "Package: foo\nVersion: 1.0-1\nArchitecture: all\n"
+    f"Filename: {deb2_rel}\nSize: {len(deb2_payload)}\nSHA256: {deb2_sha.upper()}\n\n")
+r = l4_cmd("source-cache-collect", tpl4, envl4)
+ok("T33k debian Packages-anchor deb accepted (uppercase SHA256 normalized) + per-entry ACCEPT log",
+   any(p.name.endswith("__pool%2Fmain%2Ff%2Ffoo%2Ffoo_1.0_all.deb") for p in L4ROOT.rglob("*"))
+   and "L4 ACCEPT deb-all/" in r.stdout, r.stdout[-200:])
+
+r = l4_cmd("source-cache-restore", tpl4, dict(envl4, TERMUX_L4_ROOT=str(W / "l4-elsewhere-restore")))
+ok("T34a path guard: unexpected L4 root refused by restore (rc=0, no writes)",
+   r.returncode == 0 and "SKIP: unexpected root" in r.stdout
+   and not (W / "l4-elsewhere-restore").exists(), r.stdout[:150:])
+r = l4_cmd("source-cache-collect", tpl4, dict(envl4, TERMUX_L4_ROOT=str(W / "l4-elsewhere-collect")))
+ok("T34a2 path guard: unexpected L4 root refused by collect (rc=0, no writes)",
+   r.returncode == 0 and "SKIP: unexpected root" in r.stdout
+   and not (W / "l4-elsewhere-collect").exists(), r.stdout[:150:])
+
+gen = (tpl4 / ".l4-restore.sh").read_text() + (tpl4 / ".l4-collect.sh").read_text()
+ok("T34b L4 adds NO network I/O and no retry knobs (upstream curl policy stays the only fetch path)",
+   "curl" not in gen and "wget" not in gen and "retry" not in gen)
+ok("T34c upstream vendored download policy intact (--retry 5/--retry-max-time 120)",
+   "--retry 5" in DL_FIXTURE.read_text() and "--retry-max-time 120" in DL_FIXTURE.read_text())
+
+pos_seed = wf.find("Restore source cache (L4)")
+pos_seed2 = wf.find("Seed source cache into container")
+pos_build2 = wf.find("- name: Build chromium-sandboxed")
+pos_check2 = wf.find("Verify cached completed deb")
+pos_collect = wf.find("Collect source cache (L4)")
+pos_save4 = wf.find("Save source cache (L4)")
+ok("T34d workflow order: debcheck -> L4 restore/seed -> build -> collect -> ... -> L4 save",
+   -1 < pos_check2 < pos_seed < pos_seed2 < pos_build2 < pos_collect < pos_save4)
+seed_block = wf[wf.index("- name: Restore source cache (L4)"):wf.index("- name: Seed source cache into container")]
+ok("T34e L4 restore skipped on smoke-only AND on DEB reuse (4.4-min reuse path: zero L4 IO)",
+   "if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'" in seed_block
+   and "key: chromium-srccache-aarch64-v1-${{ github.run_id }}" in seed_block
+   and "restore-keys: chromium-srccache-aarch64-v1-" in seed_block)
+coll_block = wf[pos_collect:wf.index("- name: Package gates")]
+ok("T34f collect: !cancelled + reuse/smoke gate + build-ran; has_new parsed from L4 COLLECT line only",
+   "if: ${{ !cancelled() && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1' && steps.build.outcome != 'skipped' }}" in coll_block
+   and "sed -n 's/^L4 COLLECT new=" in coll_block)
+save4_block = wf[pos_save4:wf.index("- name: Save completed deb to reuse cache")]
+ok("T34g L4 save gated by has_new == '1' (no empty-cache promotion; warm runs re-upload nothing)",
+   "steps.srccollect.outputs.has_new == '1'" in save4_block
+   and "inputs.docker_smoke_only != true" in save4_block)
+ok("T34h third bind volume .termux-srccache + image-layer pre-create (bind-parent lesson) + smoke covers it",
+   "--volume $d/.termux-srccache:/home/builder/.termux-srccache" in ci_txt
+   and "mkdir -p /home/builder/.termux-build/_cache-aarch64 /home/builder/.cache/sccache /home/builder/.termux-srccache" in ci_txt
+   and "chown -R builder:builder /home/builder/.termux-build /home/builder/.cache/sccache /home/builder/.termux-srccache" in ci_txt
+   and "/home/builder/.termux-srccache" in ci_txt[ci_txt.index("docker_perms_smoke()"):ci_txt.index("dep_cache_prune()")])
+
+_base_ok = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", "9ecb6e3^{commit}"],
+                          capture_output=True).returncode == 0
+g1 = subprocess.run(["git", "-C", str(ROOT), "show", "9ecb6e3:port/ci.sh"], capture_output=True, text=True).stdout if _base_ok else ""
+def _fn(txt, name):
+    m = re.search(rf"^{name}\(\) \{{", txt, re.M)
+    if not m:
+        return None
+    i = m.end(); depth = 1
+    while i < len(txt) and depth:
+        if txt[i] == "{": depth += 1
+        elif txt[i] == "}": depth -= 1
+        i += 1
+    return txt[m.start():i]
+ok("T34i PR #24 integrity core untouched: deb_key/deb_reuse_verify/deb_reuse_save/fingerprint byte-identical to 9ecb6e3",
+   (not _base_ok) or all(_fn(g1, f) == _fn(ci_txt, f) for f in ("deb_key", "deb_reuse_verify", "deb_reuse_save", "image_fingerprint", "deb_image_id")),
+   "skipped on shallow checkout (verified on full clone)" if not _base_ok else "drift")
+
+envl4c = dict(os.environ, **envl4)
+p1 = subprocess.Popen(["bash", str(CI), "source-cache-collect", str(tpl4)], env=envl4c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+p2 = subprocess.Popen(["bash", str(CI), "source-cache-collect", str(tpl4)], env=envl4c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+rc1, rc2 = p1.wait(timeout=180), p2.wait(timeout=180)
+bad = [p for p in L4ROOT.rglob("*") if p.is_file() and "__" in p.name
+       and p.name.split("__")[0] != sha(p.read_bytes())[:12]]
+ok("T40 concurrent collect: both succeed, every entry stays self-consistent (atomic tmp+mv)",
+   rc1 == 0 and rc2 == 0 and not bad, [str(b) for b in bad][:3])
+
+# ---------- T41: L4 adapter in the recipe clone (tarball preservation) ----
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("prepare_recipe", ROOT / "port" / "prepare_recipe.py")
+_pr = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_pr)
+_raw = (HERE / "fixtures" / "real_chromium_build_sh_2af83c3").read_text()
+_keep, _notes = _pr.preserve_source_cache(_raw)
+ok("T41a clone preserves the sha256-declared chromium tarball (upstream rm -f neutralized, exactly one line changed)",
+   'rm -f "$TERMUX_PKG_CACHEDIR/chromium-$TERMUX_PKG_VERSION-linux.tar.xz"' not in _keep
+   and "tarball kept for the L4 source cache" in _keep
+   and sum(1 for a, b in zip(_raw.splitlines(), _keep.splitlines()) if a != b) == 1
+   and len(_raw.splitlines()) == len(_keep.splitlines()), _notes)
+_k2, _n2 = _pr.preserve_source_cache(_keep)
+ok("T41b absence tolerated (no-op + note), idempotent", _k2 == _keep and any("not found" in n for n in _n2), _n2)
+
 print(f"\nCACHE-LAYERS PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)

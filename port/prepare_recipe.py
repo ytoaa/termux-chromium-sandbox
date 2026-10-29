@@ -99,6 +99,34 @@ def parse_version_line(text: str):
     return ver, quote, m.group(4)
 
 
+RM_TARBALL_RE = re.compile(
+    r'^[ \t]*rm -f "\$TERMUX_PKG_CACHEDIR/chromium-\$TERMUX_PKG_VERSION-linux\.tar\.xz"[ \t]*$',
+    re.M)
+
+def preserve_source_cache(text: str) -> tuple[str, list]:
+    """L4 adapter (clone-only; stock package never touched).
+
+    Upstream deletes the 1.87 GB extracted chromium tarball at the end of
+    post_patch ("keep more space"). That is the single largest repeated
+    download of every full rebuild (github release, sha256-verified at
+    fetch) and L4 can only persist files present in TERMUX_PKG_CACHEDIR
+    at collect time. The container has ~94 GB free after our free-space
+    step, so the space rationale does not apply on this fleet; keeping
+    the file lets the verified tarball be saved to (and restored from)
+    the L4 cache, eliminating the re-download and its failure window
+    across rebuilds. Absence of the line (upstream drift) is harmless:
+    the file simply stays, and we note it.
+    """
+    notes: list[str] = []
+    new, n = RM_TARBALL_RE.subn(
+        "\t: 'tarball kept for the L4 source cache - was an upstream "
+        "rm -f; disk is managed by the ci.sh free-space step'", text, count=1)
+    if n == 0:
+        notes.append("preserve_source_cache: upstream tarball-removal line "
+                     "not found (already removed upstream?) - no change")
+    return new, notes
+
+
 def align_versions(text: str, termux_dir: Path) -> tuple[str, list]:
     """Upstream drift guard: the recipe's own post_get_source compares our
     TERMUX_PKG_VERSION against chromium-host-tools/build.sh and termux_error_exit
@@ -272,6 +300,9 @@ def prepare(termux_dir: Path) -> dict:
             text = rewrite_identity(text)
             text = exclude_sandbox_disable_patches(text)
             text = wire_sccache(text)
+            text, keep_notes = preserve_source_cache(text)
+            for n in keep_notes:
+                print("NOTE:", n)
             text = chain_shield_hook(text)
             text, align_notes = align_versions(text, termux_dir)
             for n in align_notes:
