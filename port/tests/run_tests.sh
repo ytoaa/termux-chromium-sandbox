@@ -118,7 +118,14 @@ g15="$T15/x11-packages/chromium-sandboxed/build.sh"
 [ "$(grep -c 'cc_wrapper="sccache"' "$g15")" = "1" ]   && grep -q 'echo .cc_wrapper="sccache". >> $TERMUX_PKG_BUILDDIR/out/Release/args.gn' "$g15"   && python3 port/prepare_recipe.py audit --termux-dir "$T15" >/dev/null 2>&1   && pass "[15] cc_wrapper wired into args.gn (and audit enforces it)"   || fail "[15] sccache cc_wrapper wiring missing"
 
 # [16] ci.sh build must (re)export the sccache volume IN-STEP + early evidence gate
-grep -q 'TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume $d/.sccache:/home/builder/.cache/sccache"' port/ci.sh   && grep -q 'SCCACHE DEAD' port/ci.sh   && grep -q 'sleep 1800' port/ci.sh   && grep -q 'SCCACHE ALIVE' port/ci.sh   && pass "[16] in-step volume export + 30min evidence watchdog" || fail "[16] ci.sh marathon contract"
+# (3 exports: prepare_builder, docker_perms_smoke — self-contained for
+# standalone use — and build_chromium; GH steps do not share env.)
+grep -q 'docker_volume_args()' port/ci.sh \
+  && grep -q -- '--volume $d/.sccache:/home/builder/.cache/sccache --volume $d/.termux-depcache/aarch64:/home/builder/.termux-build/_cache-aarch64' port/ci.sh \
+  && [ "$(grep -cF 'TERMUX_DOCKER_RUN_EXTRA_ARGS="$(docker_volume_args "$d")"' port/ci.sh)" = "3" ] \
+  && grep -q 'SCCACHE DEAD' port/ci.sh && grep -q 'sleep 1800' port/ci.sh \
+  && grep -q 'SCCACHE ALIVE' port/ci.sh && grep -q 'last_tick' port/ci.sh \
+  && pass "[16] in-step dual-volume export + tick-aware 30min watchdog" || fail "[16] ci.sh marathon contract"
 
 # [17] run #11 false-failure regression: reaped-watchdog kill/wait must be || true
 grep -q 'kill "$wpid" 2>/dev/null || true' port/ci.sh \
@@ -441,5 +448,14 @@ out=$(python3 "port/tests/r12_set_tid_address_test.py" 2>&1); got=$?
 [ "$got" -eq 0 ] && echo "$out" | grep -q '^R12-TESTS PASS=19 FAIL=0$' \
   && pass "[51] R12 contract suite (19 checks)" \
   || { fail "[51] R12 contract suite"; printf '%s\n' "$out" | tail -40; }
+
+# [52] cache-layer suites (perf/ci-cache-layers): dep-cache contract,
+# preflight fail-fast/whitelist/redirect+real-transfer probe, prune caps,
+# deb-reuse fail-closed gates + image-id binding (T19-T27), runner/node24 protections, R12 policy
+# immutability, docker bind-parent fix + smoke + save-guard (51 checks).
+out=$(python3 "port/tests/cache_layers_test.py" 2>&1); got=$?
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=51 FAIL=0$' \
+  && pass "[52] cache layers suite (51 checks)" \
+  || { fail "[52] cache layers suite"; printf '%s\n' "$out" | tail -40; }
 
 exit $rc

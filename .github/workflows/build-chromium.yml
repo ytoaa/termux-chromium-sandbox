@@ -22,6 +22,14 @@ on:
         description: Publish a successful direct build as GitHub Pre-release (Round 17; opt-out=false)
         type: boolean
         default: true
+      allow_deb_reuse:
+        description: Reuse a fully-verified completed DEB when all build inputs hash-identical (cache layer 3; OPT-IN until cross-build identity is proven in production)
+        type: boolean
+        default: false
+      docker_smoke_only:
+        description: Stop after keys/preflight/prepare-builder (real-Docker permission smoke) — no compile, no gates, no deb reuse (cache-layer verification runs)
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       termux_ref:
@@ -104,21 +112,134 @@ jobs:
           git -C termux-packages rev-parse HEAD > termux-pin.txt
       - name: Prepare chromium-sandboxed recipe (identity + injected hook)
         run: bash port/ci.sh recipe-prepare "$PWD/termux-packages"
+      - name: Compute cache keys (sccache base only)
+        id: keys
+        run: |
+          set -uo pipefail
+          echo "PWD=$(pwd) PY=$(command -v python3) VER=$(python3 -V 2>&1)"
+          if ! ph=$(python3 port/maintenance.py port-input-hash --root . 2>&1); then
+            echo "port-input-hash FAILED rc=$? out=$ph" >&2
+            ls -la port/ | head -12 >&2
+            exit 1
+          fi
+          ph=$(printf '%s' "$ph" | tail -1)
+          test -n "$ph"
+          base=$(printf '%s\n' "termux=$termux_sha" "rev=${TERMUX_SANDBOXED_REVISION:-}" "port=$ph" | sha256sum | cut -d' ' -f1)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "cache base=$base"
+          # NOTE: the DEB key is computed LATER (after preflight finalized
+          # repo.json and prepare-builder produced the final image; the
+          # dedicated later step also hashes the image CONTENT id). Hashing
+          # repo.json or the image tag here, before those steps mutate
+          # them, would desync the key from the actual build inputs.
       - name: Restore sccache
         uses: actions/cache/restore@v4
         with:
           path: termux-packages/.sccache
-          key: chromium-sccache-aarch64-${{ env.termux_sha }}
-          restore-keys: chromium-sccache-aarch64-
+          key: chromium-sccache-aarch64-${{ steps.keys.outputs.base }}-${{ github.run_id }}
+          restore-keys: |
+            chromium-sccache-aarch64-${{ steps.keys.outputs.base }}-
+            chromium-sccache-aarch64-
+      # Layer 1: termux_download-depped .deb/Packages cache (integrity is
+      # re-enforced per-file by termux against GPG-verified repo metadata on
+      # every run, so stale/corrupted entries self-heal via re-download).
+      - name: Restore termux dep cache
+        uses: actions/cache/restore@v4
+        with:
+          path: termux-packages/.termux-depcache
+          key: termux-depcache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
+          restore-keys: termux-depcache-aarch64-${{ env.termux_sha }}-
+      # Layer 6: fail fast (<10 min) if official apt repos are unreachable or
+      # crawling; switches only between whitelisted official mirrors.
+      - name: Download preflight (official mirrors)
+        run: timeout 900 bash port/ci.sh download-preflight "$PWD/termux-packages"
       - name: Prepare Termux zram workspace bridge
         run: bash port/ci.sh prepare-zram-workspace "$PWD/termux-packages"
       - name: Enable zram
         uses: ./.github/actions/zram
       - name: Prepare Termux builder (docker + sccache image)
         run: bash port/ci.sh prepare-builder "$PWD/termux-packages"
+      # DEB key = hash over ALL build-affecting inputs, computed HERE —
+      # after (1) preflight possibly rewrote repo.json (mirror switch),
+      # (2) prepare-builder produced the FINAL custom image. The key
+      # hashes the deterministic image CONTENT FINGERPRINT (base image id +
+      # sorted dpkg package versions + Dockerfile hash — see
+      # image_fingerprint() in ci.sh; the raw docker image id embeds a
+      # build timestamp and is NOT reproducible, which made a raw-id key
+      # unhittable across runs), not just the tag: any real base/apt/
+      # Dockerfile change rotates the key instead of risking stale-DEB
+      # reuse. Fail-closed: missing/invalid recorded values -> no key ->
+      # no reuse (the step errors out loudly).
+      - name: Compute final DEB key (post-preflight repo.json + final image fingerprint)
+        if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true
+        id: debkey
+        run: |
+          set -uo pipefail
+          # Both files are written by prepare-builder BEFORE its free-space
+          # cleanup (run 40823773715: post-cleanup image-config inspection
+          # fails "blob not found", while live-container metadata stays
+          # readable). Missing/empty => FAIL CLOSED (never a partial key).
+          imgfp=$(cat "$PWD/termux-packages/.builder-image-id" 2>/dev/null) || imgfp=""
+          [ -n "$imgfp" ] || { echo "DEBKEY FAIL: no recorded builder image fingerprint (prepare-builder did not record it)" >&2; exit 1; }
+          [[ "$imgfp" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { echo "DEBKEY FAIL: invalid image fingerprint '$imgfp'" >&2; exit 1; }
+          imgid=$(cat "$PWD/termux-packages/.builder-image-raw" 2>/dev/null) || imgid=""
+          [[ "$imgid" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { echo "DEBKEY FAIL: invalid recorded raw image id '$imgid'" >&2; exit 1; }
+          if ! dkraw=$(TERMUX_BUILDER_IMAGE_ID="$imgfp" bash port/ci.sh deb-key "$PWD/termux-packages" 2>&1); then
+            echo "DEB-KEY step FAILED: $dkraw" >&2
+            exit 1
+          fi
+          dk=$(printf '%s' "$dkraw" | tail -1 | cut -d= -f2)
+          test -n "$dk" || { echo "DEB-KEY empty output: $dkraw" >&2; exit 1; }
+          echo "debkey=$dk" >> "$GITHUB_OUTPUT"
+          echo "image_id=$imgid" >> "$GITHUB_OUTPUT"
+          echo "DEBKEY=$dk IMAGE_FP=$imgfp IMAGE_ID=$imgid REPOJSON=$(sha256sum "$PWD/termux-packages/repo.json" | cut -c1-16)"
+      - name: Restore cached completed deb
+        if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true
+        uses: actions/cache/restore@v4
+        with:
+          path: termux-packages/.deb-cache
+          key: chromium-deb-v1-${{ steps.debkey.outputs.debkey }}
+      - name: Verify cached completed deb (fail-closed reuse gate)
+        if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true
+        id: debcheck
+        continue-on-error: true
+        env:
+          DEB_KEY: ${{ steps.debkey.outputs.debkey }}
+        run: |
+          set -euo pipefail
+          if bash port/ci.sh deb-reuse-verify "$PWD/termux-packages"; then
+            echo "reused=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "reused=0" >> "$GITHUB_OUTPUT"
+          fi
+      # docker_smoke_only = infrastructure validation run (real-Docker
+      # permission smoke, preflight, cache restore/save paths). Compile,
+      # artifact gates and deb-reuse are meaningless without a package and
+      # are skipped THERE ONLY; every normal run executes the security
+      # package gates unconditionally (reused or built — never bypassed).
       - name: Build chromium-sandboxed (port hook runs at post_get_source)
-        run: bash port/ci.sh build "$PWD/termux-packages"
+        if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
+        env:
+          EXPECTED_IMAGE_ID: ${{ steps.debkey.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          # Same-image contract: the image the DEB key was computed over
+          # must be the image this build boots. (Reuse OFF => no key => no
+          # docker dependency added here; guard is inert unless set.)
+          if [ -n "${EXPECTED_IMAGE_ID:-}" ]; then
+            # The LIVE container is the exact image this build boots
+            # (run-docker reuses it). Container .Image is daemon metadata,
+            # readable after the content-store cleanup; image inspect is
+            # not (run 40823773715).
+            actual=$(docker inspect -f '{{.Image}}' termux-package-builder)
+            [ "$actual" = "$EXPECTED_IMAGE_ID" ] || {
+              echo "IMAGE DRIFT: DEB key computed on $EXPECTED_IMAGE_ID but build container runs $actual — refusing to build under a stale key"
+              exit 1; }
+            echo "IMAGE MATCH OK: container <- $actual"
+          fi
+          bash port/ci.sh build "$PWD/termux-packages"
       - name: Package gates (separate identity, port applied)
+        if: inputs.docker_smoke_only != true
         run: |
           set -euo pipefail
           deb=$(find termux-packages/output -name 'chromium-sandboxed_*_aarch64.deb' | head -1)
@@ -175,15 +296,52 @@ jobs:
           fi
           echo "termux_sha=$(cat termux-pin.txt 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
           echo "port_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Save sccache
+      # Save-guard: never write EMPTY/near-empty caches under real keys.
+      # A failed early run (like 40717335376: zero compiles, zero dep
+      # downloads) used to save a 0-file sccache under the run key; prefix
+      # restores could then pick the empty archive over the older healthy
+      # one. Guard skips the save instead (existing caches stay untouched).
+      - name: Guard cache saves (no empty-cache promotion)
         if: always()
+        id: guard
+        run: |
+          set -uo pipefail
+          sn=$(find termux-packages/.sccache -type f 2>/dev/null | wc -l); sn=${sn:-0}
+          dn=$(find termux-packages/.termux-depcache -type f 2>/dev/null | wc -l); dn=${dn:-0}
+          echo "sccache_files=$sn" >> "$GITHUB_OUTPUT"
+          echo "dep_files=$dn" >> "$GITHUB_OUTPUT"
+          [ "$sn" -ge 10 ] && echo "sccache_nonempty=1" >> "$GITHUB_OUTPUT" || echo "sccache_nonempty=0"
+          [ "$dn" -ge 1 ] && echo "dep_nonempty=1" >> "$GITHUB_OUTPUT" || echo "dep_nonempty=0"
+          echo "GUARD sccache_files=$sn (save>=10 required) dep_files=$dn (save>=1 required)"
+      - name: Prune termux dep cache
+        if: always()
+        run: bash port/ci.sh dep-cache-prune "$PWD/termux-packages"
+      - name: Save termux dep cache
+        if: always() && steps.guard.outputs.dep_nonempty == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: termux-packages/.termux-depcache
+          key: termux-depcache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
+      - name: Save sccache
+        if: always() && steps.guard.outputs.sccache_nonempty == '1'
         uses: actions/cache/save@v4
         with:
           path: termux-packages/.sccache
-          key: chromium-sccache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
+          key: chromium-sccache-aarch64-${{ steps.keys.outputs.base }}-${{ github.run_id }}
       # The completed workflow_run payload does NOT reliably expose the
       # workflow_dispatch inputs. Bind the caller's publish consent to
       # the build artifact itself; never infer consent from a missing field.
+      - name: Save completed deb to reuse cache
+        if: success() && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
+        env:
+          DEB_KEY: ${{ steps.debkey.outputs.debkey }}
+        run: bash port/ci.sh deb-reuse-save "$PWD/termux-packages"
+      - name: Cache completed deb
+        if: success() && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
+        uses: actions/cache/save@v4
+        with:
+          path: termux-packages/.deb-cache
+          key: chromium-deb-v1-${{ steps.debkey.outputs.debkey }}
       - name: Record manual publish intent (fail closed)
         if: always()
         env:

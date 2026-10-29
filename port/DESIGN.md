@@ -1456,3 +1456,194 @@ block matrix via static per-syscall policy citation + live trap controls
 (openat/sched_getparam traps still fire + rt_sigreturn survival) + P2b
 causality (--disable-seccomp-filter-sandbox 2->1). Promotion, publication,
 validated-state and Publisher untouched — separate approvals required.
+
+## Round 20 — CI cache layers (perf/ci-cache-layers, evidence-driven)
+Motivated by the 40662494279 forensics (issue #12 audit trail): pre-ninja
+dependency downloads collapsed (19 × curl(28) to packages-cf.termux.dev) and
+the job later hung 2.5h before timing out mid-compile — compilation itself
+was never the bottleneck while warm caches existed. Three tiers now cooperate:
+
+1. **Dependency tier** — `.termux-depcache/aarch64` ↔ container
+   `_cache-aarch64` (bind volume + actions/cache). Integrity is delegated
+   VERBATIM to the official pipeline: Release(+.gpg) is always re-fetched and
+   `gpg --verify`-ed per run (`termux_get_repo_files.sh`); Packages/.deb names
+   are content-addressed with hashes from that verified metadata and
+   re-checked by `termux_download` (sha256-skip cache). Corrupted or
+   version/arch-mismatched entries self-heal by re-download (tests T1–T5).
+   Prune: 30d age + 2 GiB cap (env override), path-fenced.
+2. **sccache tier** — unchanged storage, hardened keys: restore key
+   `chromium-sccache-aarch64-<base>-<run>` with dual prefix fallback
+   (`<base>-` then legacy), `base = sha256(termux_sha|REVISION|port-input-hash)`;
+   in-container 10-min `SCCACHE_TICK_JSON` (stats JSON + file count) makes
+   hits/misses observable DURING the build; the 30-min watchdog now demands
+   real progress (ninja start or nonzero compile counters) instead of raw
+   file counts; `timeout 14400` converts a hang into a natural failure so
+   diagnostics/artifact steps still run before the 350-min job kill.
+3. **Completed-DEB tier** (input `allow_deb_reuse`, default true) —
+   actions/cache under `chromium-deb-v1-<debkey>`, where
+   `debkey = sha256(pkg|rev|arch|upstream-version|termux_sha|port-input-hash|recipe-dir|repo.json|builder-image)`.
+   Restore alone never skips work: the fail-closed verifier requires
+   manifest-matched deb sha256 + key equality + dpkg metadata + chrome-binary
+   sha256 + `r12-bionic-tid` marker; package security gates ALWAYS re-run
+   against whatever lands in `output/`. Any policy/patch/recipe/repo change
+   flips the key → full build. `reuse-decision.json` records the outcome.
+4. **Download resilience** — `download-preflight` probes every repo.json
+   entry (bounded curl, speed-timeout) and fails the job in <10 min rather
+   than hours of curl(28) loops; switches only between whitelisted official
+   hosts (packages.termux.dev / packages-cf.termux.dev); non-official hosts
+   abort; effective repo.json hash is in the deb key (provenance-visible).
+Protections re-tested, never weakened: seccomp policy files byte-identical
+(T15), no `contents:write`, no fallback mirror, no gate bypass, a cache-save
+failure can never flip build success, and code-level `rm -rf` of runner
+cache paths is forbidden (T14) preserving the node24 fix.
+
+## Round 21 — Docker bind-mount parent fix + real-container smoke contract
+
+Post-mortem run 40717335376 (15:38:47Z): `mkdir: cannot create directory
+'/home/builder/.termux-build/chromium-sandboxed': Permission denied`,
+BUILD_RC=1 before ninja. Root cause (proven by the pinned upstream
+`scripts/run-docker.sh`): the Termux builder reuses ONE detached container;
+dockerd creates any *missing* bind-mount target path **as root:root** inside
+the image's filesystem. Our Layer-1 mount targets
+`/home/builder/.termux-build/_cache-aarch64`; the image never ships
+`.termux-build` (upstream creates it at build runtime as builder), so the
+leaf mount made dockerd plant a root-owned `.termux-build` parent and
+`build-package.sh` lost write access to its own top dir. The sccache mount
+never showed this because nothing mkdirs *beside* `.cache/sccache` —
+bind-mounted leaves inherit host-dir uid semantics, only intermediate
+parents are root-created.
+
+Fix (ownership-correct, minimal, no `chmod -R 777`, no new mounts):
+`Dockerfile.chromium-sccache` pre-creates `/home/builder/.termux-build/
+_cache-aarch64` and `/home/builder/.cache/sccache` `chown -R builder:builder`
+in the image. `.termux-build` is deliberately NOT bind-mounted at its own
+level — it also hosts non-cache state (`chromium-sandboxed` build dir,
+`_cache/python-3.14` host-tool artifacts); only the per-arch download leaf
+is mounted.
+
+Contract now *verified in the real container* by `docker_perms_smoke`
+(prepare-builder runs it twice: fresh create + after `rm -f` recreate):
+uid/gid + `docker inspect` Mounts + host dir ownership evidence,
+/proc/mounts rows for BOTH volumes, mkdir under `.termux-build`,
+create/read/remove inside it, dep-cache leaf write, restored dep-cache
+entries sha-readable (warm) or clean-empty (cold), sccache leaf writable
+simultaneously. Any failure aborts the job at ~20 min, not at timeout.
+
+Adjacent hardenings in this round:
+* preflight now demands a *real* transfer — Release 200 AND a bounded 1 MiB
+  ranged GET of `binary-aarch64/Packages(.xz|.gz)` per repo entry; a
+  Release-200-only pass no longer blesses multi-hundred-MB dependency pulls
+  (run 40662494279 lesson). Redirects are followed but the EFFECTIVE host
+  must still be official (off-whitelist → hard fail); curl rc is preserved
+  next to http code (404 vs 28 vs 7 vs TLS distinguishable in the log).
+* `docker_smoke_only` dispatch input: infrastructure-validation runs stop
+  after prepare-builder; compile, package gates and deb-reuse steps are
+  gated there ONLY — every normal run executes the security gates
+  unconditionally.
+* Save-guard: sccache/dep-cache saves are skipped unless the dirs hold
+  ≥10/≥1 files. Early-failed runs previously archived empty caches under
+  real keys; restores then risked choosing an empty archive over an older
+  healthy one. Existing caches are never modified by a skipped save.
+* Completed-DEB reuse flipped to explicit **opt-in** (`allow_deb_reuse`
+  default false). The fail-closed verifier is strong, but until two
+  independent full builds prove cross-run key stability in production,
+  skipping compilation must be a deliberate choice, not a default.
+
+## Round 22 — DEB cache-key integrity (final image identity + final repo state)
+
+Two key-correctness defects closed with minimal edits (no redesign):
+
+1. **Image tag was not an identity.** `deb_key()` hashed
+   `TERMUX_BUILDER_IMAGE_NAME` — a mutable tag. Same tag can now mean
+   different image content (base `:latest` digest drift on the fleet,
+   apt package version changes inside the RUN layer, Dockerfile edits);
+   under the old key a DEB built in such a *different* environment could
+   have been served from cache. `deb_key()` now requires the FINAL
+   custom image's content id (`docker image inspect --format {{.Id}}`,
+   shape-validated `^(sha256:)?[0-9a-f]{64}$`, or an explicit
+   `TERMUX_BUILDER_IMAGE_ID` for docker-less audits) and FAILS CLOSED
+   without it. The build step re-inspects the image it is about to boot
+   and aborts on `IMAGE DRIFT` versus the key's image id (same-image
+   contract; inert when reuse is off — no new docker dependency there).
+   Image determinism note: the Dockerfile's apt layer is content-
+   deterministic per package version set; id churn therefore correctly
+   tracks security/package updates. We deliberately do NOT pin versions
+   (would suppress security updates); the cost of a rotated key is one
+   extra full build, never a wrong reuse.
+
+2. **Key was computed before the inputs it claims to cover.** The DEB key
+   step ran *before* `download-preflight` (which can rewrite repo.json
+   via official mirror-switch) and before `prepare-builder` (which
+   produces the final image). Ordering is now: recipe → sccache base key
+   (unchanged early position; its inputs do not mutate) → restores →
+   preflight → zram → prepare-builder → **compute final DEB key**
+   (post-preflight repo.json + final image id) → restore/verify completed
+   deb → conditional build (drift-checked) → package gates (unconditional
+   on normal runs) → guarded saves. All four consumers (restore key,
+   verify `DEB_KEY`, save manifest, cache-save key) reference the single
+   `steps.debkey` output; a mirror-switch failure path leaves no
+   REUSED=1 possible (preflight fails the job first).
+
+Regression coverage: T19 reproducibility (same id+inputs → same key),
+T20 image-id change → key change, T21a/b fail-closed (missing/malformed
+id, via docker-shim), T22 repo.json change → key change, T23 preflight
+MIRROR-SWITCH reflected in the final key (function-executed, not
+string-grep), T24 step ordering, T25 single-key identity + drift guard,
+T26 compile-skip vs always-gates, T27 smoke-only/opt-in invariants.
+Suite total: 43 cache-layer checks.
+
+Round 22 addendum (run 40823773715): the first production attempt of the
+post-prepare key step died fail-closed with
+`blob sha256:58a7… expected at /var/lib/containerd/io.containerd.content.
+v1.content/blobs/…: blob not found` — our free-space replacement (node24
+era) deletes containerd's CONTENT store at the end of prepare_builder.
+Upstream free-space.sh ran before any docker use; relocated into
+prepare-builder it silently broke image-config inspection (the build kept
+working only because run-docker reuses the already-created detached
+container whose snapshot is extracted). Correct ordering is therefore
+enforced in code: `docker build` -> record `image inspect .Id` into
+`$d/.builder-image-id` + verify live container `.Image == imgid` (both
+while blobs exist) -> cleanup -> later steps consume the FILE and the
+CONTAINER metadata only; the workflow never inspects the image after
+prepare (regression-pinned by T28).
+
+## Round 23 — deterministic builder-image fingerprint for the DEB key
+
+Task-C hypothesis CONFIRMED empirically: the raw `docker image inspect
+.Id` is NOT stable across rebuilds of identical inputs — run
+40825927463 recorded `7ccda63d…` and run 40834221022 (same commit,
+same base `:latest` digest `e2de051a…`, same Dockerfile) recorded
+`0b9d985a…`. The image config embeds a per-build `created` timestamp,
+so keying the DEB cache on the raw id rotated the key every run and
+made Layer-3 reuse unhittable (40834221022 hit `REUSED=0 no-cached-deb`
+and had to recompile).
+
+Fix: the DEB key now hashes `image_fingerprint = sha256(base image id +
+sorted `dpkg -W '${Package} ${Version}'` + Dockerfile content hash)` —
+three reproducible components. Security property preserved: any real
+environment change (base `:latest` drift, apt security update, Dockerfile
+edit) changes a component and rotates the key, so a stale DEB is NEVER
+reused under a different environment; an unchanged environment rebuilds
+to the same fingerprint and CAN reuse. We do not pin package versions
+(no security-update suppression); we do not map a changed image back to
+an old key. The raw docker image id is still recorded
+(`.builder-image-raw`) and the build step still asserts the live
+container's `.Image` equals it (same-image contract within a run); the
+fingerprint is recorded in `.builder-image-id`. Both are written by
+prepare_builder BEFORE the free-space step.
+
+Task-D: `prepare_builder`'s free-space subset no longer runs
+`rm -rf /var/lib/containerd/io.containerd.content.v1.content`. That
+directly gutted the docker daemon content store (broke post-prepare
+image inspection — run 40823773715; version-fragile; would starve other
+jobs on a shared runner) while disk pressure was absent (root fs
+94G avail / 36% used after the remaining cleanup). Replaced by
+daemon-managed `docker image prune -f` (reclaims the previous run's
+dangling rebuild of our tag). All node24 protections (forbidden
+runner-runtime paths) unchanged.
+
+Tests: T30a-e image_fingerprint determinism + base/pkg/dockerfile
+sensitivity + fail-closed; T31 deb_key reproducibility on the
+fingerprint; T32 no direct containerd/docker storage deletion +
+`docker image prune -f` present. T24/T28 updated for the two-file
+record. Suite 51 checks; full port suite 60/60.
