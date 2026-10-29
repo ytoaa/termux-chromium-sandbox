@@ -453,10 +453,10 @@ out=$(python3 "port/tests/r12_set_tid_address_test.py" 2>&1); got=$?
 # preflight fail-fast/whitelist/redirect+real-transfer probe, prune caps,
 # deb-reuse fail-closed gates + image-id binding (T19-T27), runner/node24 protections, R12 policy
 # immutability, docker bind-parent fix + smoke + save-guard + L4
-# verified source cache + production-layout key sensitivity T42/T43 (77 checks).
+# verified source cache + production-layout key sensitivity T42/T43 (78 checks).
 out=$(python3 "port/tests/cache_layers_test.py" 2>&1); got=$?
-[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=77 FAIL=0$' \
-  && pass "[52] cache layers suite (77 checks)" \
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=78 FAIL=0$' \
+  && pass "[52] cache layers suite (78 checks)" \
   || { fail "[52] cache layers suite"; printf '%s\n' "$out" | tail -40; }
 
 # [53] Audit round 2026-10-30 (DESIGN Round 25): verification-hardening
