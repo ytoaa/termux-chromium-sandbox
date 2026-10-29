@@ -162,8 +162,9 @@ jobs:
       # DEB key = hash over ALL build-affecting inputs, computed HERE —
       # after (1) preflight possibly rewrote repo.json (mirror switch),
       # (2) prepare-builder produced the FINAL custom image. The key
-      # includes the image CONTENT id (docker image inspect .Id), not just
-      # the tag: same tag with drifted base/apt/Dockerfile content rotates
+      # includes the image CONTENT id (the built image's digest, recorded
+      # by prepare-builder), not just the tag: same tag with drifted
+      # base/apt/Dockerfile content rotates
       # the key instead of risking stale-DEB reuse. Fail-closed: no valid
       # image id -> no key -> no reuse (and the step errors out loudly).
       - name: Compute final DEB key (post-preflight repo.json + final image id)
@@ -171,8 +172,14 @@ jobs:
         id: debkey
         run: |
           set -uo pipefail
-          imgid=$(docker image inspect --format '{{.Id}}' "$TERMUX_BUILDER_IMAGE_NAME") || {
-            echo "DEBKEY FAIL: builder image '$TERMUX_BUILDER_IMAGE_NAME' not inspectable" >&2; exit 1; }
+          # Image id is recorded by prepare-builder BEFORE its free-space
+          # step deletes containerd's content store (run 40823773715: after
+          # that, inspecting the image config blob fails "blob not found",
+          # while the live container's .Image metadata stays readable).
+          # File missing/empty => no recorded final image => FAIL CLOSED
+          # (never compute a partial key).
+          imgid=$(cat "$PWD/termux-packages/.builder-image-id" 2>/dev/null) || imgid=""
+          [ -n "$imgid" ] || { echo "DEBKEY FAIL: no recorded builder image id (prepare-builder did not record it)" >&2; exit 1; }
           [[ "$imgid" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { echo "DEBKEY FAIL: invalid image id '$imgid'" >&2; exit 1; }
           if ! dkraw=$(TERMUX_BUILDER_IMAGE_ID="$imgid" bash port/ci.sh deb-key "$PWD/termux-packages" 2>&1); then
             echo "DEB-KEY step FAILED: $dkraw" >&2
@@ -217,11 +224,15 @@ jobs:
           # must be the image this build boots. (Reuse OFF => no key => no
           # docker dependency added here; guard is inert unless set.)
           if [ -n "${EXPECTED_IMAGE_ID:-}" ]; then
-            actual=$(docker image inspect --format '{{.Id}}' "$TERMUX_BUILDER_IMAGE_NAME")
+            # The LIVE container is the exact image this build boots
+            # (run-docker reuses it). Container .Image is daemon metadata,
+            # readable after the content-store cleanup; image inspect is
+            # not (run 40823773715).
+            actual=$(docker inspect -f '{{.Image}}' termux-package-builder)
             [ "$actual" = "$EXPECTED_IMAGE_ID" ] || {
-              echo "IMAGE DRIFT: DEB key computed on $EXPECTED_IMAGE_ID but build image is $actual — refusing to build under a stale key"
+              echo "IMAGE DRIFT: DEB key computed on $EXPECTED_IMAGE_ID but build container runs $actual — refusing to build under a stale key"
               exit 1; }
-            echo "IMAGE MATCH OK: $actual"
+            echo "IMAGE MATCH OK: container <- $actual"
           fi
           bash port/ci.sh build "$PWD/termux-packages"
       - name: Package gates (separate identity, port applied)

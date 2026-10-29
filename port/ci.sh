@@ -345,7 +345,7 @@ prepare_zram_workspace() {
 }
 
 prepare_builder() {
-  local d cache base attempt pulled
+  local d cache base attempt pulled imgid cimg
   d="$(need_termux_dir "${1:?}")"
   cache="$d/.sccache"
   base="ghcr.io/termux/package-builder:latest"
@@ -382,6 +382,20 @@ USER builder:builder
 WORKDIR /home/builder/termux-packages
 DOCKERFILE
   docker build -f /tmp/Dockerfile.chromium-sccache -t "$TERMUX_BUILDER_IMAGE_NAME" "$d"
+  # Record the FINAL image content id NOW, before the free-space cleanup
+  # below (run 40823773715 evidence: `rm -rf /var/lib/containerd/io.
+  # containerd.content.v1.content` deletes containerd's content store;
+  # afterwards `docker image inspect` cannot read the image config blob
+  # — "blob not found" — while the ALREADY-CREATED container keeps
+  # working because its snapshot is extracted, which is why the old flow
+  # (image never inspected post-prepare) hid this. Persisting the id here
+  # keeps the DEB key bound to the true final image without depending on
+  # post-cleanup inspect.
+  imgid=$(docker image inspect --format '{{.Id}}' "$TERMUX_BUILDER_IMAGE_NAME") || {
+    echo "PREPARE FAIL: built image '$TERMUX_BUILDER_IMAGE_NAME' not inspectable" >&2; exit 1; }
+  [[ "$imgid" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { echo "PREPARE FAIL: invalid image id '$imgid'" >&2; exit 1; }
+  printf '%s' "$imgid" > "$d/.builder-image-id"
+  echo "BUILDER IMAGE ID=$imgid"
   docker rm -f termux-package-builder 2>/dev/null || true
   export TERMUX_DOCKER_RUN_EXTRA_ARGS="$(docker_volume_args "$d")"
   # Host-side evidence for the permission contract (see docker_perms_smoke).
@@ -396,6 +410,16 @@ DOCKERFILE
   docker rm -f termux-package-builder 2>/dev/null || true
   docker_perms_smoke "$d"
   run_docker "$d" bash -lc 'set -euxo pipefail; export SCCACHE_DIR=/home/builder/.cache/sccache SCCACHE_CACHE_SIZE=6G; command -v sccache; python3 --version; echo test > "$SCCACHE_DIR/.write-test"; rm "$SCCACHE_DIR/.write-test"'
+  # Same-image contract at the source: the LIVE container the later build
+  # step will exec into must have been created from the exact image the
+  # DEB key will hash. Container metadata .Image is readable even after
+  # the content-store cleanup below (it is not fetched from the blob
+  # store), so this remains checkable at build time too.
+  cimg=$(docker inspect -f '{{.Image}}' termux-package-builder 2>/dev/null) || {
+    echo "PREPARE FAIL: builder container missing after setup" >&2; exit 1; }
+  [ "$cimg" = "$imgid" ] || {
+    echo "PREPARE FAIL: builder container image $cimg != recorded image id $imgid" >&2; exit 1; }
+  echo "CONTAINER IMAGE MATCH OK: termux-package-builder <- $cimg"
   # --- free-space replacement (runner-safe subset) ---------------------
   # Upstream scripts/free-space.sh (pin de1dd3d1) contains
   #   sudo rm -rf /opt/ghc /opt/az /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache

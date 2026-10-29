@@ -394,6 +394,12 @@ gates_block = wf[wf.index("name: Package gates"):wf.index("name: Emit outputs")]
 ok("T26 reuse skips compile but gates stay (never conditioned on reuse)",
    "reused != '1'" in build_block and "reused" not in gates_block
    and "if: inputs.docker_smoke_only != true" in gates_block)
+ok("T28 image id recorded by prepare BEFORE content-store cleanup; no post-cleanup image inspect; drift check via live container",
+   0 < ci_txt.index("BUILDER IMAGE ID=") < ci_txt.index("free-space replacement")
+   and '.builder-image-id' in ci_txt
+   and "docker inspect -f '{{.Image}}' termux-package-builder" in ci_txt
+   and "docker image inspect" not in wf[wf.index("- name: Prepare Termux builder"):]
+   and "docker inspect -f '{{.Image}}' termux-package-builder" in wf)
 debkey_block = wf[pos_fk:pos_rd]
 ok("T27 smoke-only skips key+reuse chain; reuse default OFF; key step opt-in-only",
    "if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true" in debkey_block
