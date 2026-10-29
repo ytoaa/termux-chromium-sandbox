@@ -651,5 +651,20 @@ bad = [p for p in L4ROOT.rglob("*") if p.is_file() and "__" in p.name
 ok("T40 concurrent collect: both succeed, every entry stays self-consistent (atomic tmp+mv)",
    rc1 == 0 and rc2 == 0 and not bad, [str(b) for b in bad][:3])
 
+# ---------- T41: L4 adapter in the recipe clone (tarball preservation) ----
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("prepare_recipe", ROOT / "port" / "prepare_recipe.py")
+_pr = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_pr)
+_raw = (HERE / "fixtures" / "real_chromium_build_sh_2af83c3").read_text()
+_keep, _notes = _pr.preserve_source_cache(_raw)
+ok("T41a clone preserves the sha256-declared chromium tarball (upstream rm -f neutralized, exactly one line changed)",
+   'rm -f "$TERMUX_PKG_CACHEDIR/chromium-$TERMUX_PKG_VERSION-linux.tar.xz"' not in _keep
+   and "tarball kept for the L4 source cache" in _keep
+   and sum(1 for a, b in zip(_raw.splitlines(), _keep.splitlines()) if a != b) == 1
+   and len(_raw.splitlines()) == len(_keep.splitlines()), _notes)
+_k2, _n2 = _pr.preserve_source_cache(_keep)
+ok("T41b absence tolerated (no-op + note), idempotent", _k2 == _keep and any("not found" in n for n in _n2), _n2)
+
 print(f"\nCACHE-LAYERS PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)
