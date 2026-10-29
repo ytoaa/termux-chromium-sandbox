@@ -488,7 +488,10 @@ exec "$_p/chromium-launcher.sh" "$@"
   wg_refuse() { if TCS_PREFIX=$t/pfx PREFIX= bash "$SELF" _internal_guard "$1"; then
                   echo "[selftest] wrapper-guard BYPASSED by $1"; rc=1
                 else echo "[selftest] wrapper-guard refuses $1 ok"; fi; }
-  wg_allow()  { if ! TCS_PREFIX=$t/pfx PREFIX= bash "$SELF" _internal_guard "$1"; then
+  # Audit round (DESIGN Round 25): installed-mode now requires PREFIX to
+  # match the installed root (empty PREFIX execs the DEFAULT install —
+  # mixed identity, refused; pinned by the dedicated case above).
+  wg_allow()  { if ! TCS_PREFIX=$t/pfx PREFIX=${2:-$t/pfx} bash "$SELF" _internal_guard "$1"; then
                   echo "[selftest] wrapper-guard WRONGLY refused $1"; rc=1
                 else echo "[selftest] wrapper-guard allows $1 ok"; fi; }
   wg_refuse "$t/ex/chromium-shield-wrapper.sh"
