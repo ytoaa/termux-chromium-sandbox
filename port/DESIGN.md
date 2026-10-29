@@ -1647,3 +1647,46 @@ sensitivity + fail-closed; T31 deb_key reproducibility on the
 fingerprint; T32 no direct containerd/docker storage deletion +
 `docker image prune -f` present. T24/T28 updated for the two-file
 record. Suite 51 checks; full port suite 60/60.
+
+## Round 24 — L4: 지속 검증 소스 캐시 (perf/ci-source-cache, PR #24 후속)
+
+배경(A/B): PR #24 GO 이후 잔여 위험(R12 보고서 §N)이 실측으로 확인되었다.
+pinned de1dd3d1에서 소스 tarball은 `termux_step_setup_variables.sh:118`의
+`TERMUX_PKG_CACHEDIR=$TERMUX_TOPDIR/<pkg>/cache`로, arch-independent .deb는
+`$TERMUX_TOPDIR/_cache-all`로 내려받히며, 둘 다 컨테이너 overlay에만 존재해
+컨테이너 재생성 시 소실된다(L1 바인드는 `_cache-aarch64` 리프만 마운트).
+콜드 풀빌드 2건(fp-cold-full.log, keybuild2-full.log)의 다운로드 URL 목록은
+완전 동일(53건, ~2.19 GB) — 매 실행이 같은 파일을 다시 내리는 것이 반복 비용의
+정체다. ffmpeg.org curl(28)/(35)로 빌드가 사망한 40834221022가 실질 장애 사례.
+
+설계(C): upstream 방식 위에 최소 어댑터 — 스크립트 수정 없이 ci.sh 함수 2개
+(`source-cache-restore`/`source-cache-collect`)와 전용 바인드
+`.termux-srccache`(/home/builder/.termux-srccache, 이미지 레이어에서
+builder 소유 사전 생성 — Round 21 바인드-부모 교훈 준용).
+신뢰 모델은 3중 fail-closed:
+  1) 저장 게이트 — 파일 sha256 ∈ T. T = termux-packages 모든 */build.sh의
+     64-hex 선언 해시 ∪ 매 실행 GPG 검증되는 `<repo>-json` 인덱스의
+     SHA256SUM 값. SKIP_CHECKSUM/빈 SHA256 파일은 T에 진입 불가 → 영속
+     캐시에 무조건 미수용. 항목은 `<sha12>__<인코딩 이름>` 내용주소 저장
+     (동일 basename·상이한 해시 공존, 버전 변경 보존).
+  2) 복원 게이트 — 이름의 sha12 재계산 일치분만 tmp+원자 mv로 복사, 불일치
+     격리 삭제, 기존 타깃 절대 덮어쓰지 않음.
+  3) 빌드 게이트(upstream 무변경) — termux_download이 사용 시점에 레시피/
+     인덱스 체크섬으로 재검증, 불일치 시 재다운로드. 캐시 오염의 최악 결과는
+     재다운로드일 뿐이며 검증 우회는 구조적으로 불가능.
+Packages.gz 기반 ubuntu deb(mesa hostbuild)와 elf-cleaner은 선언 해시 집합이
+없어 v1에서 의도적 미포함(문서화 잔여 위험). `.termux-build`/`_cache` 통째
+바인드는 하지 않는다(host-tool 경로 보호, Round 21 불변).
+
+성능(D/I): DEB 재사용(4.4 min) 경로는 L4 스텝이 `reused != '1'` 게이트로
+전부 스킵 — 캐시 IO 0. 미스 시에만 ~2.3 GB 복원(콜드 빌드 90분 대비 분 단위),
+완전 워밍 시 collect new=0 → save 스킵으로 재업로드 없음. 저장 용량은
+cap(기본 6 GB, 실측 ~2.3 GB 대비 여유)+연령(45일) prune로 유계.
+save-gate(has_new)로 빈 캐시 승진 차단(Round 21 가드 철학 동일).
+
+검증(E): 캐시 스위트 T33a–j/T34a–i/T40 추가(72 checks) — cold/warm 바이트
+동일 + warm 무망(죽은 포트에서도 termux_download 즉시 return), 손상 격리,
+동일 basename/상이한 sha 공존, 미선언 해시 미수용, 인덱스 파일 제외,
+크기/연령 prune, 경로 가드, 동시 collect 원자성(이 테스트가 실제 경합을
+발견 → 스크립트 게시도 tmp+mv로 원자화), DEB-키 코어( deb_key,
+deb_reuse_*, image_fingerprint)가 9ecb6e3과 바이트 동일함을 git show로 검증.

@@ -212,12 +212,28 @@ jobs:
           else
             echo "reused=0" >> "$GITHUB_OUTPUT"
           fi
+      # Layer 4: persistent VERIFIED source cache (upstream tarballs in
+      # ~/.termux-build/<pkg>/cache + arch-independent debs in _cache-all).
+      # Restore is pointless when the completed DEB is reused (no build, no
+      # downloads) — gate identical to the build step, so the proven 4.4-min
+      # REUSED=1 path performs ZERO extra cache IO.
+      - name: Restore source cache (L4)
+        if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: termux-packages/.termux-srccache
+          key: chromium-srccache-aarch64-v1-${{ github.run_id }}
+          restore-keys: chromium-srccache-aarch64-v1-
+      - name: Seed source cache into container (L4)
+        if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
+        run: bash port/ci.sh source-cache-restore "$PWD/termux-packages"
       # docker_smoke_only = infrastructure validation run (real-Docker
       # permission smoke, preflight, cache restore/save paths). Compile,
       # artifact gates and deb-reuse are meaningless without a package and
       # are skipped THERE ONLY; every normal run executes the security
       # package gates unconditionally (reused or built — never bypassed).
       - name: Build chromium-sandboxed (port hook runs at post_get_source)
+        id: build
         if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
         env:
           EXPECTED_IMAGE_ID: ${{ steps.debkey.outputs.image_id }}
@@ -238,6 +254,20 @@ jobs:
             echo "IMAGE MATCH OK: container <- $actual"
           fi
           bash port/ci.sh build "$PWD/termux-packages"
+      # Collect VERIFIED source files into the L4 host dir (bind-mounted
+      # .termux-srccache). Bookkeeping only: NEVER fails the pipeline —
+      # save-gate reads its has_new output; on any error has_new=0 and the
+      # run behaves exactly as before L4 existed.
+      - name: Collect source cache (L4)
+        id: srccollect
+        if: ${{ !cancelled() && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1' && steps.build.outcome != 'skipped' }}
+        run: |
+          set -uo pipefail
+          out=$(bash port/ci.sh source-cache-collect "$PWD/termux-packages" 2>&1) && rc=0 || rc=$?
+          printf '%s\n' "$out"
+          new=$(printf '%s' "$out" | sed -n 's/^L4 COLLECT new=\([0-9]\{1,\}\).*/\1/p' | tail -1)
+          if [ "${rc:-1}" -ne 0 ] || [ -z "$new" ]; then new=0; fi
+          if [ "$new" -gt 0 ]; then echo "has_new=1" >> "$GITHUB_OUTPUT"; else echo "has_new=0" >> "$GITHUB_OUTPUT"; fi
       - name: Package gates (separate identity, port applied)
         if: inputs.docker_smoke_only != true
         run: |
@@ -328,6 +358,16 @@ jobs:
         with:
           path: termux-packages/.sccache
           key: chromium-sccache-aarch64-${{ steps.keys.outputs.base }}-${{ github.run_id }}
+      # Save only when collect actually ADDED verified files (has_new=1):
+      # a fully warm run re-uploads nothing, and a failed early run cannot
+      # promote an empty/partial L4 archive over healthy prefix restores
+      # (same guard philosophy as the sccache save-guard above).
+      - name: Save source cache (L4)
+        if: always() && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1' && steps.srccollect.outputs.has_new == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: termux-packages/.termux-srccache
+          key: chromium-srccache-aarch64-v1-${{ github.run_id }}
       # The completed workflow_run payload does NOT reliably expose the
       # workflow_dispatch inputs. Bind the caller's publish consent to
       # the build artifact itself; never infer consent from a missing field.

@@ -15,7 +15,7 @@ need_termux_dir() {
 run_docker() { local d="$1"; shift; ( cd "$d" && ./scripts/run-docker.sh "$@" ); }
 
 # --- cache-layer helpers ---------------------------------------------------
-# Bind-mount BOTH caches into the builder container:
+# Bind-mount ALL caches into the builder container:
 #   .sccache            -> /home/builder/.cache/sccache           (Layer 2)
 #   .termux-depcache/aarch64 -> /home/builder/.termux-build/_cache-aarch64
 #                          (Layer 1: termux_download content-addressed
@@ -27,10 +27,21 @@ run_docker() { local d="$1"; shift; ( cd "$d" && ./scripts/run-docker.sh "$@" );
 #                           sha256-checked by termux_download on every use,
 #                           so a corrupted/version-mismatched cache entry is
 #                           transparently re-downloaded.)
+#   .termux-srccache    -> /home/builder/.termux-srccache        (Layer 4:
+#                          content-addressed persistent cache for VERIFIED
+#                          upstream source tarballs (TERMUX_PKG_CACHEDIR =
+#                          ~/.termux-build/<pkg>/cache) and arch-independent
+#                          termux .deb files (~/.termux-build/_cache-all).
+#                          Both live on the container overlay otherwise and
+#                          were re-downloaded EVERY run (53 files / ~2.19 GB
+#                          per full build, identical URL list in
+#                          fp-cold-full.log and keybuild2-full.log); run
+#                          40834221022 died on a transient ffmpeg.org
+#                          curl(28)/(35) outage. See source_cache_* below.)
 docker_volume_args() {
   local d="$1"
-  mkdir -p "$d/.sccache" "$d/.termux-depcache/aarch64"
-  echo "--volume $d/.sccache:/home/builder/.cache/sccache --volume $d/.termux-depcache/aarch64:/home/builder/.termux-build/_cache-aarch64"
+  mkdir -p "$d/.sccache" "$d/.termux-depcache/aarch64" "$d/.termux-srccache"
+  echo "--volume $d/.sccache:/home/builder/.cache/sccache --volume $d/.termux-depcache/aarch64:/home/builder/.termux-build/_cache-aarch64 --volume $d/.termux-srccache:/home/builder/.termux-srccache"
 }
 
 docker_perms_smoke() {
@@ -51,11 +62,12 @@ docker_perms_smoke() {
   run_docker "$d" bash -lc '
     set -euo pipefail
     echo "SMOKE uid=$(id -u) gid=$(id -g) user=$(id -un)"
-    grep -E "termux-build/_cache-aarch64|cache/sccache" /proc/mounts >/dev/null \
+    grep -E "termux-build/_cache-aarch64|cache/sccache|\.termux-srccache" /proc/mounts >/dev/null \
       || { echo "SMOKE FAIL: expected bind mounts absent from /proc/mounts"; exit 1; }
     echo "SMOKE ownership evidence:"
     ls -ld /home/builder /home/builder/.cache /home/builder/.cache/sccache \
-           /home/builder/.termux-build /home/builder/.termux-build/_cache-aarch64
+           /home/builder/.termux-build /home/builder/.termux-build/_cache-aarch64 \
+           /home/builder/.termux-srccache
     b=/home/builder/.termux-build/smoke-$$
     mkdir -p "$b/sub"
     echo payload > "$b/sub/f"
@@ -72,6 +84,9 @@ docker_perms_smoke() {
     fi
     s=/home/builder/.cache/sccache
     echo w > "$s/.smoke-write" && rm "$s/.smoke-write"
+    r=/home/builder/.termux-srccache
+    echo w > "$r/.smoke-write" && rm "$r/.smoke-write" \
+      || { echo "SMOKE FAIL: srccache leaf not writable"; exit 1; }
     echo "SMOKE OK"'
 }
 
@@ -98,6 +113,206 @@ dep_cache_prune() {
     done
   fi
   echo "DEPCACHE size: $(du -sh "$root" 2>/dev/null | cut -f1)"
+}
+
+# ---- Layer 4: persistent VERIFIED source cache -----------------------------
+# Closes the residual risk documented in REPORT-PR24-FINAL-AO.md §N: termux
+# source tarballs (TERMUX_PKG_CACHEDIR=$TERMUX_TOPDIR/<pkg>/cache, see
+# scripts/build/termux_step_setup_variables.sh:118 @ de1dd3d1) and
+# arch-independent .deb files ($TERMUX_TOPDIR/_cache-all) sit on the
+# container OVERLAY (only _cache-aarch64 is bind-mounted), so every full
+# build re-downloads ~2.19 GB / 53 files (identical URL lists in
+# fp-cold-full.log vs keybuild2-full.log) and a transient upstream outage
+# (ffmpeg.org curl 28/35, run 40834221022) kills the build.
+# TRUST MODEL — integrity is never relaxed, only repeated network fetch is
+# eliminated (fail-closed in three independent layers):
+#   SAVE gate: a file enters L4 only if its sha256 is ∈ the trust set T =
+#     (a) every 64-hex checksum declared in termux-packages */build.sh
+#         (TERMUX_PKG_SHA256 etc.), union
+#     (b) SHA256SUM values from the <repo>-json index maps that
+#         termux_get_repo_files.sh downloads and GPG-verifies (via
+#         Release) EVERY run. Files fetched WITHOUT a checksum
+#         (SKIP_CHECKSUM / empty TERMUX_PKG_SHA256, see
+#         get_source/termux_download_src_archive.sh:10-14) can never be in
+#         T, so unverified content is NEVER persisted. Entries are stored
+#         content-addressed as <sha12>__<urlencoded-name>.
+#   RESTORE gate: entry is copied only after re-hashing it and matching the
+#         sha12 in its own name (mismatch => quarantine = delete), via a
+#         tmp file + atomic mv, and never over an existing target.
+#   BUILD gate (upstream, untouched): termux_download.sh:30-35 keeps an
+#         existing cache file ONLY if it matches the recipe/index checksum
+#         and otherwise re-downloads; so even a fully corrupted or poisoned
+#         L4 can only cause a re-download — never unverified input.
+# Ubuntu-Packages.gz debs (mesa hostbuild) and the elf-cleaner binary are
+# downloaded WITHOUT a build.sh-declared checksum set and are deliberately
+# NOT persisted in v1 (documented residual risk; small, official hosts).
+# No new bind of .termux-build/_cache itself (PR #24 host-tool protection
+# intact); L4 uses its own neutral mount, pre-created builder-owned in the
+# image layer exactly like _cache-aarch64.
+
+_l4_write_scripts() {
+  # Generate the two IN-CONTAINER scripts into the termux-packages workspace
+  # (bind-mounted as /home/builder/termux-packages, same mechanism as the
+  # proven .r12-sccache-profile.sh). Container paths are overridable ONLY
+  # for the local test harness; production uses the defaults.
+  local d="$1"
+  # ATOMIC publish (tmp+mv): two concurrent collect calls must never make
+  # bash execute a half-written script (race caught by cache test T40).
+  cat > "$d/.l4-restore.sh.$$.tmp" <<'L4RESTORE'
+#!/usr/bin/env bash
+# L4 restore: verified content-addressed entries -> termux cache dirs.
+# MUST NEVER fail a build: unguarded errors exit 0; upstream still
+# re-verifies every restored byte against its own checksum on use.
+L4="${TERMUX_L4_ROOT:-/home/builder/.termux-srccache}"
+TOP="${TERMUX_L4_TOPDIR:-/home/builder/.termux-build}"
+restored=0 present=0 quarantined=0 badname=0
+case "$L4" in */.termux-srccache) ;; *) echo "L4 RESTORE SKIP: unexpected root '$L4'"; exit 0 ;; esac
+[ -d "$L4" ] || { echo "L4 RESTORE cold: no $L4"; exit 0; }
+l4_decode() { local s="$1"; s=${s//%2F//}; s=${s//%25/%}; printf '%s' "$s"; }
+l4_restore_one() { # $1=entry file, $2=target dir, $3=decoded relname
+  local ent="$1" dir="$2" name="$3" tgt tmp have b
+  tgt="$dir/$name"
+  if [ -e "$tgt" ]; then present=$((present+1)); return 0; fi
+  mkdir -p "$(dirname "$tgt")" 2>/dev/null || { echo "L4 RESTORE WARN: mkdir $dir failed"; return 0; }
+  tmp="$dir/.l4.$$.tmp"
+  cp -p -- "$ent" "$tmp" 2>/dev/null || { rm -f -- "$tmp"; echo "L4 RESTORE WARN: copy $ent failed"; return 0; }
+  b=${ent##*/}
+  have=$(sha256sum "$tmp" 2>/dev/null | cut -c1-12)
+  if [ "$have" != "${b%%__*}" ]; then
+    rm -f -- "$tmp" "$ent"; quarantined=$((quarantined+1))
+    echo "L4 RESTORE quarantine (sha mismatch): $b"
+    return 0
+  fi
+  mv -f -- "$tmp" "$tgt" 2>/dev/null || { rm -f -- "$tmp"; echo "L4 RESTORE WARN: mv $tgt failed"; return 0; }
+  restored=$((restored+1))
+}
+if [ -d "$L4/pkgs" ]; then
+  while IFS= read -r -d '' ent; do
+    base=${ent##*/}; pkg=${ent%/"$base"}; pkg=${pkg##*/}
+    sha12=${base%%__*}; name=${base#*__}
+    case "$sha12" in *[!0-9a-f]*) badname=$((badname+1)); rm -f -- "$ent"; continue ;; esac
+    [ "${#sha12}" -eq 12 ] && [ "$name" != "$base" ] || { badname=$((badname+1)); rm -f -- "$ent"; continue; }
+    case "$pkg" in _cache*|tmp-checkout*|.*) badname=$((badname+1)); rm -f -- "$ent"; continue ;; esac
+    l4_restore_one "$ent" "$TOP/$pkg/cache" "$(l4_decode "$name")"
+  done < <(find "$L4/pkgs" -mindepth 2 -maxdepth 2 -type f ! -name '.l4.*' ! -name '.has-new' -print0 2>/dev/null)
+fi
+if [ -d "$L4/deb-all" ]; then
+  while IFS= read -r -d '' ent; do
+    base=${ent##*/}
+    rel=${base#*__}; sha12=${base%%__*}
+    [ "$rel" != "$base" ] || { badname=$((badname+1)); rm -f -- "$ent"; continue; }
+    case "$sha12" in *[!0-9a-f]*) badname=$((badname+1)); rm -f -- "$ent"; continue ;; esac
+    [ "${#sha12}" -eq 12 ] || { badname=$((badname+1)); rm -f -- "$ent"; continue; }
+    case "$rel" in *Packages*|*-json|*.l4tmp*) badname=$((badname+1)); rm -f -- "$ent"; continue ;; esac
+    l4_restore_one "$ent" "$TOP/_cache-all" "$(l4_decode "$rel")"
+  done < <(find "$L4/deb-all" -mindepth 1 -type f ! -name '.l4.*' ! -name '.has-new' -print0 2>/dev/null)
+fi
+echo "L4 RESTORE restored=$restored present=$present quarantined=$quarantined badname=$badname"
+exit 0
+L4RESTORE
+  cat > "$d/.l4-collect.sh.$$.tmp" <<'L4COLLECT'
+#!/usr/bin/env bash
+# L4 collect: persist files whose sha256 is VERIFIED by a trusted
+# declaration (build.sh checksums or GPG-anchored repo index SHA256SUM).
+# Anything without such a declaration (SKIP_CHECKSUM / empty SHA256 /
+# unindexed file) is counted as unverified and NEVER written.
+L4="${TERMUX_L4_ROOT:-/home/builder/.termux-srccache}"
+TOP="${TERMUX_L4_TOPDIR:-/home/builder/.termux-build}"
+TP="${TERMUX_L4_TP:-/home/builder/termux-packages}"
+CAP_MB="${TERMUX_SRCCACHE_CAP_MB:-6144}"
+AGE_DAYS="${TERMUX_SRCCACHE_AGE_DAYS:-45}"
+FCAP_MB="${TERMUX_SRCCACHE_FILE_CAP_MB:-4096}"
+case "$L4" in */.termux-srccache) ;; *) echo "L4 COLLECT SKIP: unexpected root '$L4'"; exit 0 ;; esac
+mkdir -p "$L4" 2>/dev/null || { echo "L4 COLLECT WARN: cannot create $L4"; exit 0; }
+l4_encode() { local s="$1"; s=${s//%/%25}; s=${s//\//%2F}; printf '%s' "$s"; }
+tset=$(mktemp) || exit 0; jset=$(mktemp) || { rm -f "$tset"; exit 0; }
+allset=$(mktemp) || { rm -f "$tset" "$jset"; exit 0; }
+# (a) checksums declared in recipes: TERMUX_PKG_SHA256=..., inline
+# termux_download ... <sha>, arrays — any 64-hex token in any */build.sh.
+find "$TP" -mindepth 3 -maxdepth 3 -name build.sh -type f -print0 2>/dev/null \
+  | xargs -0 grep -hoE '[0-9a-f]{64}' 2>/dev/null | sort -u > "$tset" || true
+# (b) SHA256SUM values from GPG-verified repo index maps (downloaded and
+# gpg --verified EVERY run by termux_get_repo_files.sh).
+for j in "$TOP"/_cache-all/*-json "$TOP"/_cache-aarch64/*-json; do
+  [ -f "$j" ] || continue
+  jq -r '.[].SHA256SUM // empty' "$j" 2>/dev/null | grep -E '^[0-9a-f]{64}$' >> "$jset" || true
+done
+sort -u "$tset" "$jset" > "$allset" 2>/dev/null || true
+new=0 bytes=0 kept=0 unverified=0
+l4_accept() { # $1=src file, $2=namespace dir, $3=relpath inside namespace
+  local f="$1" ns="$2" rel="$3" sz sha ent tmp enc
+  sz=$(stat -c %s -- "$f" 2>/dev/null || echo 0)
+  [ "$sz" -gt 0 ] || return 0
+  [ "$sz" -le $((FCAP_MB*1024*1024)) ] || { echo "L4 COLLECT skip-toobig: $rel ($sz)"; return 0; }
+  sha=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+  [ -n "$sha" ] || return 0
+  grep -qx "$sha" "$allset" || { unverified=$((unverified+1)); return 0; }
+  enc=$(l4_encode "$rel")
+  ent="$ns/${sha:0:12}__$enc"
+  if [ -e "$ent" ]; then kept=$((kept+1)); return 0; fi
+  mkdir -p "$ns" 2>/dev/null || return 0
+  tmp="$ent.l4tmp.$$"
+  cp -p -- "$f" "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 0; }
+  if [ "$(sha256sum "$tmp" 2>/dev/null | cut -d' ' -f1)" != "$sha" ]; then
+    rm -f -- "$tmp"; echo "L4 COLLECT WARN: copy corrupted, dropped $rel"; return 0
+  fi
+  mv -f -- "$tmp" "$ent" 2>/dev/null || { rm -f -- "$tmp"; return 0; }
+  new=$((new+1)); bytes=$((bytes+sz))
+}
+if [ -d "$TOP" ]; then
+  for pkgd in "$TOP"/*/cache; do
+    [ -d "$pkgd" ] || continue
+    pkg=${pkgd%/cache}; pkg=${pkg##*/}
+    case "$pkg" in _cache*|tmp-checkout*|.*) continue ;; esac
+    while IFS= read -r -d '' f; do
+      l4_accept "$f" "$L4/pkgs/$pkg" "${f##*/}"
+    done < <(find "$pkgd" -mindepth 1 -maxdepth 1 -type f ! -name '.l4.*' ! -name 'download.*' ! -name '*.l4tmp.*' -print0 2>/dev/null)
+  done
+  if [ -d "$TOP/_cache-all" ]; then
+    while IFS= read -r -d '' f; do
+      rel=${f#"$TOP"/_cache-all/}
+      case "$rel" in *-json|*Packages*|*.l4tmp.*|.*) continue ;; esac
+      l4_accept "$f" "$L4/deb-all" "$rel"
+    done < <(find "$TOP/_cache-all" -mindepth 1 -type f -print0 2>/dev/null)
+  fi
+fi
+# Bounded store: age first, then oldest-first to the size cap (same policy
+# shape as the proven dep-cache prune; touches ONLY this namespace).
+find "$L4" -type f -mtime "+$AGE_DAYS" -delete 2>/dev/null || true
+total=$(du -sb "$L4" 2>/dev/null | cut -f1); total=${total:-0}
+if [ "$total" -gt $((CAP_MB*1024*1024)) ]; then
+  echo "L4 COLLECT over cap ($total > $((CAP_MB*1024*1024))); pruning oldest first"
+  find "$L4" -type f ! -name '.has-new' -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2- | \
+  while IFS= read -r f; do
+    total=$(du -sb "$L4" | cut -f1)
+    [ "$total" -le $((CAP_MB*1024*1024)) ] && break
+    rm -f -- "$f"
+  done
+fi
+total=$(du -sb "$L4" 2>/dev/null | cut -f1); total=${total:-0}
+if [ "$new" -gt 0 ]; then printf '1' > "$L4/.has-new" 2>/dev/null || true; else rm -f -- "$L4/.has-new" 2>/dev/null || true; fi
+echo "L4 COLLECT new=$new bytes=$bytes kept=$kept unverified=$unverified total_bytes=$total"
+exit 0
+L4COLLECT
+  chmod 644 "$d/.l4-restore.sh.$$.tmp" "$d/.l4-collect.sh.$$.tmp"
+  mv -f "$d/.l4-restore.sh.$$.tmp" "$d/.l4-restore.sh"
+  mv -f "$d/.l4-collect.sh.$$.tmp" "$d/.l4-collect.sh"
+}
+
+source_cache_restore() {
+  local d
+  d="$(need_termux_dir "${1:?usage: ci.sh source-cache-restore <termux-packages>}")"
+  _l4_write_scripts "$d"
+  export TERMUX_DOCKER_RUN_EXTRA_ARGS="$(docker_volume_args "$d")"
+  run_docker "$d" bash ./.l4-restore.sh
+}
+
+source_cache_collect() {
+  local d
+  d="$(need_termux_dir "${1:?usage: ci.sh source-cache-collect <termux-packages>}")"
+  _l4_write_scripts "$d"
+  export TERMUX_DOCKER_RUN_EXTRA_ARGS="$(docker_volume_args "$d")"
+  run_docker "$d" bash ./.l4-collect.sh
 }
 
 # Layer 6: bounded pre-build connectivity probe against OFFICIAL termux
@@ -397,8 +612,8 @@ RUN apt-get update \
     && apt-get install -yq --no-install-recommends sccache python3 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /home/builder/.termux-build/_cache-aarch64 /home/builder/.cache/sccache \
-    && chown -R builder:builder /home/builder/.termux-build /home/builder/.cache/sccache
+    && mkdir -p /home/builder/.termux-build/_cache-aarch64 /home/builder/.cache/sccache /home/builder/.termux-srccache \
+    && chown -R builder:builder /home/builder/.termux-build /home/builder/.cache/sccache /home/builder/.termux-srccache
 USER builder:builder
 WORKDIR /home/builder/termux-packages
 DOCKERFILE
@@ -628,6 +843,8 @@ case "$cmd" in
   docker-perms-smoke)    docker_perms_smoke "${2:?usage: ci.sh docker-perms-smoke <termux-packages>}" ;;
   build)                  build_chromium "${2:?usage: ci.sh build <termux-packages>}" ;;
   dep-cache-prune)     dep_cache_prune "${2:?usage: ci.sh dep-cache-prune <termux-packages>}" ;;
+  source-cache-restore) source_cache_restore "${2:?usage: ci.sh source-cache-restore <termux-packages>}" ;;
+  source-cache-collect) source_cache_collect "${2:?usage: ci.sh source-cache-collect <termux-packages>}" ;;
   download-preflight)  download_preflight "${2:?usage: ci.sh download-preflight <termux-packages>}" ;;
   deb-key)             deb_key "${2:?usage: ci.sh deb-key <termux-packages>}" ;;
   image-fingerprint)   image_fingerprint "${2:?}" "${3:?}" "${4:?}" ;;
@@ -638,7 +855,7 @@ case "$cmd" in
     gh api --method GET "repos/termux/termux-packages/commits/${2:-master}" --jq .sha
     ;;
   *)
-    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | prepare-zram-workspace <tp> | prepare-builder <tp> | docker-perms-smoke <tp> | image-fingerprint <base> <pkgs> <dockerfile> | build <tp> | dep-cache-prune <tp> | download-preflight <tp> | deb-key <tp> | deb-reuse-verify <tp> | deb-reuse-save <tp> | resolve-ref [ref]" >&2
+    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | prepare-zram-workspace <tp> | prepare-builder <tp> | docker-perms-smoke <tp> | image-fingerprint <base> <pkgs> <dockerfile> | build <tp> | dep-cache-prune <tp> | source-cache-restore <tp> | source-cache-collect <tp> | download-preflight <tp> | deb-key <tp> | deb-reuse-verify <tp> | deb-reuse-save <tp> | resolve-ref [ref]" >&2
     exit 2
     ;;
 esac
