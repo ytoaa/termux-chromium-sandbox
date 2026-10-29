@@ -384,7 +384,7 @@ pos_rd   = pos(r"- name: Restore cached completed deb")
 keys_block = wf[pos_keys:pos_pf] if 0 < pos_keys < pos_pf else ""
 ok("T24 DEB key computed AFTER preflight + prepare-builder, BEFORE deb restore; keys step has no deb-key",
    0 < pos_pf < pos_pb < pos_fk < pos_rd and "deb-key" not in keys_block
-   and "TERMUX_BUILDER_IMAGE_ID=\"$imgid\"" in wf[pos_fk:pos_rd],
+   and "TERMUX_BUILDER_IMAGE_ID=\"$imgfp\"" in wf[pos_fk:pos_rd],
    f"{pos_pf},{pos_pb},{pos_fk},{pos_rd}")
 ok("T25 restore/verify/save all reference the ONE final key + build checks image drift",
    wf.count("steps.debkey.outputs.debkey") == 4
@@ -394,12 +394,59 @@ gates_block = wf[wf.index("name: Package gates"):wf.index("name: Emit outputs")]
 ok("T26 reuse skips compile but gates stay (never conditioned on reuse)",
    "reused != '1'" in build_block and "reused" not in gates_block
    and "if: inputs.docker_smoke_only != true" in gates_block)
-ok("T28 image id recorded by prepare BEFORE content-store cleanup; no post-cleanup image inspect; drift check via live container",
-   0 < ci_txt.index("BUILDER IMAGE ID=") < ci_txt.index("free-space replacement")
-   and '.builder-image-id' in ci_txt
+ok("T28 identity recorded by prepare BEFORE cleanup; no post-cleanup image inspect; drift via live container",
+   0 < ci_txt.index("BUILDER IMAGE ID(raw)=") < ci_txt.index("free-space replacement")
+   and '.builder-image-id' in ci_txt and '.builder-image-raw' in ci_txt
    and "docker inspect -f '{{.Image}}' termux-package-builder" in ci_txt
    and "docker image inspect" not in wf[wf.index("- name: Prepare Termux builder"):]
    and "docker inspect -f '{{.Image}}' termux-package-builder" in wf)
+# T30: image_fingerprint() FUNCTIONAL determinism + component sensitivity
+import hashlib as _h
+fp_w = W / "fp" ; fp_w.mkdir(exist_ok=True)
+(fp_w / "pkgs").write_text("coreutils 9.1\npython3 3.14.4-1\nsccache 0.13.0-1\n")
+(fp_w / "Dockerfile").write_text("FROM x\nRUN true\n")
+def fpr(base="sha256:"+"c"*64, pkgs=str(fp_w/"pkgs"), dfk=str(fp_w/"Dockerfile")):
+    r = run(["bash", str(CI), "image-fingerprint", base, pkgs, dfk])
+    return (r.returncode, r.stdout.strip(), r.stderr)
+rc0, fp_a, _ = fpr(); rc0b, fp_a2, _ = fpr()
+ok("T30a same base+packages+dockerfile -> identical fingerprint (rebuild-stable)",
+   rc0 == 0 and fp_a == fp_a2 and re.fullmatch(r"[0-9a-f]{64}", fp_a) is not None, fp_a)
+_, fp_pkg, _ = fpr(pkgs=None) if False else (0,"","") 
+(fp_w / "pkgs2").write_text("coreutils 9.1\npython3 3.14.4-1\nsccache 0.14.0-1\n")  # apt update scenario
+_, fp_b, _ = fpr(pkgs=str(fp_w/"pkgs2"))
+ok("T30b package version change (apt update) -> fingerprint change", fp_b != fp_a, fp_b)
+_, fp_c, _ = fpr(base="sha256:"+"d"*64)
+ok("T30c base image change -> fingerprint change", fp_c != fp_a, fp_c)
+(fp_w / "Dockerfile").write_text("FROM x\nRUN true\nRUN date\n")
+_, fp_d, _ = fpr()
+ok("T30d Dockerfile change -> fingerprint change", fp_d != fp_a, fp_d)
+re_ = run(["bash", str(CI), "image-fingerprint", "", str(fp_w/"pkgs"), str(fp_w/"Dockerfile")])
+ok("T30e missing component -> fail-closed", re_.returncode != 0 and ("IMAGE FINGERPRINT FAIL" in (re_.stdout + re_.stderr) or "parameter null or not set" in (re_.stdout + re_.stderr)), (re_.stdout + re_.stderr)[:120])
+# T31: deb_key consumes the fingerprint end-to-end (function-executed)
+tpf1 = W / "tp-fp"
+(tpf1 / "scripts").mkdir(parents=True, exist_ok=True)
+(tpf1 / "build-package.sh").write_text("#!/bin/sh\ntrue\n"); (tpf1 / "scripts" / "run-docker.sh").write_text("#!/bin/sh\ntrue\n")
+(tpf1 / "build-package.sh").chmod(0o755); (tpf1 / "scripts" / "run-docker.sh").chmod(0o755)
+(tpf1 / "repo.json").write_text(repo_orig)
+(tpf1 / "packages" / "chromium").mkdir(parents=True, exist_ok=True)
+(tpf1 / "packages" / "chromium" / "build.sh").write_text('TERMUX_PKG_VERSION="156.0.8078.47"\n')
+(tpf1 / "packages" / "chromium-sandboxed").mkdir(parents=True, exist_ok=True)
+(tpf1 / "packages" / "chromium-sandboxed" / "build.sh").write_text('TERMUX_PKG_VERSION="156.0.8078.47"\n')
+subprocess.run(["git","-C",str(tpf1),"init","-q"],check=True)
+subprocess.run(["git","-C",str(tpf1),"-c","user.email=t@t","-c","user.name=t","add","-A"],check=True)
+subprocess.run(["git","-C",str(tpf1),"-c","user.email=t@t","-c","user.name=t","commit","-qm","fp"],check=True)
+envfp = dict(os.environ, TERMUX_SANDBOXED_REVISION="12")
+fp1 = fpr()[1]
+k_fp1 = run(["bash", str(CI), "deb-key", str(tpf1)], env=dict(envfp, TERMUX_BUILDER_IMAGE_ID=fp1)).stdout.strip().splitlines()[-1]
+k_fp2 = run(["bash", str(CI), "deb-key", str(tpf1)], env=dict(envfp, TERMUX_BUILDER_IMAGE_ID=fp_b)).stdout.strip().splitlines()[-1]
+k_fp3 = run(["bash", str(CI), "deb-key", str(tpf1)], env=dict(envfp, TERMUX_BUILDER_IMAGE_ID=fp1)).stdout.strip().splitlines()[-1]
+ok("T31 deb_key reproducibility on fingerprint (same fp -> same key; changed fp -> new key)",
+   k_fp1 == k_fp3 and k_fp1 != k_fp2 and k_fp1.startswith("DEB_KEY="), f"{k_fp1} {k_fp2}")
+# T32: Task-D — no direct docker/containerd storage deletion; daemon prune instead
+rm_lines = [l for l in ci_txt.splitlines() if "rm -rf" in l and not l.lstrip().startswith("#")]
+ok("T32 containerd/docker daemon storage never rm-ed directly; docker image prune used",
+   not any(re.search(r"rm -rf[^&|;]*/var/lib/(containerd|docker)", l) for l in rm_lines)
+   and "docker image prune -f" in ci_txt)
 debkey_block = wf[pos_fk:pos_rd]
 ok("T27 smoke-only skips key+reuse chain; reuse default OFF; key step opt-in-only",
    "if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true" in debkey_block

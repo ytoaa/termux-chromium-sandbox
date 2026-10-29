@@ -162,26 +162,29 @@ jobs:
       # DEB key = hash over ALL build-affecting inputs, computed HERE —
       # after (1) preflight possibly rewrote repo.json (mirror switch),
       # (2) prepare-builder produced the FINAL custom image. The key
-      # includes the image CONTENT id (the built image's digest, recorded
-      # by prepare-builder), not just the tag: same tag with drifted
-      # base/apt/Dockerfile content rotates
-      # the key instead of risking stale-DEB reuse. Fail-closed: no valid
-      # image id -> no key -> no reuse (and the step errors out loudly).
-      - name: Compute final DEB key (post-preflight repo.json + final image id)
+      # hashes the deterministic image CONTENT FINGERPRINT (base image id +
+      # sorted dpkg package versions + Dockerfile hash — see
+      # image_fingerprint() in ci.sh; the raw docker image id embeds a
+      # build timestamp and is NOT reproducible, which made a raw-id key
+      # unhittable across runs), not just the tag: any real base/apt/
+      # Dockerfile change rotates the key instead of risking stale-DEB
+      # reuse. Fail-closed: missing/invalid recorded values -> no key ->
+      # no reuse (the step errors out loudly).
+      - name: Compute final DEB key (post-preflight repo.json + final image fingerprint)
         if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true
         id: debkey
         run: |
           set -uo pipefail
-          # Image id is recorded by prepare-builder BEFORE its free-space
-          # step deletes containerd's content store (run 40823773715: after
-          # that, inspecting the image config blob fails "blob not found",
-          # while the live container's .Image metadata stays readable).
-          # File missing/empty => no recorded final image => FAIL CLOSED
-          # (never compute a partial key).
-          imgid=$(cat "$PWD/termux-packages/.builder-image-id" 2>/dev/null) || imgid=""
-          [ -n "$imgid" ] || { echo "DEBKEY FAIL: no recorded builder image id (prepare-builder did not record it)" >&2; exit 1; }
-          [[ "$imgid" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { echo "DEBKEY FAIL: invalid image id '$imgid'" >&2; exit 1; }
-          if ! dkraw=$(TERMUX_BUILDER_IMAGE_ID="$imgid" bash port/ci.sh deb-key "$PWD/termux-packages" 2>&1); then
+          # Both files are written by prepare-builder BEFORE its free-space
+          # cleanup (run 40823773715: post-cleanup image-config inspection
+          # fails "blob not found", while live-container metadata stays
+          # readable). Missing/empty => FAIL CLOSED (never a partial key).
+          imgfp=$(cat "$PWD/termux-packages/.builder-image-id" 2>/dev/null) || imgfp=""
+          [ -n "$imgfp" ] || { echo "DEBKEY FAIL: no recorded builder image fingerprint (prepare-builder did not record it)" >&2; exit 1; }
+          [[ "$imgfp" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { echo "DEBKEY FAIL: invalid image fingerprint '$imgfp'" >&2; exit 1; }
+          imgid=$(cat "$PWD/termux-packages/.builder-image-raw" 2>/dev/null) || imgid=""
+          [[ "$imgid" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { echo "DEBKEY FAIL: invalid recorded raw image id '$imgid'" >&2; exit 1; }
+          if ! dkraw=$(TERMUX_BUILDER_IMAGE_ID="$imgfp" bash port/ci.sh deb-key "$PWD/termux-packages" 2>&1); then
             echo "DEB-KEY step FAILED: $dkraw" >&2
             exit 1
           fi
@@ -189,7 +192,7 @@ jobs:
           test -n "$dk" || { echo "DEB-KEY empty output: $dkraw" >&2; exit 1; }
           echo "debkey=$dk" >> "$GITHUB_OUTPUT"
           echo "image_id=$imgid" >> "$GITHUB_OUTPUT"
-          echo "DEBKEY=$dk IMAGE_ID=$imgid REPOJSON=$(sha256sum "$PWD/termux-packages/repo.json" | cut -c1-16)"
+          echo "DEBKEY=$dk IMAGE_FP=$imgfp IMAGE_ID=$imgid REPOJSON=$(sha256sum "$PWD/termux-packages/repo.json" | cut -c1-16)"
       - name: Restore cached completed deb
         if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true
         uses: actions/cache/restore@v4

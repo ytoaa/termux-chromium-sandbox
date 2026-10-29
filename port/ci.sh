@@ -222,27 +222,48 @@ download_preflight() {
 }
 
 # Layer 3: composite, immutable key over ALL build-affecting inputs.
+image_fingerprint() {
+  # Deterministic CONTENT identity of the final builder image, from three
+  # reproducible components: base image id + sorted installed-package
+  # versions + Dockerfile content hash.
+  # Why not the raw `docker image inspect .Id`: the image config embeds
+  # the build `created` timestamp, so the raw id rotates on EVERY rebuild
+  # even with byte-identical inputs — proven empirically: runs
+  # 40825927463 vs 40834221022 (same commit, same base digest) recorded
+  # ids 7ccda63d… vs 0b9d985a…. Keying on the raw id made the DEB cache
+  # unhittable (structural defect; task-C hypothesis CONFIRMED).
+  # The fingerprint keeps the SAME security property the raw id was meant
+  # to provide — any real environment change (base `:latest` drift, apt
+  # security update, Dockerfile edit) changes one of the three components
+  # and rotates the key — while being reproducible across rebuilds:
+  # a rebuilt-but-unchanged environment re-hits the DEB cache; a changed
+  # environment NEVER reuses a stale DEB.
+  local base_id="$1" pkgs_file="$2" dockerfile="$3"
+  [ -n "$base_id" ] || { echo "IMAGE FINGERPRINT FAIL: empty base image id" >&2; return 1; }
+  [ -s "$pkgs_file" ] || { echo "IMAGE FINGERPRINT FAIL: missing/empty package list" >&2; return 1; }
+  [ -f "$dockerfile" ] || { echo "IMAGE FINGERPRINT FAIL: Dockerfile '$dockerfile' missing" >&2; return 1; }
+  { printf 'base=%s\n' "$base_id"; cat "$pkgs_file"; printf 'dockerfile='; sha256sum "$dockerfile" | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1
+}
 deb_image_id() {
-  # Content identity of the FINAL custom builder image. The tag alone is
-  # NOT an identity: the same tag can point at different image content
-  # (base-image digest drift under :latest, apt package changes, Dockerfile
-  # edits), and reusing a DEB cached under a different environment is
-  # exactly what this key must prevent. Resolution order:
-  #   1) TERMUX_BUILDER_IMAGE_ID env (explicit override; the workflow
-  #      audits the same value in the build step, docker-less unit tests
-  #      inject synthetic ids)
-  #   2) docker image inspect of $TERMUX_BUILDER_IMAGE_NAME — the very tag
-  #      run-docker.sh boots (prepared once in prepare-builder; nothing
-  #      rebuilds it between keying and build)
+  # Resolution order:
+  #   1) TERMUX_BUILDER_IMAGE_ID env — the workflow passes the fingerprint
+  #      recorded by prepare_builder (single computation site); docker-less
+  #      unit tests inject synthetic values.
+  #   2) derive from the live final image (base id + dpkg -W + Dockerfile).
   # Anything else (missing/empty/malformed) FAILS CLOSED — deb-key never
   # computes a key that silently omits image identity.
   local id
   id="${TERMUX_BUILDER_IMAGE_ID:-}"
   if [ -z "$id" ] && command -v docker >/dev/null 2>&1; then
-    id=$(docker image inspect --format '{{.Id}}' "$TERMUX_BUILDER_IMAGE_NAME" 2>/dev/null) || id=""
+    local base_id pkgsf
+    pkgsf=$(mktemp)
+    base_id=$(docker image inspect --format '{{.Id}}' "${TERMUX_BUILDER_BASE_IMAGE:-ghcr.io/termux/package-builder:latest}" 2>/dev/null) || base_id=""
+    docker run --rm --entrypoint /usr/bin/dpkg-query "$TERMUX_BUILDER_IMAGE_NAME" -W -f '${Package} ${Version}\n' 2>/dev/null | LC_ALL=C sort > "$pkgsf" || true
+    id=$(image_fingerprint "$base_id" "$pkgsf" "${TERMUX_BUILDER_DOCKERFILE:-/tmp/Dockerfile.chromium-sccache}") || id=""
+    rm -f "$pkgsf"
   fi
   if ! [[ "$id" =~ ^(sha256:)?[0-9a-f]{64}$ ]]; then
-    echo "DEB KEY FAIL: builder image id missing/invalid (need docker image '$TERMUX_BUILDER_IMAGE_NAME' present, or TERMUX_BUILDER_IMAGE_ID=<64-hex>) — refusing to compute a key without image identity" >&2
+    echo "DEB KEY FAIL: builder image fingerprint missing/invalid (need docker image '$TERMUX_BUILDER_IMAGE_NAME' present, or TERMUX_BUILDER_IMAGE_ID=<64-hex>) — refusing to compute a key without image identity" >&2
     return 1
   fi
   echo "$id"
@@ -345,7 +366,7 @@ prepare_zram_workspace() {
 }
 
 prepare_builder() {
-  local d cache base attempt pulled imgid cimg
+  local d cache base attempt pulled imgid cimg base_id pkgsf imgfp
   d="$(need_termux_dir "${1:?}")"
   cache="$d/.sccache"
   base="ghcr.io/termux/package-builder:latest"
@@ -382,20 +403,39 @@ USER builder:builder
 WORKDIR /home/builder/termux-packages
 DOCKERFILE
   docker build -f /tmp/Dockerfile.chromium-sccache -t "$TERMUX_BUILDER_IMAGE_NAME" "$d"
-  # Record the FINAL image content id NOW, before the free-space cleanup
+  # Record the FINAL image identity NOW, before the free-space cleanup
   # below (run 40823773715 evidence: `rm -rf /var/lib/containerd/io.
   # containerd.content.v1.content` deletes containerd's content store;
   # afterwards `docker image inspect` cannot read the image config blob
   # — "blob not found" — while the ALREADY-CREATED container keeps
   # working because its snapshot is extracted, which is why the old flow
-  # (image never inspected post-prepare) hid this. Persisting the id here
-  # keeps the DEB key bound to the true final image without depending on
-  # post-cleanup inspect.
+  # (image never inspected post-prepare) hid this). Persisting the ids
+  # here keeps the DEB key bound to the true final image without
+  # depending on post-cleanup inspect.
+  # Two values:
+  #   .builder-image-raw — docker's own image id. NOT reproducible across
+  #     rebuilds (config `created` timestamp; runs 40825927463/40834221022
+  #     proved 7ccda63d… vs 0b9d985a… from identical inputs), so it is
+  #     used ONLY for the within-run same-image drift guard.
+  #   .builder-image-id  — deterministic content fingerprint (base id +
+  #     sorted dpkg package versions + Dockerfile hash), see
+  #     image_fingerprint(); this is what the DEB key hashes, so an
+  #     unchanged environment can actually REUSE the cached DEB while any
+  #     real environment change still rotates the key.
   imgid=$(docker image inspect --format '{{.Id}}' "$TERMUX_BUILDER_IMAGE_NAME") || {
     echo "PREPARE FAIL: built image '$TERMUX_BUILDER_IMAGE_NAME' not inspectable" >&2; exit 1; }
   [[ "$imgid" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { echo "PREPARE FAIL: invalid image id '$imgid'" >&2; exit 1; }
-  printf '%s' "$imgid" > "$d/.builder-image-id"
-  echo "BUILDER IMAGE ID=$imgid"
+  base_id=$(docker image inspect --format '{{.Id}}' "$base") || {
+    echo "PREPARE FAIL: base image '$base' not inspectable" >&2; exit 1; }
+  pkgsf=$(mktemp)
+  docker run --rm --entrypoint /usr/bin/dpkg-query "$TERMUX_BUILDER_IMAGE_NAME" -W -f '${Package} ${Version}\n' | LC_ALL=C sort > "$pkgsf" || {
+    echo "PREPARE FAIL: dpkg-query package list failed in final image" >&2; rm -f "$pkgsf"; exit 1; }
+  [ -s "$pkgsf" ] || { echo "PREPARE FAIL: empty package list from final image" >&2; rm -f "$pkgsf"; exit 1; }
+  imgfp=$(image_fingerprint "$base_id" "$pkgsf" /tmp/Dockerfile.chromium-sccache) || { rm -f "$pkgsf"; exit 1; }
+  rm -f "$pkgsf"
+  printf '%s' "$imgid" > "$d/.builder-image-raw"
+  printf '%s' "$imgfp" > "$d/.builder-image-id"
+  echo "BUILDER IMAGE ID(raw)=$imgid FINGERPRINT=$imgfp BASE=$base_id"
   docker rm -f termux-package-builder 2>/dev/null || true
   export TERMUX_DOCKER_RUN_EXTRA_ARGS="$(docker_volume_args "$d")"
   # Host-side evidence for the permission contract (see docker_perms_smoke).
@@ -432,11 +472,22 @@ DOCKERFILE
   # DIRS GONE /opt/runner-cache immediately after that single rm; disk was
   # NOT pressured, ruling out the GC hypothesis). Run only the
   # runner-independent cleanup subset here; keep df evidence inline.
+  # Task-D review (run 40823773715 + df evidence): the former extra entry
+  # `sudo rm -rf /var/lib/containerd/io.containerd.content.v1.content` is
+  # REMOVED. It directly gutted the docker daemon's content store (broke
+  # image inspection post-prepare; version-fragile internal layout; on a
+  # shared runner it would also starve other jobs' images), while disk
+  # pressure is measurably absent (root fs 94G avail / 36% used after the
+  # remaining cleanup, keybuild2-full.log). Reclaimed instead via the
+  # daemon-managed `docker image prune -f` below (dangling images from
+  # previous runs' rebuilds of this tag) — same space, zero corruption
+  # risk, no conflict with the node24 protections (which forbid touching
+  # runner-runtime paths like /opt/runner-cache).
   ( cd "$d" && sudo rm -rf /opt/ghc /opt/az /opt/pipx \
       /usr/share/dotnet /usr/share/swift /usr/share/miniconda /usr/share/az_* \
       /usr/share/gradle-* /usr/share/java /home/runner/.rustup /etc/skel \
-      /home/packer /home/linuxbrew /usr/src \
-      /var/lib/containerd/io.containerd.content.v1.content ) || true
+      /home/packer /home/linuxbrew /usr/src ) || true
+  docker image prune -f >/dev/null 2>&1 || true
   df -h
   # Early presence gate for the runner action runtime (diagnostic only —
   # never fabricates success; if the fleet layout regresses again this step
@@ -579,6 +630,7 @@ case "$cmd" in
   dep-cache-prune)     dep_cache_prune "${2:?usage: ci.sh dep-cache-prune <termux-packages>}" ;;
   download-preflight)  download_preflight "${2:?usage: ci.sh download-preflight <termux-packages>}" ;;
   deb-key)             deb_key "${2:?usage: ci.sh deb-key <termux-packages>}" ;;
+  image-fingerprint)   image_fingerprint "${2:?}" "${3:?}" "${4:?}" ;;
   deb-reuse-verify)    deb_reuse_verify "${2:?usage: ci.sh deb-reuse-verify <termux-packages>}" ;;
   deb-reuse-save)      deb_reuse_save "${2:?usage: ci.sh deb-reuse-save <termux-packages>}" ;;
   resolve-ref)
@@ -586,7 +638,7 @@ case "$cmd" in
     gh api --method GET "repos/termux/termux-packages/commits/${2:-master}" --jq .sha
     ;;
   *)
-    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | prepare-zram-workspace <tp> | prepare-builder <tp> | docker-perms-smoke <tp> | build <tp> | dep-cache-prune <tp> | download-preflight <tp> | deb-key <tp> | deb-reuse-verify <tp> | deb-reuse-save <tp> | resolve-ref [ref]" >&2
+    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | prepare-zram-workspace <tp> | prepare-builder <tp> | docker-perms-smoke <tp> | image-fingerprint <base> <pkgs> <dockerfile> | build <tp> | dep-cache-prune <tp> | download-preflight <tp> | deb-key <tp> | deb-reuse-verify <tp> | deb-reuse-save <tp> | resolve-ref [ref]" >&2
     exit 2
     ;;
 esac
