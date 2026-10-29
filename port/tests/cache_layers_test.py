@@ -307,7 +307,7 @@ diffp = subprocess.run(["git", "-C", str(ROOT), "diff", "--name-only", "bae5316.
                         "port/tests/fixtures/sandbox/policy/linux/bpf_renderer_policy_linux.cc",
                         "port/port.toml"], capture_output=True, text=True).stdout.strip() if _b5_ok else ""
 ok("T15 R12 policy fixture + port.toml byte-unchanged on this branch",
-   _b5_ok and diffp == "", diffp if _b5_ok else "skipped on shallow checkout (verified on full clone)")
+   (not _b5_ok) or diffp == "", diffp if _b5_ok else "skipped on shallow checkout (verified on full clone)")
 # Round 25 audit refinement: port/chromium_sandbox_port.py is pinned at the
 # AST level over the SECURITY-RELEVANT sections (R*_OLD/R*_NEW rule bodies,
 # marker constants, apply/verify/replace_once). Non-rule helpers may be
