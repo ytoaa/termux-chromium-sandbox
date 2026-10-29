@@ -172,7 +172,8 @@ subprocess.run(["git", "-C", str(tp), "-c", "user.email=t@t", "-c", "user.name=t
 (tp / "repo.json").write_text(json.dumps({"pkg_format": "debian",
     "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
                  "url": "https://packages-cf.termux.dev/apt/termux-main"}}))
-env = dict(os.environ, TERMUX_SANDBOXED_REVISION="12")
+IMG_FAKE = "sha256:" + "a" * 64
+env = dict(os.environ, TERMUX_SANDBOXED_REVISION="12", TERMUX_BUILDER_IMAGE_ID=IMG_FAKE)
 k1 = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
 k2 = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
 ok("T7 deb_key stable for identical inputs", k1.startswith("DEB_KEY=") and k1 == k2, k1)
@@ -181,6 +182,44 @@ ok("T7 deb_key stable for identical inputs", k1.startswith("DEB_KEY=") and k1 ==
 k3 = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
 ok("T8 deb_key changes when recipe/upstream changes", k3 != k1)
 (tp / "packages" / "chromium" / "build.sh").write_text('TERMUX_PKG_VERSION="156.0.8078.47"\n')
+(tp / "packages" / "chromium-sandboxed" / "build.sh").write_text('TERMUX_PKG_VERSION="156.0.8078.47"\n')
+
+# ---------- T19..T23: DEB key integrity (image id + final repo.json) ----
+k_dup = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
+ok("T19 identical image id + identical inputs -> identical key (reproducible)", k_dup == k1, f"{k_dup} != {k1}")
+k_img = run(["bash", str(CI), "deb-key", str(tp)],
+            env=dict(env, TERMUX_BUILDER_IMAGE_ID="sha256:" + "b" * 64)).stdout.strip().splitlines()[-1]
+ok("T20 image id change -> DEB key change", k_img != k1, k_img)
+shim = W / "shim-no-docker"; shim.mkdir(exist_ok=True)
+(shim / "docker").write_text("#!/bin/sh\nexit 1\n"); (shim / "docker").chmod(0o755)
+r = run(["bash", str(CI), "deb-key", str(tp)],
+        env=dict(env, TERMUX_BUILDER_IMAGE_ID="", PATH=f"{shim}:{os.environ['PATH']}"))
+ok("T21a missing image id (docker inspect fails, no env) -> fail-closed",
+   r.returncode != 0 and "DEB KEY FAIL" in (r.stdout + r.stderr), (r.stdout + r.stderr)[-160:])
+r = run(["bash", str(CI), "deb-key", str(tp)], env=dict(env, TERMUX_BUILDER_IMAGE_ID="not-a-hash"))
+ok("T21b malformed image id -> fail-closed",
+   r.returncode != 0 and "DEB KEY FAIL" in (r.stdout + r.stderr), (r.stdout + r.stderr)[-160:])
+repo_orig = (tp / "repo.json").read_text()
+(tp / "repo.json").write_text(json.dumps({"pkg_format": "debian",
+    "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
+                 "url": "https://packages.termux.dev/apt/termux-main"}}))
+k_repo = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
+ok("T22 repo.json change -> DEB key change", k_repo != k1, k_repo)
+(tp / "repo.json").write_text(repo_orig)
+# T23: mirror switch (preflight rewrites repo.json) must flow into the key
+(tp / "repo.json").write_text(json.dumps({"pkg_format": "debian",
+    "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
+                 "url": "https://packages-cf.termux.dev/apt/termux-main"}}))
+k_before_switch = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
+r = run(["bash", str(CI), "download-preflight", str(tp)],
+        env=dict(os.environ, PATH=f"{HERE / 'fixtures' / 'net'}:{os.environ['PATH']}",
+                 FAKE_FAIL_HOST="packages-cf.termux.dev"), timeout=300)
+switched = "packages.termux.dev/apt/termux-main" in (tp / "repo.json").read_text()
+k_after_switch = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
+ok("T23 preflight mirror-switch -> final repo.json reflected in key",
+   r.returncode == 0 and "MIRROR-SWITCH" in r.stdout and switched and k_after_switch != k_before_switch,
+   (r.stdout + r.stderr)[-200:])
+(tp / "repo.json").write_text(repo_orig)
 
 # ---------- T9..T12: deb-reuse fail-closed gates ----------
 import subprocess as sp
@@ -279,9 +318,11 @@ wf = (ROOT / ".github/workflows/build-chromium.yml").read_text()
 def pos(pat): 
     m = re.search(pat, wf)
     return m.start() if m else -1
+build_block = wf[wf.index("name: Build chromium-sandboxed"):wf.index("name: Package gates")]
 ok("T17 preflight before prepare-builder; gates unconditional; save-deb success-only",
    0 < pos(r"Download preflight") < pos(r"Prepare Termux builder") and
-   pos(r"if: inputs\.docker_smoke_only != true && steps\.debcheck\.outputs\.reused != '1'\s*\n\s*run: bash port/ci\.sh build") > 0 and
+   "if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'" in build_block and
+   "bash port/ci.sh build" in build_block and
    pos(r"Package gates") > pos(r"Build chromium-sandboxed") and
    "if: success() && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'" in wf)
 
@@ -333,6 +374,31 @@ ok("T18c workflow: smoke-only gates compile/gates/deb-reuse; reuse default OFF (
 ok("T18d no empty-cache promotion: both save steps gated by guard outputs",
    "steps.guard.outputs.sccache_nonempty" in wf and "steps.guard.outputs.dep_nonempty" in wf
    and "Guard cache saves" in wf)
+
+# ---------- T24..T27: key-stage ordering + key-identity invariants ------
+pos_keys = pos(r"- name: Compute cache keys \(sccache base only\)")
+pos_pf   = pos(r"- name: Download preflight")
+pos_pb   = pos(r"- name: Prepare Termux builder")
+pos_fk   = pos(r"- name: Compute final DEB key")
+pos_rd   = pos(r"- name: Restore cached completed deb")
+keys_block = wf[pos_keys:pos_pf] if 0 < pos_keys < pos_pf else ""
+ok("T24 DEB key computed AFTER preflight + prepare-builder, BEFORE deb restore; keys step has no deb-key",
+   0 < pos_pf < pos_pb < pos_fk < pos_rd and "deb-key" not in keys_block
+   and "TERMUX_BUILDER_IMAGE_ID=\"$imgid\"" in wf[pos_fk:pos_rd],
+   f"{pos_pf},{pos_pb},{pos_fk},{pos_rd}")
+ok("T25 restore/verify/save all reference the ONE final key + build checks image drift",
+   wf.count("steps.debkey.outputs.debkey") == 4
+   and "EXPECTED_IMAGE_ID: ${{ steps.debkey.outputs.image_id }}" in wf
+   and "IMAGE DRIFT" in wf)
+gates_block = wf[wf.index("name: Package gates"):wf.index("name: Emit outputs")]
+ok("T26 reuse skips compile but gates stay (never conditioned on reuse)",
+   "reused != '1'" in build_block and "reused" not in gates_block
+   and "if: inputs.docker_smoke_only != true" in gates_block)
+debkey_block = wf[pos_fk:pos_rd]
+ok("T27 smoke-only skips key+reuse chain; reuse default OFF; key step opt-in-only",
+   "if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true" in debkey_block
+   and re.search(r"allow_deb_reuse:[\s\S]{0,400}?default: false", wf) is not None
+   and "inputs.docker_smoke_only != true" in build_block)
 
 print(f"\nCACHE-LAYERS PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)

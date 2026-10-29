@@ -222,13 +222,39 @@ download_preflight() {
 }
 
 # Layer 3: composite, immutable key over ALL build-affecting inputs.
+deb_image_id() {
+  # Content identity of the FINAL custom builder image. The tag alone is
+  # NOT an identity: the same tag can point at different image content
+  # (base-image digest drift under :latest, apt package changes, Dockerfile
+  # edits), and reusing a DEB cached under a different environment is
+  # exactly what this key must prevent. Resolution order:
+  #   1) TERMUX_BUILDER_IMAGE_ID env (explicit override; the workflow
+  #      audits the same value in the build step, docker-less unit tests
+  #      inject synthetic ids)
+  #   2) docker image inspect of $TERMUX_BUILDER_IMAGE_NAME — the very tag
+  #      run-docker.sh boots (prepared once in prepare-builder; nothing
+  #      rebuilds it between keying and build)
+  # Anything else (missing/empty/malformed) FAILS CLOSED — deb-key never
+  # computes a key that silently omits image identity.
+  local id
+  id="${TERMUX_BUILDER_IMAGE_ID:-}"
+  if [ -z "$id" ] && command -v docker >/dev/null 2>&1; then
+    id=$(docker image inspect --format '{{.Id}}' "$TERMUX_BUILDER_IMAGE_NAME" 2>/dev/null) || id=""
+  fi
+  if ! [[ "$id" =~ ^(sha256:)?[0-9a-f]{64}$ ]]; then
+    echo "DEB KEY FAIL: builder image id missing/invalid (need docker image '$TERMUX_BUILDER_IMAGE_NAME' present, or TERMUX_BUILDER_IMAGE_ID=<64-hex>) — refusing to compute a key without image identity" >&2
+    return 1
+  fi
+  echo "$id"
+}
 deb_key() {
-  local d termux_sha port_hash recipe_sha upstream ver arch rev repo_sha k
+  local d termux_sha port_hash recipe_sha upstream ver arch rev repo_sha k imageid
   d="$(need_termux_dir "${1:?}")"
   termux_sha=$(git -C "$d" rev-parse HEAD 2>/dev/null || true)
   [ -n "$termux_sha" ] || { echo "DEB KEY FAIL: termux dir is not a git checkout" >&2; return 1; }
   port_hash=$(cd "$here/.." && python3 port/maintenance.py port-input-hash --root . | tail -1)
   [ -n "$port_hash" ] || { echo "DEB KEY FAIL: port-input-hash empty" >&2; return 1; }
+  imageid=$(deb_image_id) || return 1
   recipe_sha=$( { find "$d/packages/chromium-sandboxed" -type f \( -name '*.sh' -o -name '*.sub' -o -name 'RECIPE*' \) -print0 2>/dev/null | xargs -0 sha256sum 2>/dev/null || true; } | sha256sum | cut -d' ' -f1)
   upstream=$( { grep -hoE 'TERMUX_PKG_VERSION=.[0-9][0-9.]*' "$d"/packages/*chromium*/build.sh 2>/dev/null || true; } | head -1 | sed -e 's/.*=//' -e 's/[^0-9.]//g')
   [ -n "$upstream" ] || upstream=$( { grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$d/../../port/port.toml" 2>/dev/null || true; } | head -1)
@@ -238,7 +264,7 @@ deb_key() {
   rev="${TERMUX_SANDBOXED_REVISION:-?}"
   arch="aarch64"
   ver="chromium-sandboxed"
-  k=$(printf '%s\n' "pkg=$ver" "rev=$rev" "arch=$arch" "upstream=${upstream:-unknown}" "termux=$termux_sha" "port=$port_hash" "recipe=$recipe_sha" "repojson=$repo_sha" "image=$TERMUX_BUILDER_IMAGE_NAME" | sha256sum | cut -d' ' -f1)
+  k=$(printf '%s\n' "pkg=$ver" "rev=$rev" "arch=$arch" "upstream=${upstream:-unknown}" "termux=$termux_sha" "port=$port_hash" "recipe=$recipe_sha" "repojson=$repo_sha" "image=$TERMUX_BUILDER_IMAGE_NAME" "imageid=$imageid" | sha256sum | cut -d' ' -f1)
   echo "DEB_KEY=$k"
 }
 
