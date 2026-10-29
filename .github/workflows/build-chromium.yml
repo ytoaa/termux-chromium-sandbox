@@ -112,7 +112,7 @@ jobs:
           git -C termux-packages rev-parse HEAD > termux-pin.txt
       - name: Prepare chromium-sandboxed recipe (identity + injected hook)
         run: bash port/ci.sh recipe-prepare "$PWD/termux-packages"
-      - name: Compute cache keys
+      - name: Compute cache keys (sccache base only)
         id: keys
         run: |
           set -uo pipefail
@@ -126,14 +126,12 @@ jobs:
           test -n "$ph"
           base=$(printf '%s\n' "termux=$termux_sha" "rev=${TERMUX_SANDBOXED_REVISION:-}" "port=$ph" | sha256sum | cut -d' ' -f1)
           echo "base=$base" >> "$GITHUB_OUTPUT"
-          if ! dkraw=$(bash port/ci.sh deb-key "$PWD/termux-packages" 2>&1); then
-            echo "DEB-KEY step FAILED: $dkraw" >&2
-            exit 1
-          fi
-          dk=$(printf '%s' "$dkraw" | tail -1 | cut -d= -f2)
-          test -n "$dk" || { echo "DEB-KEY empty output: $dkraw" >&2; exit 1; }
-          echo "debkey=$dk" >> "$GITHUB_OUTPUT"
-          echo "cache base=$base deb key=$dk"
+          echo "cache base=$base"
+          # NOTE: the DEB key is computed LATER (after preflight finalized
+          # repo.json and prepare-builder produced the final image; the
+          # dedicated later step also hashes the image CONTENT id). Hashing
+          # repo.json or the image tag here, before those steps mutate
+          # them, would desync the key from the actual build inputs.
       - name: Restore sccache
         uses: actions/cache/restore@v4
         with:
@@ -161,18 +159,42 @@ jobs:
         uses: ./.github/actions/zram
       - name: Prepare Termux builder (docker + sccache image)
         run: bash port/ci.sh prepare-builder "$PWD/termux-packages"
+      # DEB key = hash over ALL build-affecting inputs, computed HERE —
+      # after (1) preflight possibly rewrote repo.json (mirror switch),
+      # (2) prepare-builder produced the FINAL custom image. The key
+      # includes the image CONTENT id (docker image inspect .Id), not just
+      # the tag: same tag with drifted base/apt/Dockerfile content rotates
+      # the key instead of risking stale-DEB reuse. Fail-closed: no valid
+      # image id -> no key -> no reuse (and the step errors out loudly).
+      - name: Compute final DEB key (post-preflight repo.json + final image id)
+        if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true
+        id: debkey
+        run: |
+          set -uo pipefail
+          imgid=$(docker image inspect --format '{{.Id}}' "$TERMUX_BUILDER_IMAGE_NAME") || {
+            echo "DEBKEY FAIL: builder image '$TERMUX_BUILDER_IMAGE_NAME' not inspectable" >&2; exit 1; }
+          [[ "$imgid" =~ ^(sha256:)?[0-9a-f]{64}$ ]] || { echo "DEBKEY FAIL: invalid image id '$imgid'" >&2; exit 1; }
+          if ! dkraw=$(TERMUX_BUILDER_IMAGE_ID="$imgid" bash port/ci.sh deb-key "$PWD/termux-packages" 2>&1); then
+            echo "DEB-KEY step FAILED: $dkraw" >&2
+            exit 1
+          fi
+          dk=$(printf '%s' "$dkraw" | tail -1 | cut -d= -f2)
+          test -n "$dk" || { echo "DEB-KEY empty output: $dkraw" >&2; exit 1; }
+          echo "debkey=$dk" >> "$GITHUB_OUTPUT"
+          echo "image_id=$imgid" >> "$GITHUB_OUTPUT"
+          echo "DEBKEY=$dk IMAGE_ID=$imgid REPOJSON=$(sha256sum "$PWD/termux-packages/repo.json" | cut -c1-16)"
       - name: Restore cached completed deb
         if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true
         uses: actions/cache/restore@v4
         with:
           path: termux-packages/.deb-cache
-          key: chromium-deb-v1-${{ steps.keys.outputs.debkey }}
+          key: chromium-deb-v1-${{ steps.debkey.outputs.debkey }}
       - name: Verify cached completed deb (fail-closed reuse gate)
         if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true
         id: debcheck
         continue-on-error: true
         env:
-          DEB_KEY: ${{ steps.keys.outputs.debkey }}
+          DEB_KEY: ${{ steps.debkey.outputs.debkey }}
         run: |
           set -euo pipefail
           if bash port/ci.sh deb-reuse-verify "$PWD/termux-packages"; then
@@ -187,7 +209,21 @@ jobs:
       # package gates unconditionally (reused or built — never bypassed).
       - name: Build chromium-sandboxed (port hook runs at post_get_source)
         if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
-        run: bash port/ci.sh build "$PWD/termux-packages"
+        env:
+          EXPECTED_IMAGE_ID: ${{ steps.debkey.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          # Same-image contract: the image the DEB key was computed over
+          # must be the image this build boots. (Reuse OFF => no key => no
+          # docker dependency added here; guard is inert unless set.)
+          if [ -n "${EXPECTED_IMAGE_ID:-}" ]; then
+            actual=$(docker image inspect --format '{{.Id}}' "$TERMUX_BUILDER_IMAGE_NAME")
+            [ "$actual" = "$EXPECTED_IMAGE_ID" ] || {
+              echo "IMAGE DRIFT: DEB key computed on $EXPECTED_IMAGE_ID but build image is $actual — refusing to build under a stale key"
+              exit 1; }
+            echo "IMAGE MATCH OK: $actual"
+          fi
+          bash port/ci.sh build "$PWD/termux-packages"
       - name: Package gates (separate identity, port applied)
         if: inputs.docker_smoke_only != true
         run: |
@@ -284,14 +320,14 @@ jobs:
       - name: Save completed deb to reuse cache
         if: success() && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
         env:
-          DEB_KEY: ${{ steps.keys.outputs.debkey }}
+          DEB_KEY: ${{ steps.debkey.outputs.debkey }}
         run: bash port/ci.sh deb-reuse-save "$PWD/termux-packages"
       - name: Cache completed deb
         if: success() && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
         uses: actions/cache/save@v4
         with:
           path: termux-packages/.deb-cache
-          key: chromium-deb-v1-${{ steps.keys.outputs.debkey }}
+          key: chromium-deb-v1-${{ steps.debkey.outputs.debkey }}
       - name: Record manual publish intent (fail closed)
         if: always()
         env:

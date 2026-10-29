@@ -1548,3 +1548,46 @@ Adjacent hardenings in this round:
   default false). The fail-closed verifier is strong, but until two
   independent full builds prove cross-run key stability in production,
   skipping compilation must be a deliberate choice, not a default.
+
+## Round 22 — DEB cache-key integrity (final image identity + final repo state)
+
+Two key-correctness defects closed with minimal edits (no redesign):
+
+1. **Image tag was not an identity.** `deb_key()` hashed
+   `TERMUX_BUILDER_IMAGE_NAME` — a mutable tag. Same tag can now mean
+   different image content (base `:latest` digest drift on the fleet,
+   apt package version changes inside the RUN layer, Dockerfile edits);
+   under the old key a DEB built in such a *different* environment could
+   have been served from cache. `deb_key()` now requires the FINAL
+   custom image's content id (`docker image inspect --format {{.Id}}`,
+   shape-validated `^(sha256:)?[0-9a-f]{64}$`, or an explicit
+   `TERMUX_BUILDER_IMAGE_ID` for docker-less audits) and FAILS CLOSED
+   without it. The build step re-inspects the image it is about to boot
+   and aborts on `IMAGE DRIFT` versus the key's image id (same-image
+   contract; inert when reuse is off — no new docker dependency there).
+   Image determinism note: the Dockerfile's apt layer is content-
+   deterministic per package version set; id churn therefore correctly
+   tracks security/package updates. We deliberately do NOT pin versions
+   (would suppress security updates); the cost of a rotated key is one
+   extra full build, never a wrong reuse.
+
+2. **Key was computed before the inputs it claims to cover.** The DEB key
+   step ran *before* `download-preflight` (which can rewrite repo.json
+   via official mirror-switch) and before `prepare-builder` (which
+   produces the final image). Ordering is now: recipe → sccache base key
+   (unchanged early position; its inputs do not mutate) → restores →
+   preflight → zram → prepare-builder → **compute final DEB key**
+   (post-preflight repo.json + final image id) → restore/verify completed
+   deb → conditional build (drift-checked) → package gates (unconditional
+   on normal runs) → guarded saves. All four consumers (restore key,
+   verify `DEB_KEY`, save manifest, cache-save key) reference the single
+   `steps.debkey` output; a mirror-switch failure path leaves no
+   REUSED=1 possible (preflight fails the job first).
+
+Regression coverage: T19 reproducibility (same id+inputs → same key),
+T20 image-id change → key change, T21a/b fail-closed (missing/malformed
+id, via docker-shim), T22 repo.json change → key change, T23 preflight
+MIRROR-SWITCH reflected in the final key (function-executed, not
+string-grep), T24 step ordering, T25 single-key identity + drift guard,
+T26 compile-skip vs always-gates, T27 smoke-only/opt-in invariants.
+Suite total: 43 cache-layer checks.
