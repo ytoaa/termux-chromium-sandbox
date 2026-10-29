@@ -705,7 +705,16 @@ const pthread_t g_termux_main_thread = pthread_self();
                 rel = str(f.relative_to(self.root))
                 if test_pat.search(rel):
                     continue
-                txt = f.read_text(errors="ignore")
+                try:
+                    txt = f.read_text(errors="ignore")
+                except OSError as e:
+                    # Audit round (2026-10-30): an unreadable scan target is a
+                    # fail-closed OFFENDER, not a bare traceback. Previously
+                    # the OSError escaped (stderr, rc invisible behind tee);
+                    # now it is named in the PortError list and the hardened
+                    # hook (DESIGN Round 25) surfaces both rc and marker.
+                    offenders.append(f"{rel} (unreadable {type(e).__name__})")
+                    continue
                 if pattern.search(txt) and rel not in allowed:
                     offenders.append(rel)
         if offenders:

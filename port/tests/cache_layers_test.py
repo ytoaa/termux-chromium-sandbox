@@ -638,8 +638,12 @@ def _fn(txt, name):
         elif txt[i] == "}": depth -= 1
         i += 1
     return txt[m.start():i]
-ok("T34i PR #24 integrity core untouched: deb_key/deb_reuse_verify/deb_reuse_save/fingerprint byte-identical to 9ecb6e3",
-   (not _base_ok) or all(_fn(g1, f) == _fn(ci_txt, f) for f in ("deb_key", "deb_reuse_verify", "deb_reuse_save", "image_fingerprint", "deb_image_id")),
+# Audit round 2026-10-30 (DESIGN Round 25): deb_key was DELIBERATELY upgraded
+# (x11-packages recipe + upstream made live — a sensitivity INCREASE, never a
+# relaxation, pinned by T42/T43 below); the remaining integrity core stays
+# byte-pinned to the PR #24 GO baseline 9ecb6e3.
+ok("T34i PR #24 integrity core untouched: deb_reuse_verify/deb_reuse_save/fingerprint byte-identical to 9ecb6e3",
+   (not _base_ok) or all(_fn(g1, f) == _fn(ci_txt, f) for f in ("deb_reuse_verify", "deb_reuse_save", "image_fingerprint", "deb_image_id")),
    "skipped on shallow checkout (verified on full clone)" if not _base_ok else "drift")
 
 envl4c = dict(os.environ, **envl4)
@@ -665,6 +669,29 @@ ok("T41a clone preserves the sha256-declared chromium tarball (upstream rm -f ne
    and len(_raw.splitlines()) == len(_keep.splitlines()), _notes)
 _k2, _n2 = _pr.preserve_source_cache(_keep)
 ok("T41b absence tolerated (no-op + note), idempotent", _k2 == _keep and any("not found" in n for n in _n2), _n2)
+
+# ---------- T42/T43: production (x11-packages) layout key sensitivity -----
+# Audit round 2026-10-30 (DESIGN Round 25): production PKG_DST is
+# x11-packages/chromium-sandboxed — before the fix recipe_sha/upstream were
+# constants over an empty set there, and the T7/T8 packages/ fixture masked
+# it. These checks pin the FIXED behavior and forbid future relaxation.
+(tp / "x11-packages" / "chromium-sandboxed").mkdir(parents=True, exist_ok=True)
+_b = tp / "x11-packages" / "chromium-sandboxed" / "build.sh"
+_b.write_text('TERMUX_PKG_VERSION="156.0.8078.47"\n')
+_untracked = subprocess.run(["git", "-C", str(tp), "status", "--short", "--", "x11-packages"],
+                            capture_output=True, text=True).stdout
+kx1 = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
+_b.write_text('TERMUX_PKG_VERSION="156.0.8078.47"\n# audit tweak (untracked)\n')
+kx2 = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
+ok("T42 production x11-packages recipe is a LIVE key input (untracked edit rotates key)",
+   kx1.startswith("DEB_KEY=") and kx2.startswith("DEB_KEY=") and kx1 != kx2 and "x11-packages" in _untracked,
+   f"{kx1} vs {kx2}; untracked={_untracked!r}")
+(tp / "repo.json").write_text(json.dumps({"pkg_format": "debian",
+    "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
+                 "url": "https://packages.termux.dev/apt/termux-main"}}))
+kxr2 = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
+ok("T43 repo.json change still rotates DEB key (no key relaxation after Round 25 upgrade)",
+   kxr2.startswith("DEB_KEY=") and kxr2 != kx2, f"{kxr2} vs {kx2}")
 
 print(f"\nCACHE-LAYERS PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)

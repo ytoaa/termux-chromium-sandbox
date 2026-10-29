@@ -507,9 +507,15 @@ deb_key() {
   port_hash=$(cd "$here/.." && python3 port/maintenance.py port-input-hash --root . | tail -1)
   [ -n "$port_hash" ] || { echo "DEB KEY FAIL: port-input-hash empty" >&2; return 1; }
   imageid=$(deb_image_id) || return 1
-  recipe_sha=$( { find "$d/packages/chromium-sandboxed" -type f \( -name '*.sh' -o -name '*.sub' -o -name 'RECIPE*' \) -print0 2>/dev/null | xargs -0 sha256sum 2>/dev/null || true; } | sha256sum | cut -d' ' -f1)
-  upstream=$( { grep -hoE 'TERMUX_PKG_VERSION=.[0-9][0-9.]*' "$d"/packages/*chromium*/build.sh 2>/dev/null || true; } | head -1 | sed -e 's/.*=//' -e 's/[^0-9.]//g')
-  [ -n "$upstream" ] || upstream=$( { grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$d/../../port/port.toml" 2>/dev/null || true; } | head -1)
+  # Audit round (DESIGN Round 25): the production clone lives under
+  # x11-packages/ (prepare_recipe PKG_DST), NOT packages/ — the old single
+  # path made recipe_sha a CONSTANT over an empty set and upstream detection
+  # dead, so recipe content rode only on port_hash. Key RELAXATION remains
+  # forbidden (T43/T34i): these components must now be LIVE. Both layouts are
+  # scanned so legacy fixtures and production both count.
+  recipe_sha=$( { find "$d/x11-packages/chromium-sandboxed" "$d/packages/chromium-sandboxed" -type f \( -name '*.sh' -o -name '*.sub' -o -name 'RECIPE*' \) -print0 2>/dev/null | xargs -0 sha256sum 2>/dev/null || true; } | sha256sum | cut -d' ' -f1)
+  upstream=$( { grep -hoE 'TERMUX_PKG_VERSION=.[0-9][0-9.]*' "$d"/x11-packages/*chromium*/build.sh "$d"/packages/*chromium*/build.sh 2>/dev/null || true; } | head -1 | sed -e 's/.*=//' -e 's/[^0-9.]//g')
+  [ -n "$upstream" ] || upstream=$( { grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$d/../port/port.toml" "$d/../../port/port.toml" 2>/dev/null || true; } | head -1)
   [ -n "$upstream" ] || upstream=unknown
   repo_sha=$( { sha256sum "$d/repo.json" 2>/dev/null || true; } | cut -d' ' -f1)
   [ -n "$repo_sha" ] || repo_sha=absent

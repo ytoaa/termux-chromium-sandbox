@@ -38,17 +38,30 @@ def rewrite_identity(text: str) -> str:
 HOOK = f"""
 {HOOK_BEGIN}
 termux_step_post_get_source() {{
+\t# Audit round (2026-10-30, DESIGN Round 25): the fail-closed contract must
+\t# NOT lean on the external builder's `set -euo pipefail` (build-package.sh
+\t# de1dd3d1 line 21 — an upstream invariant we do not own). Capture the
+\t# transformer rc from the pipeline itself, keep stderr inside the evidence
+\t# log, then require EVERY unconditional rule record plus the anti-injection
+\t# scan completion marker. The old `>= 8 records` threshold tolerated any
+\t# early rule loss; per-rule presence + rc + marker replaces it.
 \tpython3 "$TERMUX_PKG_BUILDER_DIR/termux-chromium-sandbox-port.py" apply \\
-\t\t--src "$TERMUX_PKG_SRCDIR" --scan content,chrome \\
+\t\t--src "$TERMUX_PKG_SRCDIR" --scan content,chrome 2>&1 \\
 \t\t| tee "$TERMUX_PKG_TMPDIR/port-apply.log"
+\tport_rc=${{PIPESTATUS[0]}}
+\t[ "$port_rc" -eq 0 ] || {{ echo "port hook: transformer exited rc=$port_rc (partial apply refused)" >&2; exit 1; }}
 \t\t# mirror into BUILDER_DIR (repo tree) so the CI host can grep it —
 \t\t# TMPDIR lives under the container home which is not mounted back.
 \t\tcp "$TERMUX_PKG_TMPDIR/port-apply.log" "$TERMUX_PKG_BUILDER_DIR/port-apply.log" 2>/dev/null || true
 \t\t# BUILDER_DIR at hook time is the container-local recipe copy (.termux-build),
 \t\t# NOT the mounted repo — also drop it at the mounted repo root for CI host gates.
 \t\tcat "$TERMUX_PKG_TMPDIR/port-apply.log" > /home/builder/termux-packages/port-apply-chromium.log 2>/dev/null || true
-\tc=$(grep -c "ALREADY_PRESENT\\|APPLIED" "$TERMUX_PKG_TMPDIR/port-apply.log" || true)
-\t[ "$c" -ge 8 ] || {{ echo "port hook: fewer than 8 rules applied" >&2; exit 1; }}
+\tfor r in R1 R2 R3 R4 R5 R7 R9a R10 R11 R12; do
+\t\tgrep -qE "\\] ${{r}} " "$TERMUX_PKG_TMPDIR/port-apply.log" \\
+\t\t\t|| {{ echo "port hook: rule ${{r}} record missing from port-apply.log" >&2; exit 1; }}
+\tdone
+\tgrep -q "anti-injection scan" "$TERMUX_PKG_TMPDIR/port-apply.log" \\
+\t\t|| {{ echo "port hook: anti-injection scan completion marker missing" >&2; exit 1; }}
 }}
 {HOOK_END}
 """

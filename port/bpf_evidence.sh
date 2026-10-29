@@ -155,12 +155,17 @@ wrapper_guard() { # $1=launch-path — refuse EXTRACTED DEB shield wrappers
   local troot; troot=$(readlink -f -- "$TCS_PREFIX" 2>/dev/null) || troot=$TCS_PREFIX
   case "$rp" in
     "$troot"/*)
-      if [ -n "${PREFIX:-}" ]; then
-        local pr; pr=$(readlink -f -- "$PREFIX" 2>/dev/null || echo "$PREFIX")
-        if [ "$pr" != "$troot" ]; then
-          echo "[FAIL] wrapper guard: installed wrapper with PREFIX=$PREFIX (-> $pr) outside installed root $troot — mixed identity refused"
-          return 1
-        fi
+      # Audit round (DESIGN Round 25): the wrapper resolves its launcher via
+      # ${PREFIX:-<hardcoded default>} — a SET-BUT-EMPTY PREFIX falls back to
+      # the default root, so testing only a non-empty PREFIX let a wrapper
+      # living under a custom TCS_PREFIX exec the DEFAULT installation
+      # (mixed identity — the exact R11-audit contamination class). Compare
+      # the wrapper's EFFECTIVE root against the installed root instead.
+      local proot="${PREFIX:-/data/data/com.termux/files/usr}"
+      local pr; pr=$(readlink -f -- "$proot" 2>/dev/null || echo "$proot")
+      if [ "$pr" != "$troot" ]; then
+        echo "[FAIL] wrapper guard: wrapper under installed root $troot but launcher resolves via ${PREFIX+PREFIX=}${proot} (-> $pr) — mixed identity refused"
+        return 1
       fi
       return 0 ;;
     *)
@@ -369,9 +374,15 @@ selftest() {
   if TCS_PREFIX=$t/pfx bash "$0" _internal_guard "$t/extract/chromium-shield-wrapper.sh"; then
     echo "[selftest] wrapper guard FAIL (extracted not refused)"; rc=1
   else echo "[selftest] wrapper guard refuses extracted ok"; fi
-  if TCS_PREFIX=$t/pfx PREFIX= bash "$0" _internal_guard "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"; then
+  if TCS_PREFIX=$t/pfx PREFIX=$t/pfx bash "$0" _internal_guard "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"; then
     echo "[selftest] wrapper guard allows installed-mode ok"
   else echo "[selftest] wrapper guard FAIL (installed-mode refused)"; rc=1; fi
+  # Audit round (DESIGN Round 25): PREFIX set-but-EMPTY under a CUSTOM
+  # TCS_PREFIX makes the wrapper exec the DEFAULT root — mixed identity,
+  # must be refused (the pre-fix behavior allowed it; expectation flipped).
+  if TCS_PREFIX=$t/pfx PREFIX= bash "$0" _internal_guard "$t/pfx/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh"; then
+    echo "[selftest] wrapper guard FAIL (empty-PREFIX mixed identity allowed)"; rc=1
+  else echo "[selftest] wrapper guard refuses empty-PREFIX mixed identity ok"; fi
   # ---- Phase-2 scenario matrix (2026-10-27): broker lifecycle & classifier ----
   PROC_ROOT=$P bash "$0" _internal_census "$real" "$t/b.txt"
   BRO=$(PROC_ROOT=$P bash "$0" _internal_broker "$t/b.txt" "$real"); BRC=$?
