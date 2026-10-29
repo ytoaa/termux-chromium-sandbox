@@ -1690,3 +1690,23 @@ save-gate(has_new)로 빈 캐시 승진 차단(Round 21 가드 철학 동일).
 크기/연령 prune, 경로 가드, 동시 collect 원자성(이 테스트가 실제 경합을
 발견 → 스크립트 게시도 tmp+mv로 원자화), DEB-키 코어( deb_key,
 deb_reuse_*, image_fingerprint)가 9ecb6e3과 바이트 동일함을 git show로 검증.
+
+### Round 24 addendum — run 40862002110 (branch bootstrap) findings
+1. **Actions cache branch scoping**: caches saved on `perf/ci-cache-layers`
+   are invisible to `perf/ci-source-cache` workflow_dispatch runs (only
+   same-branch + default-branch scopes are restorable; PR-base sharing
+   applies to PR events only). First run on the new branch therefore
+   restored NOTHING (sccache/depcache/L4 all miss → cold compile died at
+   94% on the 240-min guard, RC=124 — a bootstrap cost, not an L4 defect;
+   the same run SAVED all layers under its branch scope, so the next run
+   is warm). Dual restore-key fallbacks (`...-<base>-`, `...-`) then keep
+   working within the branch even when port-input-hash rotates.
+2. **Deb hash anchor is format-dependent**: repo.json here is
+   `pkg_format: debian`; the `<repo>-json` maps exist only in pacman mode.
+   The GPG-anchored deb hashes are the SHA256 stanzas of the
+   `<repo>*-Packages` files (verified per run against the gpg-verified
+   Release). v1 shipped json-only, so all 29 `_cache-all` debs were
+   correctly REJECTED as unverified (fail-closed behaved). Fixed:
+   collect now unions both anchors; T33k pins the debian path
+   (uppercase SHA256 normalized).
+3. Per-entry `L4 ACCEPT` audit log lines added (new entries only).

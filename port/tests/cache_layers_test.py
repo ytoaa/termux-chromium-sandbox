@@ -566,6 +566,23 @@ r = l4_cmd("source-cache-collect", tpl4, envl4)
 ok("T33j age-pruned entry re-collected once fresh (prune is policy, not breakage)",
    any(p.name.endswith("__blobA.tar.xz") for p in L4ROOT.rglob("*")), r.stdout[-120:])
 
+# T33k: DEBIAN-format anchor — deb hash anchored in the GPG-verified
+# Packages index (repo.json here uses pkg_format=debian; *-json exists only
+# in pacman mode — run 40862002110 proved the json-only anchor rejected all
+# 29 _all debs). Acceptance must come from the SHA256 stanza instead.
+deb2_payload = b"ALLDEB2" * 700
+deb2_sha = sha(deb2_payload)
+deb2_rel = "pool/main/f/foo/foo_1.0_all.deb"
+(deb2_dir := (TOP4 / "_cache-all" / "pool" / "main" / "f" / "foo")).mkdir(parents=True)
+(deb2_dir / "foo_1.0_all.deb").write_bytes(deb2_payload)
+(TOP4 / "_cache-all" / "main-Packages").write_text(
+    "Package: foo\nVersion: 1.0-1\nArchitecture: all\n"
+    f"Filename: {deb2_rel}\nSize: {len(deb2_payload)}\nSHA256: {deb2_sha.upper()}\n\n")
+r = l4_cmd("source-cache-collect", tpl4, envl4)
+ok("T33k debian Packages-anchor deb accepted (uppercase SHA256 normalized) + per-entry ACCEPT log",
+   any(p.name.endswith("__pool%2Fmain%2Ff%2Ffoo%2Ffoo_1.0_all.deb") for p in L4ROOT.rglob("*"))
+   and "L4 ACCEPT deb-all/" in r.stdout, r.stdout[-200:])
+
 r = l4_cmd("source-cache-restore", tpl4, dict(envl4, TERMUX_L4_ROOT=str(W / "l4-elsewhere-restore")))
 ok("T34a path guard: unexpected L4 root refused by restore (rc=0, no writes)",
    r.returncode == 0 and "SKIP: unexpected root" in r.stdout
