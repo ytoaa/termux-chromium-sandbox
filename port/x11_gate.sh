@@ -45,7 +45,13 @@ run_capture() { # $1=bin $2=tag  [extra flags...]
   local udd="$WS/udd-$tag" log="$WS/x11-$tag.log"
   rm -rf "$udd"
   # setsid + process-group kill (never pkill -f: our own cmdline matches)
-  DISPLAY="$DISP" setsid env ${PRE:+LD_PRELOAD=$PRE} "$bin" --ozone-platform=x11 --user-data-dir="$udd" \
+  # Audit round (DESIGN Round 25): the preload export was an UNQUOTED
+  # parameter-expansion assignment — a preload path containing spaces
+  # word-split into bogus assignments and the gate could silently measure an
+  # UNSHEILDED binary. Array expansion keeps it one argv element.
+  local -a prearg=()
+  [ -n "${PRE:-}" ] && prearg=(LD_PRELOAD="$PRE")
+  DISPLAY="$DISP" setsid env "${prearg[@]}" "$bin" --ozone-platform=x11 --user-data-dir="$udd" \
       --no-first-run --disable-dev-shm-usage --enable-logging=stderr --v=1 \
       "$@" "file://$PAGE" >"$log" 2>&1 &
   local gpid=$!

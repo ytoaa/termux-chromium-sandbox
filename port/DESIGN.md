@@ -1721,3 +1721,77 @@ CLONE ONLY (stock chromium untouched; sha256-verification untouched) to
 so the space rationale does not apply on this fleet. bash -n contract +
 T41 pin the substitution (quoted: an unquoted `( )` in the note was caught
 by [10] during development — evidence the local gates earn their keep).
+
+## Round 25 — Full security/functional audit + verification hardening (2026-10-30)
+
+Scope: read-only full audit of the R12 policy (Phase A), failure/boundary
+scenario inventory of runtime-target scripts + packaging glue (Phase B,
+F1-F22 ledger in chromium-evidence/r12/REPORT-R12-FULL-AUDIT-AO.md),
+test/CI verification (Phase C) and MAIN-device spot re-validation of the
+C3 artifact (Phase D). NO shipping security policy was touched: policy C++
+stays byte-identical (T15/T34i/[47]-[51]), no allowlist change, no
+disposition change, no key relaxation (T43 pins sensitivity INCREASE only).
+
+Findings fixed in this round (verification-integrity, minimal changes):
+
+1. Generated post_get_source hook (F1/F11): the fail-closed contract leaned
+   on build-package.sh's external `set -euo pipefail` (pinned de1dd3d1 line
+   21 — verified) plus a stale `>= 8 records` counter (19 records exist).
+   Now: transformer rc captured from PIPESTATUS, stderr tee'd into the
+   evidence log, EVERY unconditional rule (R1 R2 R3 R4 R5 R7 R9a R10 R11
+   R12) must appear as `] <id> `, and the anti-injection completion marker
+   is required. Stub matrix proves refusal with AND without builder options.
+2. CI Package gates (F2/F3): plain substring rule grep let `R1` match
+   R10/R11/R12 lines; an absent evidence mirror was WARN-only. Now anchored
+   `] <id> ` grep, build-log fallback for the mirror, and an empty evidence
+   chain on a FRESH build REFUSES (REUSED=1 legitimately skips evidence
+   discovery — the deb was gated on its originating run and the
+   manifest/chrome-sha/R12-marker chain re-verifies the bytes).
+3. DEB gates (F4c/F17): added bin/chromium-sandboxed ->
+   chromium-shield-wrapper.sh symlink-target assertion (a lost `ln -sfr`
+   repoint previously shipped an unsheilded bin entry silently) and a
+   no-maintainer-scripts invariant (preinst/postinst/prerm/postrm).
+4. deb_key dead inputs (F18): production recipe lives in x11-packages/
+   (PKG_DST), but the key hashed `packages/chromium-sandboxed` —
+   recipe_sha was a constant over an empty set and upstream detection was
+   dead; the T7/T8 packages/ fixtures masked it. Both layouts are now
+   hashed; T42 (untracked x11 recipe edit rotates the key) and T43
+   (repo.json rotates the key) pin the fix; T34i re-pinned accordingly
+   (deb_key intentionally upgraded, everything else still byte-pinned to
+   9ecb6e3). CI DEB_KEY rotates once — expected, documented.
+5. wrapper_guard (F12): set-but-empty PREFIX fell through the mixed-identity
+   check while the wrapper's `${PREFIX:-default}` exec'd the DEFAULT
+   installation. The guard now compares the wrapper's EFFECTIVE root; the
+   selftest expectation was flipped to refuse.
+6. Anti-injection scan (F11a): unreadable .cc targets (dangling symlink,
+   EACCES) escaped as an uncaught OSError traceback invisible to the log;
+   now a named `(unreadable <type>)` offender (fail closed, actionable).
+7. x11_gate (F14): the LD_PRELOAD assignment was an unquoted expansion —
+   spaces in the preload path word-split and the gate could measure an
+   UNSHEILDED binary. Array expansion; suite X1/X2.
+
+Contract suite: port/tests/verification_hardening_test.py (22 checks,
+harness [53]). Cache suite 75 -> 77 (T42/T43).
+
+Accepted/document-only findings (no code change this round, §N of the
+audit report): census cross-instance false-PASS window (F12; mitigated by
+cleanup_all + serial gate policy), device_gate trap/lock gaps (F13),
+remote_gate dpkg-interruption recovery (F15), CDP port collisions (F16),
+PulseAudio stale-socket preference (F5b), gnp_shim fork-inheritance
+coverage rests on R7/R8 (F22), deb-cache same-trust-domain tamper model
+(F19; package gates re-run regardless), publish_apt signing debt (F21;
+known, pre-approved design), co-install share-path conflicts (F6; fix
+already exists on hotfix/chromium-side-by-side-package-paths, unmerged —
+release-readiness item), report-accuracy correction: run 40646555506 was
+overall FAILURE (Save sccache/Upload/Post, node24 infra), NOT "all green"
+— the full-green proof for the R12 code line is the stacked-branch runs
+(40729241856/40745613135/40757904721 + C3 40903720830).
+
+Device spot (Phase D, MAIN SM-F956N Android17 6.1.162, this round):
+C3 artifact deb 93ad9894... payload diff -r == candidate-verified
+07ee85eb tree (0 differences; chrome 2f488177 == Build-ID ad45cce0 era
+binary) -> device evidence transfers; r12_spot.sh V40x10 + VS(strace)x3:
+13/13 cdp_crashes 0, hist-31 0, renderer Seccomp_filters min/max 2/2 and
+NoNewPrivs min 1 across ~10,200 census rows, VS strace set_tid_address
+36/36 allowed-continues, 0 traps, 0 SIGSYS kill lines; --no-sandbox
+tripwire 0; dpkg -4 / real profile untouched.

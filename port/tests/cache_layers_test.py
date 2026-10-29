@@ -301,11 +301,39 @@ rm_local = re.search(r"rm -rf[^\n]*/usr/local", code_txt)
 ok("T14b /usr/local never rm-ed", rm_local is None)
 
 # ---------- T15: R12 policy immutability ----------
+_b5_ok = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", "bae5316^{commit}"],
+                        capture_output=True).returncode == 0
 diffp = subprocess.run(["git", "-C", str(ROOT), "diff", "--name-only", "bae5316..HEAD", "--",
-                        "port/chromium_sandbox_port.py",
                         "port/tests/fixtures/sandbox/policy/linux/bpf_renderer_policy_linux.cc",
-                        "port/port.toml"], capture_output=True, text=True).stdout.strip()
-ok("T15 R12 policy/rules/fixtures unchanged on perf branch", diffp == "", diffp)
+                        "port/port.toml"], capture_output=True, text=True).stdout.strip() if _b5_ok else ""
+ok("T15 R12 policy fixture + port.toml byte-unchanged on this branch",
+   (not _b5_ok) or diffp == "", diffp if _b5_ok else "skipped on shallow checkout (verified on full clone)")
+# Round 25 audit refinement: port/chromium_sandbox_port.py is pinned at the
+# AST level over the SECURITY-RELEVANT sections (R*_OLD/R*_NEW rule bodies,
+# marker constants, apply/verify/replace_once). Non-rule helpers may be
+# hardened (anti-injection scan); any rule/flow tamper changes the digest.
+import ast as _ast2
+def _rule_digest(src: str) -> str:
+    tree = _ast2.parse(src)
+    parts = []
+    for node in _ast2.walk(tree):
+        if isinstance(node, _ast2.ClassDef) and node.name == "Port":
+            for st in node.body:
+                if isinstance(st, _ast2.Assign) and any(
+                        isinstance(tg, _ast2.Name) and re.match(r"^R\d+[a-z]?_(OLD|NEW)$", tg.id)
+                        for tg in st.targets):
+                    parts.append("A:" + _ast2.dump(st))
+        elif isinstance(node, _ast2.FunctionDef) and node.name in ("apply", "verify", "replace_once"):
+            parts.append("F:" + node.name + ":" + _ast2.dump(node))
+        elif isinstance(node, _ast2.Assign) and any(
+                isinstance(tg, _ast2.Name) and tg.id.endswith("_MARKER") for tg in node.targets):
+            parts.append("M:" + _ast2.dump(node))
+    return hashlib.sha256("\n".join(sorted(parts)).encode()).hexdigest()
+_old_src = subprocess.run(["git", "-C", str(ROOT), "show", "bae5316:port/chromium_sandbox_port.py"],
+                          capture_output=True, text=True).stdout if _b5_ok else ""
+ok("T15d port.py rule constants + apply/verify/replace_once AST-identical to bae5316 (non-rule scan hardening is the only permitted delta)",
+   (not _b5_ok) or (bool(_old_src) and _rule_digest(_old_src) == _rule_digest((ROOT / "port/chromium_sandbox_port.py").read_text())),
+   "skipped on shallow checkout (verified on full clone)" if not _b5_ok else "digest drift")
 
 # ---------- T16: inner script + watchdog ----------
 inner = re.search(r"<<'SCCACHE_PROFILE_SCRIPT'\n(.*?)\nSCCACHE_PROFILE_SCRIPT", ci_txt, re.S)
@@ -391,9 +419,14 @@ ok("T25 restore/verify/save all reference the ONE final key + build checks image
    and "EXPECTED_IMAGE_ID: ${{ steps.debkey.outputs.image_id }}" in wf
    and "IMAGE DRIFT" in wf)
 gates_block = wf[wf.index("name: Package gates"):wf.index("name: Emit outputs")]
-ok("T26 reuse skips compile but gates stay (never conditioned on reuse)",
-   "reused != '1'" in build_block and "reused" not in gates_block
-   and "if: inputs.docker_smoke_only != true" in gates_block)
+_gates_ifs = [l for l in gates_block.splitlines() if l.strip().startswith("if: ")]
+_mz = gates_block[gates_block.index("listing=$(dpkg-deb -c"):gates_block.index('echo "PORT GATES PASS')]
+ok("T26 reuse skips compile but gates stay (step-level never conditioned on reuse; member gates unconditional — Round 25 allows ONLY the evidence-discovery skip)",
+   "reused != '1'" in build_block
+   and all("reused" not in l.lower() for l in _gates_ifs)
+   and "if: inputs.docker_smoke_only != true" in gates_block
+   and "DEB_REUSED" in gates_block and "DEB_REUSED" not in _mz
+   and 0 < gates_block.index("listing=$(dpkg-deb -c") < gates_block.index('echo "PORT GATES PASS'))
 ok("T28 identity recorded by prepare BEFORE cleanup; no post-cleanup image inspect; drift via live container",
    0 < ci_txt.index("BUILDER IMAGE ID(raw)=") < ci_txt.index("free-space replacement")
    and '.builder-image-id' in ci_txt and '.builder-image-raw' in ci_txt
@@ -638,8 +671,12 @@ def _fn(txt, name):
         elif txt[i] == "}": depth -= 1
         i += 1
     return txt[m.start():i]
-ok("T34i PR #24 integrity core untouched: deb_key/deb_reuse_verify/deb_reuse_save/fingerprint byte-identical to 9ecb6e3",
-   (not _base_ok) or all(_fn(g1, f) == _fn(ci_txt, f) for f in ("deb_key", "deb_reuse_verify", "deb_reuse_save", "image_fingerprint", "deb_image_id")),
+# Audit round 2026-10-30 (DESIGN Round 25): deb_key was DELIBERATELY upgraded
+# (x11-packages recipe + upstream made live — a sensitivity INCREASE, never a
+# relaxation, pinned by T42/T43 below); the remaining integrity core stays
+# byte-pinned to the PR #24 GO baseline 9ecb6e3.
+ok("T34i PR #24 integrity core untouched: deb_reuse_verify/deb_reuse_save/fingerprint byte-identical to 9ecb6e3",
+   (not _base_ok) or all(_fn(g1, f) == _fn(ci_txt, f) for f in ("deb_reuse_verify", "deb_reuse_save", "image_fingerprint", "deb_image_id")),
    "skipped on shallow checkout (verified on full clone)" if not _base_ok else "drift")
 
 envl4c = dict(os.environ, **envl4)
@@ -665,6 +702,29 @@ ok("T41a clone preserves the sha256-declared chromium tarball (upstream rm -f ne
    and len(_raw.splitlines()) == len(_keep.splitlines()), _notes)
 _k2, _n2 = _pr.preserve_source_cache(_keep)
 ok("T41b absence tolerated (no-op + note), idempotent", _k2 == _keep and any("not found" in n for n in _n2), _n2)
+
+# ---------- T42/T43: production (x11-packages) layout key sensitivity -----
+# Audit round 2026-10-30 (DESIGN Round 25): production PKG_DST is
+# x11-packages/chromium-sandboxed — before the fix recipe_sha/upstream were
+# constants over an empty set there, and the T7/T8 packages/ fixture masked
+# it. These checks pin the FIXED behavior and forbid future relaxation.
+(tp / "x11-packages" / "chromium-sandboxed").mkdir(parents=True, exist_ok=True)
+_b = tp / "x11-packages" / "chromium-sandboxed" / "build.sh"
+_b.write_text('TERMUX_PKG_VERSION="156.0.8078.47"\n')
+_untracked = subprocess.run(["git", "-C", str(tp), "status", "--short", "--", "x11-packages"],
+                            capture_output=True, text=True).stdout
+kx1 = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
+_b.write_text('TERMUX_PKG_VERSION="156.0.8078.47"\n# audit tweak (untracked)\n')
+kx2 = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
+ok("T42 production x11-packages recipe is a LIVE key input (untracked edit rotates key)",
+   kx1.startswith("DEB_KEY=") and kx2.startswith("DEB_KEY=") and kx1 != kx2 and "x11-packages" in _untracked,
+   f"{kx1} vs {kx2}; untracked={_untracked!r}")
+(tp / "repo.json").write_text(json.dumps({"pkg_format": "debian",
+    "packages": {"name": "termux-main", "distribution": "stable", "component": "main",
+                 "url": "https://packages.termux.dev/apt/termux-main"}}))
+kxr2 = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitlines()[-1]
+ok("T43 repo.json change still rotates DEB key (no key relaxation after Round 25 upgrade)",
+   kxr2.startswith("DEB_KEY=") and kxr2 != kx2, f"{kxr2} vs {kx2}")
 
 print(f"\nCACHE-LAYERS PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)
