@@ -1710,3 +1710,14 @@ deb_reuse_*, image_fingerprint)가 9ecb6e3과 바이트 동일함을 git show로
    collect now unions both anchors; T33k pins the debian path
    (uppercase SHA256 normalized).
 3. Per-entry `L4 ACCEPT` audit log lines added (new entries only).
+
+### Round 24 addendum 2 — tarball preservation adapter (largest repeated cost)
+`x11-packages/chromium/build.sh:65` deletes the 1.87 GB extracted tarball
+("keep more space") BEFORE collect can see it — so L4 could not persist the
+single biggest per-rebuild download (github release; the exact failure
+class we are hardening). prepare_recipe now rewrites that ONE line in OUR
+CLONE ONLY (stock chromium untouched; sha256-verification untouched) to
+`:` + quoted audit note — the container has ~94 GB free after free-space,
+so the space rationale does not apply on this fleet. bash -n contract +
+T41 pin the substitution (quoted: an unquoted `( )` in the note was caught
+by [10] during development — evidence the local gates earn their keep).
