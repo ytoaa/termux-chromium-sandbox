@@ -483,8 +483,8 @@ out=$(python3 "port/tests/verification_hardening_test.py" 2>&1); got=$?
 # package_identity_gate (+ real pre-F6 deb refusal), install-set disjointness
 # vs stock, forged cached-DEB release-chain refusal, stale-key reuse refusal.
 out=$(python3 "port/tests/f6_side_by_side_test.py" 2>&1); got=$?
-[ "$got" -eq 0 ] && echo "$out" | grep -q '^F6-SUITE PASS=28 FAIL=0$' \
-  && pass "[54] F6 side-by-side suite (28 checks)" \
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^F6-SUITE PASS=30 FAIL=0$' \
+  && pass "[54] F6 side-by-side suite (30 checks)" \
   || { fail "[54] F6 side-by-side suite"; printf '%s\n' "$out" | tail -40; }
 
 exit $rc

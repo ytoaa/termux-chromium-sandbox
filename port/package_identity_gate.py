@@ -18,10 +18,19 @@ REQUIRED = {
     "lib/chromium-sandboxed/chrome",
     "lib/chromium-sandboxed/chromium-shield-wrapper.sh",
     "lib/chromium-sandboxed/libtermux-gnp-fix.so",
-    "share/man/man1/chromium-sandboxed.1",
+    # manpage: termux-package-build gzips man/ files automatically, so the
+    # real deb ships .1.gz; accept either spelling (run 41022366268 proved
+    # the plain form never exists in a produced deb — the old exact
+    # requirement failed every correct package, i.e. a gate bug, not drift).
     "share/applications/chromium-sandboxed.desktop",
     "share/metainfo/chromium-sandboxed.appdata.xml",
 }
+REQUIRED_GLOBS = (
+    ("share/man/man1/chromium-sandboxed.1*",
+     "isolated manpage (plain or .gz)"),
+    ("share/icons/hicolor/*/apps/chromium-sandboxed.png",
+     "isolated hicolor icon"),
+)
 DENIED = (
     "bin/chromium-browser",
     "bin/chromedriver",
@@ -64,6 +73,9 @@ def check_paths(paths: set[str]) -> list[str]:
             if fnmatch.fnmatchcase(entry, pat):
                 errors.append(f"stock Chromium-owned path: {entry}")
                 break
+    for pattern, what in REQUIRED_GLOBS:
+        if not any(fnmatch.fnmatchcase(p, pattern) for p in paths):
+            errors.append(f"required isolated package file missing: {what} [{pattern}]")
     for missing in sorted(REQUIRED - paths):
         errors.append(f"required isolated package file missing: {missing}")
     if not any(re.fullmatch(r"share/icons/hicolor/\d+x\d+/apps/chromium-sandboxed\.png", p)

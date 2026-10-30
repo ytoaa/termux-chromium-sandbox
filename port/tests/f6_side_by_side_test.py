@@ -159,6 +159,22 @@ with tempfile.TemporaryDirectory(prefix="f6-b-") as tmp:
     r = run(["python3", GATE, str(deb)])
     ok("B1 well-formed isolated deb PASSES (hotfix './' root-row crash pin)",
        r.returncode == 0 and "PACKAGE-IDENTITY-PASS" in r.stdout, (r.stdout + r.stderr)[-160:])
+    # B1b: termux-build auto-gzips man/ — a deb shipping ONLY chromium-sandboxed.1.gz
+    # is the real produced shape (run 41022366268: the old exact-.1 REQUIRED failed
+    # every correct package). Gate must PASS on the gz form and still DENY chromium.1.gz.
+    tg = Path(tmp) / "gzonly"; make_good_deb(tg)
+    mg = tg / "data/data/com.termux/files/usr/share/man/man1"
+    (mg / "chromium-sandboxed.1").rename(mg / "chromium-sandboxed.1.gz")
+    dg = Path(tmp) / "gz.deb"; run(["dpkg-deb", "-b", str(tg), str(dg)], check=True)
+    rg = run(["python3", GATE, str(dg)])
+    ok("B1b gz-only manpage (real termux shape) PASSES; stock chromium.1.gz still DENIED",
+       rg.returncode == 0 and "PACKAGE-IDENTITY-PASS" in rg.stdout, (rg.stdout + rg.stderr)[-160:])
+    ts = Path(tmp) / "gzstock"; make_good_deb(ts)
+    (ts / "data/data/com.termux/files/usr/share/man/man1/chromium.1.gz").write_text("gz")
+    ds = Path(tmp) / "gzstock.deb"; run(["dpkg-deb", "-b", str(ts), str(ds)], check=True)
+    rs = run(["python3", GATE, str(ds)])
+    ok("B1c stock chromium.1.gz DENIED even alongside isolated set",
+       rs.returncode == 1 and "share/man/man1/chromium.1.gz" in rs.stderr, rs.stderr[-140:])
     cases = (
         ("stock desktop", "share/applications/chromium.desktop"),
         ("stock driver symlink", "bin/chromedriver"),
