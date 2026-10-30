@@ -267,6 +267,67 @@ else:
     ok("C2b installed-tree check skipped (no -4 package on this runner)", True)
 
 # ---------------- D: cached-DEB reuse chain ----------------
+# ---------------- A6: launcher BEHAVIOR (real sh execution) ----------------
+def run_launcher(home, xdg=None, extra_args=(), user_flags=None, root_like=False):
+    """Execute the rewritten launcher with a fake chrome that prints argv."""
+    tmpd = tempfile.mkdtemp(prefix="f6-launch-")
+    prefix = Path(tmpd) / "usr"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "lib/chromium-sandboxed").mkdir(parents=True)
+    launcher = Path(tmpd) / "launcher.sh"
+    text = prepare_recipe.rewrite_launcher(LT).replace("@TERMUX_PREFIX@", str(prefix))
+    if root_like:  # simulate the upstream failsafe branch firing (root+root-owned HOME)
+        text = text.replace("[ $(id -u) -eq 0 ] && [ $(stat -c %u -L ${XDG_CONFIG_HOME:-${HOME}}) -eq 0 ]", "true")
+    launcher.write_text(text)
+    fake = Path(tmpd) / "chrome"  # launcher execs "$PROGDIR/chrome" (PROGDIR = launcher dir)
+    fake.write_text('#!/bin/sh\nfor a in "$@"; do echo "ARG|$a"; done\n')
+    fake.chmod(0o755)
+    env = dict(os.environ, HOME=str(home), PATH=str(prefix / "bin") + ":" + os.environ["PATH"])
+    env.pop("XDG_CONFIG_HOME", None)
+    if xdg is not None:
+        env["XDG_CONFIG_HOME"] = str(xdg)
+    if user_flags is not None:
+        env["CHROMIUM_USER_FLAGS"] = user_flags
+    r = run(["sh", str(launcher), *extra_args], env=env)
+    args = [l[4:] for l in r.stdout.splitlines() if l.startswith("ARG|")]
+    return r.returncode, args, tmpd
+
+rc, args, _ = run_launcher(Path.home())
+udd = [a for a in args if a.startswith("--user-data-dir=")]
+ok("A6c default run injects exactly ONE isolated user-data-dir (non-root)",
+   rc == 0 and len(udd) == 1 and udd[0] == f"--user-data-dir={Path.home()}/.config/chromium-sandboxed", str(args)[-160:])
+rc2, args2, _ = run_launcher(Path.home(), xdg="/tmp/xdgtest".replace("/tmp", str(Path(os.environ.get('TMPDIR','/data/data/com.termux/files/usr/tmp')))))
+udd2 = [a for a in args2 if a.startswith("--user-data-dir=")]
+ok("A6d XDG_CONFIG_HOME honored as config base", rc2 == 0 and len(udd2) == 1
+   and udd2[0].endswith("/xdgtest/chromium-sandboxed"), str(udd2))
+rc3, args3, _ = run_launcher(Path.home(), extra_args=("--user-data-dir=/custom/prof", "--foo"))
+udd3 = [a for a in args3 if a.startswith("--user-data-dir=")]
+ok("A6e explicit --user-data-dir respected, no duplicate injection",
+   rc3 == 0 and udd3 == ["--user-data-dir=/custom/prof"] and "--foo" in args3, str(args3))
+rc4, args4, _ = run_launcher(Path.home(), user_flags="--user-data-dir=/env/prof")
+udd4 = [a for a in args4 if a.startswith("--user-data-dir=")]
+ok("A6f CHROMIUM_USER_FLAGS explicit dir respected (skip default)",
+   rc4 == 0 and udd4 == ["--user-data-dir=/env/prof"], str(args4))
+spacey = Path(tempfile.mkdtemp(prefix="f6 home dir"))
+rc5, args5, _ = run_launcher(spacey)
+udd5 = [a for a in args5 if a.startswith("--user-data-dir=")]
+ok("A6g HOME with spaces -> single intact token (set -- quoting)",
+   rc5 == 0 and len(udd5) == 1 and udd5[0] == f"--user-data-dir={spacey}/.config/chromium-sandboxed"
+   and str(spacey) in udd5[0], str(args5)[:180])
+rc6, args6, _ = run_launcher(Path.home(), root_like=True)
+udd6 = [a for a in args6 if a.startswith("--user-data-dir=")]
+ok("A6h root failsafe branch keeps isolated path, no double injection",
+   rc6 == 0 and len(udd6) == 1 and udd6[0].endswith("/chromium-sandboxed"), str(args6))
+for label, tamper_lt in (
+    ("config-glob drift", lambda x: x.replace('@TERMUX_PREFIX@/etc/chromium/*.conf', '@TERMUX_PREFIX@/etc/chromium.d/*.conf')),
+    ("desktop-anchor drift", lambda x: x.replace('# Set the .desktop file name', '# CHANGED upstream')),
+):
+    try:
+        prepare_recipe.rewrite_launcher(tamper_lt(LT))
+        ok(f"A6i fail-closed on launcher drift ({label})", False, "no raise")
+    except RecipeError:
+        ok(f"A6i fail-closed on launcher drift ({label})", True)
+
 with tempfile.TemporaryDirectory(prefix="f6-d-") as tmp:
     real = Path("/data/data/com.termux/files/home/Project/chromium-evidence/r12/"
                 "artifacts-c3/termux-packages/output/chromium-sandboxed_156.0.8078.47-12_aarch64.deb")

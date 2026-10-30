@@ -1843,3 +1843,25 @@ Cache suite 78 green; hardening 22 green; full harness re-run recorded in
 the audit evidence (RC=0). CI: full build + REUSED dispatches on
 fix/f6-side-by-side (publish=false) with PACKAGE-IDENTITY-PASS as the new
 gate line; results appended to the F6 evidence section of the A–O report.
+
+
+## Round 27 — profile isolation defect fix + TESTBED tooling (2026-10-31)
+
+TESTBED (A13) evidence proved the Round-26 launcher isolation was incomplete:
+the only user-data-dir branch was upstream's ROOT failsafe, so regular users
+shared ~/.config/chromium — 3413 profile files (incl Default/Preferences)
+were written during a test run (evidence: chromium-evidence/r12/testbed2/00,01).
+Fix (minimal, in rewrite_launcher): anchored fail-closed injection of
+`set -- --user-data-dir="${XDG_CONFIG_HOME:-${HOME}/.config}/chromium-sandboxed" "$@"`
+for every user, skipped when any of "$@"/CHROMIUM_USER_FLAGS/CHROMIUM_FLAGS
+already carries --user-data-dir (explicit wins via chromium last-occurrence;
+no duplicates), set -- preserves whitespace, root block retained with the
+isolated path. audit() gains the injection needle (tamper-refusal).
+[54] extended 30→38: six REAL sh executions (default/XDG/explicit-arg/
+env-flags/spaces-HOME/root-simulated) + two upstream-drift fail-closed cases.
+
+Tooling: ws_proof/dl_proof retired the hardcoded .phc-main defaults —
+strict resolution (PHC_WRAPPER env → installed package on PATH → loud
+SystemExit) plus /proc/pid/exe cross-verification gates feeding the verdict
+(no PASS without an exe-verified packaged chrome). T3/T4 execution evidence
+is collected on TESTBED (Phase 4); nothing here claims unexecuted passes.
