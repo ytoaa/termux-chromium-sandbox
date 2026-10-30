@@ -255,8 +255,20 @@ with tempfile.TemporaryDirectory(prefix="f6-d-") as tmp:
     real = Path("/data/data/com.termux/files/home/Project/chromium-evidence/r12/"
                 "artifacts-c3/termux-packages/output/chromium-sandboxed_156.0.8078.47-12_aarch64.deb")
     if not real.is_file():
-        ok("D1 pre-F6 forged-consistent cache cannot pass release chain (skipped: no artifact)", True)
-    else:
+        # Environment-independent fallback: SYNTHETIC pre-F6 deb — isolated set
+        # plus one injected stock-owned path; chrome payload carries the R12
+        # marker so the content chain legitimately passes and only the
+        # release-chain identity gate can refuse it.
+        src_t = Path(tmp) / "pretree"
+        make_good_deb(src_t)
+        (src_t / "chrome-marker" ).unlink(missing_ok=True)
+        (src_t / "data/data/com.termux/files/usr/lib/chromium-sandboxed/chrome").write_text(
+            "ELF\x00Termux seccomp-only r12-bionic-tid: renderer allow active\n")
+        f = src_t / "data/data/com.termux/files/usr/share/applications/chromium.desktop"
+        f.parent.mkdir(parents=True, exist_ok=True); f.write_text("[Desktop Entry]\n")
+        real = Path(tmp) / "chromium-sandboxed_156.0.8078.47-13_aarch64.deb"
+        run(["dpkg-deb", "-b", str(src_t), str(real)], check=True)
+    if True:
         tp = Path(tmp) / "termux-packages"
         (tp / ".deb-cache").mkdir(parents=True)
         shutil.copy(real, tp / ".deb-cache" / real.name)

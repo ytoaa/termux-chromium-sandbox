@@ -150,7 +150,7 @@ echo "$out" | grep -q 'APPLIED.*R3' \
 
 # [19] R4 zygote passthrough (device-gate round-2: set_tid_address SYS_SECCOMP kill)
 fresh
-out=$(python3 $PORT apply --src "$W/src" 2>/dev/null); out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
 echo "$out" | grep -q 'APPLIED.*R4' \
   && grep -q 'kZygote' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
   && grep -q '#if defined(__BIONIC__)' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
