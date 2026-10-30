@@ -143,6 +143,18 @@ def make_deb(root: Path, symlink_target="chromium-shield-wrapper.sh", postinst=F
     (lib / "libtermux-gnp-fix.so").write_text("so")
     (lib / "chromium-shield-wrapper.sh").write_text("exec chromium-launcher.sh\n")
     (lib / "chromium-launcher.sh").write_text("#!/bin/sh\nexec chrome\n")
+    (lib / "chrome").write_text("ELF-fixture")
+    # F6 (DESIGN Round 26): the Package gates step now also runs
+    # package_identity_gate.py — the fixture must carry the isolated set.
+    (binp / "chromedriver-sandboxed").write_text("drv")
+    (binp / "headless_shell-sandboxed").write_text("hs")
+    for rel in ("share/man/man1/chromium-sandboxed.1",
+                "share/applications/chromium-sandboxed.desktop",
+                "share/metainfo/chromium-sandboxed.appdata.xml",
+                "share/icons/hicolor/48x48/apps/chromium-sandboxed.png"):
+        f = root / "data/data/com.termux/files/usr" / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("isolated")
     ln = binp / "chromium-sandboxed"
     if ln.exists() or ln.is_symlink():
         ln.unlink()
@@ -166,6 +178,10 @@ def run_gates(tmp, tag, log_content=None, reused="0", **debkw):
     if log_content is not None:
         (tp / "port-apply-chromium.log").write_text(log_content)
     (ws / "gates.sh").write_text(body)
+    # the workflow step runs from the CHECKOUT ROOT (port/ + termux-packages/
+    # siblings) — mirror that layout into the fixture workspace.
+    (ws / "port").mkdir(exist_ok=True)
+    shutil.copy(ROOT / "port/package_identity_gate.py", ws / "port/package_identity_gate.py")
     env = dict(os.environ, DEB_REUSED=reused)
     return sh("exec bash gates.sh", env=env, cwd=str(ws))
 

@@ -42,9 +42,14 @@ def list_paths(deb: str) -> set[str]:
         fields = line.split(maxsplit=5)
         if len(fields) != 6:
             raise ValueError(f"unexpected dpkg-deb listing row: {line!r}")
-        path = fields[5].split(" -> ", 1)[0].removeprefix("./")
-        if path.endswith("/"):
+        raw = fields[5].split(" -> ", 1)[0]
+        if raw.endswith("/"):
             continue  # shared parent directories are not owned file collisions
+        path = raw.removeprefix("./")
+        # NOTE (F6 port, 2026-10-30): the hotfix stripped "./" BEFORE the
+        # trailing-slash skip, so the package root row ("./") became "" and
+        # raised on every real deb (branch never CI-verified). Order fixed;
+        # pinned by f6_side_by_side_test D1 (a well-formed deb must PASS).
         if not path.startswith(PREFIX):
             raise ValueError(f"unexpected package file outside Termux prefix: {path}")
         paths.add(path[len(PREFIX):])

@@ -56,6 +56,7 @@ grep -qF 'Termux seccomp-only sandbox:' "$WORK/src/content/browser/zygote_host/z
 # [8] recipe prepare/audit on vendored build.sh (side-by-side identity + hook)
 TREP="$WORK/termux"; mkdir -p "$TREP/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$TREP/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$TREP/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$TREP/build-package.sh"; chmod +x "$TREP/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$TREP" >/dev/null 2>&1 \
   && python3 port/prepare_recipe.py audit --termux-dir "$TREP" >/dev/null 2>&1 \
@@ -64,6 +65,7 @@ python3 port/prepare_recipe.py prepare --termux-dir "$TREP" >/dev/null 2>&1 \
 # [10] generated recipe must be bash-parseable
 fresh; TREP2="$WORK/termux2"; mkdir -p "$TREP2/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$TREP2/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$TREP2/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$TREP2/build-package.sh"; chmod +x "$TREP2/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$TREP2" >/dev/null 2>&1
 bash -n "$TREP2/x11-packages/chromium-sandboxed/build.sh" \
@@ -73,6 +75,7 @@ bash -n "$TREP2/x11-packages/chromium-sandboxed/build.sh" \
 # body (cr-patches loop) — chaining, never shadowing.
 fresh; TREP3="$WORK/termux3"; mkdir -p "$TREP3/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$TREP3/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$TREP3/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$TREP3/build-package.sh"; chmod +x "$TREP3/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$TREP3" >/dev/null 2>&1
 g="$TREP3/x11-packages/chromium-sandboxed/build.sh"
@@ -85,6 +88,7 @@ grep -q 'termux_step_post_get_source_upstream()' "$g" \
 # [12] sandbox-disable patches must be excluded from the cr-patches loop
 fresh2="$WORK/t12"; mkdir -p "$fresh2/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$fresh2/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$fresh2/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$fresh2/build-package.sh"; chmod +x "$fresh2/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$fresh2" >/dev/null 2>&1
 grep -q "grep -v -e '1001-chromium-disable-sandbox' -e '1004-chromium-headless-disable-sandbox-by-default'" "$fresh2/x11-packages/chromium-sandboxed/build.sh" \
@@ -112,6 +116,7 @@ grep -q -- '--disable-seccomp-filter-sandbox' $be \
 # [15] marathon: generated recipe must wire cc_wrapper=sccache (run #10 post-mortem)
 fresh; T15="$WORK/t15"; mkdir -p "$T15/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$T15/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$T15/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$T15/build-package.sh"; chmod +x "$T15/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$T15" >/dev/null 2>&1
 g15="$T15/x11-packages/chromium-sandboxed/build.sh"
@@ -200,6 +205,7 @@ python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
 #      and route bin/chromium-sandboxed through LD_PRELOAD (round-7 breakthrough)
 fresh; T25="$WORK/t25"; mkdir -p "$T25/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$T25/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$T25/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$T25/build-package.sh"; chmod +x "$T25/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$T25" >/dev/null 2>&1
 g25="$T25/x11-packages/chromium-sandboxed/build.sh"
@@ -223,6 +229,7 @@ python3 port/prepare_recipe.py audit --termux-dir "$T25" >/dev/null 2>&1 \
 #      repointed at it; the real launcher must never receive the shield line
 fresh; T27="$WORK/t27"; mkdir -p "$T27/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$T27/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$T27/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$T27/build-package.sh"; chmod +x "$T27/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$T27" >/dev/null 2>&1
 g27="$T27/x11-packages/chromium-sandboxed/build.sh"
@@ -277,6 +284,7 @@ python3 -c "import tomllib,sys; d=tomllib.load(open('port/port.toml','rb')); sys
 # unix: form; exec line & LD_PRELOAD path preserved; single wrapper).
 T32=$WORK/t32; rm -rf "$T32"; mkdir -p "$T32/x11-packages/chromium" "$T32/x11-packages/chromium-sandboxed"
 cp "$FIX/termux-build.sh" "$T32/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$T32/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$T32/build-package.sh"; chmod +x "$T32/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$T32" >/dev/null 2>&1
 G32="$T32/x11-packages/chromium-sandboxed/build.sh"
@@ -469,5 +477,14 @@ out=$(python3 "port/tests/verification_hardening_test.py" 2>&1); got=$?
 [ "$got" -eq 0 ] && echo "$out" | grep -q '^VERIFY-HARDENING PASS=22 FAIL=0$' \
   && pass "[53] verification-hardening suite (22 checks)" \
   || { fail "[53] verification-hardening suite"; printf '%s\n' "$out" | tail -40; }
+
+# [54] F6 side-by-side packaging contract (DESIGN Round 26): rewrite chain
+# pin + anchor fail-closed, launcher isolation, audit tamper negatives,
+# package_identity_gate (+ real pre-F6 deb refusal), install-set disjointness
+# vs stock, forged cached-DEB release-chain refusal, stale-key reuse refusal.
+out=$(python3 "port/tests/f6_side_by_side_test.py" 2>&1); got=$?
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^F6-SUITE PASS=28 FAIL=0$' \
+  && pass "[54] F6 side-by-side suite (28 checks)" \
+  || { fail "[54] F6 side-by-side suite"; printf '%s\n' "$out" | tail -40; }
 
 exit $rc

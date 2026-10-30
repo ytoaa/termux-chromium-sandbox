@@ -42,7 +42,11 @@ def rewrite_identity(text: str) -> str:
     # desktop file, manpage, icons and AppStream metadata. Every path must
     # be independent or dpkg -i fails (or --force-overwrite clobbers stock).
     t = text.replace("lib/chromium", "lib/chromium-sandboxed")
-    t = text.replace("bin/chromium-browser", "bin/chromium-sandboxed")
+    # NOTE (F6 port, 2026-10-30): the hotfix branch re-derived the second
+    # replace from `text`, silently discarding the lib-dir move — a latent
+    # regression that never reached CI (branch unverified). Chained here to
+    # restore main's behavior; pinned by f6_side_by_side_test A1.
+    t = t.replace("bin/chromium-browser", "bin/chromium-sandboxed")
     # Each target has a verified location in the pinned Termux recipe.
     rewrites = (
         ('ln -sfr $TERMUX_PREFIX/lib/chromium-sandboxed/chromedriver $TERMUX_PREFIX/bin/',

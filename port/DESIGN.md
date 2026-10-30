@@ -1795,3 +1795,51 @@ binary) -> device evidence transfers; r12_spot.sh V40x10 + VS(strace)x3:
 NoNewPrivs min 1 across ~10,200 census rows, VS strace set_tid_address
 36/36 allowed-continues, 0 traps, 0 SIGSYS kill lines; --no-sandbox
 tripwire 0; dpkg -4 / real profile untouched.
+
+## Round 26 — F6 release blocker resolved: side-by-side package path isolation (2026-10-30)
+
+Blocker (audit F6, confirmed against real artifacts): the sandboxed recipe
+inherited every stock-Chromium-owned installer path (share/applications/
+chromium.desktop, share/man/man1/chromium.1, icons hicolor/*/apps/chromium.png,
+metainfo/chromium.appdata.xml, bin/chromedriver, bin/headless_shell) — co-
+install with stock chromium is a dpkg file-ownership collision, and
+--force-overwrite would clobber stock (forbidden by project rails). The
+installed -4 tree still demonstrates the surface (f6 suite C2b; identity
+gate rejects the real pre-F6 deb listing exactly these paths — B7).
+
+Port: hotfix/chromium-side-by-side-package-paths (aebee77/40d7aba/1f7b612,
+never CI-verified) cherry-picked onto PR #26 HEAD; every intent preserved
+(fail-closed counted anchors, real-deb ownership gate, launcher isolation),
+plus TWO latent regressions the untested hotfix carried, found by this
+round's local CI-equivalent suites and fixed:
+1. rewrite_identity re-derived the second blind replace from `text`,
+   discarding the lib-dir move (main's chained form restored; pin A1).
+2. package_identity_gate stripped "./" BEFORE the trailing-slash skip, so
+   the package-root row became "" and raised on EVERY real deb (order
+   fixed; pin B1 with a well-formed deb — must PASS).
+
+F6 decisions (documented, human-reviewable):
+- Launcher isolation (hotfix intent kept): CHROME_DESKTOP, /etc/chromium
+  config dir and the fallback profile dir move under -sandboxed names.
+  Consequence: builds from this branch default to ~/.config/chromium-sandboxed
+  — the installed -4 continues using ~/.config/chromium (untouched); profile
+  migration for promoted builds is a human release-notes decision, NOT
+  performed here.
+- Ownership gate placement: inside Package gates, BEFORE any artifact use;
+  it also runs on REUSED=1 (proven: forged-consistent pre-F6 cache passes
+  content gates by design — bytes are honestly hashed — and is then refused
+  by the release chain; suite D1a/D1b).
+- Hardening interplay preserved: identity gate added without touching the
+  Round 25 hook/evidence/symlink/maintainer gates (suite [53] 22/22 still
+  green with the fixture extended to the isolated member set; DEB key
+  rotates again via port-input-hash — sensitivity direction only).
+
+Verification: new [54] suite 28 checks (rewrite chain/drift fail-closed,
+launcher isolation/idempotence, audit tamper negatives x3, gate positive +
+6 negatives + REAL pre-F6 deb refusal, install-set disjointness (static +
+real stock deb when F6_STOCK_DEB is provided; pool-retention absent today,
+proxy via installed tree C2b), reuse-chain refusal, stale-key refusal).
+Cache suite 78 green; hardening 22 green; full harness re-run recorded in
+the audit evidence (RC=0). CI: full build + REUSED dispatches on
+fix/f6-side-by-side (publish=false) with PACKAGE-IDENTITY-PASS as the new
+gate line; results appended to the F6 evidence section of the A–O report.
