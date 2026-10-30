@@ -22,10 +22,24 @@ import threading
 import time
 
 OUT_DIR = os.environ.get('PHC_WS_OUT', os.path.dirname(os.path.abspath(__file__)))
-WRAPPER = os.environ.get(
-    'PHC_WRAPPER',
-    '/data/data/com.termux/files/home/Project/.phc-main/data/data/'
-    'com.termux/files/usr/bin/chromium-sandboxed')
+def _require_wrapper():
+    # Stale-path incident (TESTBED 2026-10-31): a hardcoded .phc-main default
+    # made the harness exec a nonexistent binary while the parent still
+    # reported structured output — resolve strictly: env override, then the
+    # INSTALLED package on PATH, then fail loudly (never a silent default).
+    v = os.environ.get('PHC_WRAPPER')
+    if v:
+        return v
+    if 'shutil' not in globals():
+        import shutil as _sh
+        globals()['shutil'] = _sh
+    w = shutil.which('chromium-sandboxed')
+    if w:
+        return w
+    raise SystemExit('ws_proof: wrapper unresolved — set PHC_WRAPPER or install '
+                     'chromium-sandboxed; refusing the retired hardcoded path')
+
+WRAPPER = _require_wrapper()
 # residual-scan identity: real chrome inside the packaged prefix the
 # wrapper resolves to (derived from the wrapper, never executed directly)
 CHROME = os.path.realpath(os.path.join(
@@ -172,6 +186,15 @@ def main():
             time.sleep(0.5)
         expected = ['m%d' % i for i in range(N)]
         recv_ok = proof['sent_by_page'] == expected
+        # log<->process linkage: the launched process must BE the packaged
+        # chrome the wrapper resolves to (exe-verified, never inferred).
+        try:
+            _exe = os.path.realpath('/proc/%d/exe' % proc.pid)
+        except OSError:
+            _exe = None
+        proof['proc_exe'] = _exe
+        if _exe != CHROME:
+            proof['errors'].append('proc exe mismatch: %r != %r' % (_exe, CHROME))
         all_ok = (recv_ok and proof['server_echoed'] == N
                   and proof['page_msgs_received'] == N
                   and not proof['errors'])

@@ -21,14 +21,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cdp_client import CDP, CDPError
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CHROME = os.environ.get(
-    'PHC_CHROME',
-    '/data/data/com.termux/files/home/Project/.phc-main/data/data/'
-    'com.termux/files/usr/lib/chromium-sandboxed/chrome')
-WRAPPER = os.environ.get(
-    'PHC_WRAPPER',
-    '/data/data/com.termux/files/home/Project/.phc-main/data/data/'
-    'com.termux/files/usr/bin/chromium-sandboxed')
+def _require_wrapper():
+    # see ws_proof: strict resolution, no stale .phc-main default
+    v = os.environ.get('PHC_WRAPPER')
+    if v:
+        return v
+    w = shutil.which('chromium-sandboxed')
+    if w:
+        return w
+    raise SystemExit('dl_proof: wrapper unresolved — set PHC_WRAPPER or install '
+                     'chromium-sandboxed; refusing the retired hardcoded path')
+
+WRAPPER = _require_wrapper()
+CHROME = os.environ.get('PHC_CHROME') or os.path.realpath(os.path.join(
+    os.path.dirname(os.path.realpath(WRAPPER)), 'chrome'))
 
 BODY = bytes(range(256)) * 4096  # 1 MiB
 EXPECTED_SHA = hashlib.sha256(BODY).hexdigest()
@@ -154,7 +160,13 @@ def main():
         result.update({'final_path': final, 'final_name': os.path.basename(final),
                        'size': os.path.getsize(final), 'expected_sha256': EXPECTED_SHA,
                        'actual_sha256': got})
-        if got == EXPECTED_SHA:
+        try:
+            _exe = os.path.realpath('/proc/%d/exe' % proc.pid)
+        except OSError:
+            _exe = None
+        result['proc_exe'] = _exe
+        result['proc_exe_verified'] = (_exe == CHROME)
+        if got == EXPECTED_SHA and _exe == CHROME:
             result.update({'verdict': 'PASS',
                            'reason': ('CDP download completed (event=%s); '
                                       'final file stable, no .crdownload, '

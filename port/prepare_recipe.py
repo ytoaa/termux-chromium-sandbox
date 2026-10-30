@@ -81,9 +81,36 @@ def rewrite_launcher(text: str) -> str:
          'export CHROME_DESKTOP="chromium-sandboxed.desktop"', "launcher desktop ID"),
         ('@TERMUX_PREFIX@/etc/chromium/*.conf',
          '@TERMUX_PREFIX@/etc/chromium-sandboxed/*.conf', "launcher config isolation"),
-        ('/.config}/chromium', '/.config}/chromium-sandboxed', "root-only fallback profile"),
+        ('/.config}/chromium', '/.config}/chromium-sandboxed', "root failsafe profile path"),
     ):
         text = _replace_expected(text, old, new, 1, label)
+    # TESTBED-verified defect (2026-10-31): the block above fires ONLY for
+    # root with root-owned HOME, so regular users silently shared the stock
+    # ~/.config/chromium profile (3413 files incl. Default/Preferences were
+    # written during a test run). Isolate the default profile for EVERY user,
+    # anchored fail-closed on the desktop-id block (upstream drift -> raise).
+    # Design notes:
+    #  - `set --` keeps the injected token quoted through the unquoted exec
+    #    line's "$@", so HOME/XDG paths containing spaces survive intact.
+    #  - Explicit --user-data-dir always wins: user "$@" args and
+    #    CHROMIUM_USER_FLAGS/CHROMIUM_FLAGS appear later on the command line
+    #    (chromium takes the last occurrence); when any already carry the
+    #    flag we skip our default entirely (no duplicates).
+    #  - Same config base as upstream: ${XDG_CONFIG_HOME:-${HOME}/.config}.
+    anchor = ('# Set the .desktop file name\n'
+              'export CHROME_DESKTOP="chromium-sandboxed.desktop"')
+    injection = """# Port (F6 profile isolation): default every user to an isolated profile
+# directory; explicit --user-data-dir (args or flags) is respected by skipping
+# the default, and set -- preserves whitespace in the path.
+for _f in "$@" ${CHROMIUM_USER_FLAGS:-} ${CHROMIUM_FLAGS:-}; do
+    case "$_f" in --user-data-dir*) _udd=1 ;; esac
+done
+if [ "${_udd:-0}" != 1 ]; then
+    set -- --user-data-dir="${XDG_CONFIG_HOME:-${HOME}/.config}/chromium-sandboxed" "$@"
+fi
+
+""" + anchor
+    text = _replace_expected(text, anchor, injection, 1, "profile isolation injection")
     return text
 
 HOOK = f"""
@@ -463,6 +490,8 @@ def audit(termux_dir: Path) -> None:
     if ('CHROME_DESKTOP="chromium-sandboxed.desktop"' not in lt
             or '/etc/chromium-sandboxed/*.conf' not in lt):
         raise RecipeError("audit fail: stock desktop/config leak in launcher")
+    if 'set -- --user-data-dir="${XDG_CONFIG_HOME:-${HOME}/.config}/chromium-sandboxed" "$@"' not in lt:
+        raise RecipeError("audit fail: default profile isolation injection missing")
     for forbidden in (
         "share/applications/chromium.desktop", "share/man/man1/chromium.1",
         "apps/chromium.png", "share/metainfo/chromium.appdata.xml",
