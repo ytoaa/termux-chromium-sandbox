@@ -101,18 +101,136 @@ dep_cache_prune() {
     *) echo "PRUNE REFUSAL: unexpected path: $root" >&2; return 2 ;;
   esac
   cap_bytes=$(( ${TERMUX_DEPCACHE_CAP_MB:-2048} * 1024 * 1024 ))
-  find "$root" -type f -mtime +30 -delete 2>/dev/null || true
+  # Round 28: deps/ holds dependency .debs WE built (host-tools etc.) and is the
+  # only surviving copy once the live repo drops the pinned version — never
+  # age-prune it; bound it by count instead.
+  find "$root" -type f -mtime +30 -not -path "$root/deps/*" -delete 2>/dev/null || true
+  if [ -d "$root/deps" ]; then
+    find "$root/deps" -maxdepth 1 -type f -name '*.deb' -printf '%T@ %p\n' 2>/dev/null | \
+      LC_ALL=C sort -rn | tail -n +$(( ${TERMUX_DEPCACHE_MAX_DEPS:-40} + 1 )) | cut -d' ' -f2- | \
+      while IFS= read -r f; do
+        if [ -n "$f" ]; then rm -f -- "$f" || true; fi
+      done
+  fi
   total=$(du -sb "$root" 2>/dev/null | cut -f1); total=${total:-0}
   if [ "$total" -gt "$cap_bytes" ]; then
     echo "DEPCACHE over cap ($total B > $cap_bytes B); pruning oldest first"
     find "$root" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2- | \
     while IFS= read -r f; do
       total=$(du -sb "$root" | cut -f1)
-      [ "$total" -le "$cap_bytes" ] && break
-      rm -f -- "$f"
+      if [ "$total" -le "$cap_bytes" ]; then break; fi
+      rm -f -- "$f" || true
     done
   fi
   echo "DEPCACHE size: $(du -sh "$root" 2>/dev/null | cut -f1)"
+}
+
+# ---- Round 28: dependency .deb persistence (host-tools and friends) --------
+# WHY (measured: runs 41616244636/4163249*/41642461862 and every R27 run):
+# termux resolves a dependency by looking its exact version up in the
+# GPG-anchored Packages index (scripts/build/termux_download_deb_pac.sh @
+# de1dd3d1). The pin needs chromium-host-tools 156.0.8078.47; the live x11 repo
+# now ships only 156.0.8078.79, so the lookup yields no hash, the download
+# "fails" and termux BUILDS the dependency from source: 14,487 ninja edges,
+# 160-219 min, which consumes the 240-minute BUILD_TIMEOUT_GUARD before the
+# target's 28,877 edges even start => RC=124 on every run. libexpat 2.9.0 vs
+# 2.10.0 is the same class of drift (run7 logged 17 such fallbacks).
+# The upstream-supported escape hatch is `--reuse-built-packages`
+# (build-package.sh:548/573). Its implementation is exactly what we need
+# (termux_download_deb_pac.sh:116-125): PKG_HASH empty + flag on +
+# $TERMUX_OUTPUT_DIR/<pkg>_<ver>_<arch>.deb present => ln -sf into
+# _cache-aarch64 and return 0. No network, no rebuild; the normal extraction
+# path then installs the deb. Dependency builds use the DEFAULT output dir
+# (termux_run_build-package passes no -o) == <termux-packages>/output, which is
+# on the bind-mounted workspace and therefore visible to the host.
+# So persistence = keep those debs in .termux-depcache/deps/ (deliberately
+# OUTSIDE the _cache-aarch64 bind mount, so termux never mistakes them for a
+# repo hit) and copy them back into output/ before the build.
+# TRUST (fail-closed; never a wrong binary):
+#   * manifest sha256 must match the bytes on disk;
+#   * dpkg-deb must parse control AND list members (truncated debs rejected);
+#   * Package must not be chromium-sandboxed (we never ship a stale target);
+#   * Architecture must be aarch64;
+#   * the filename must be exactly <Package>_<Version>_<arch>.deb, which also
+#     makes version/arch drift self-rejecting: termux only ever looks for the
+#     exact DEP_VERSION filename, so a stale entry can never be selected.
+# A rejected entry is simply not seeded -> termux falls back to the source
+# build it would have done anyway.
+_dep_deb_meta() { # $1=file -> "<pkg> <ver> <arch>"; rc!=0 => unusable
+  local f="$1" pkg ver arch
+  [ -f "$f" ] || return 1
+  pkg=$(dpkg-deb -f "$f" Package 2>/dev/null) || return 1
+  ver=$(dpkg-deb -f "$f" Version 2>/dev/null) || return 1
+  arch=$(dpkg-deb -f "$f" Architecture 2>/dev/null) || return 1
+  [ -n "$pkg" ] && [ -n "$ver" ] && [ -n "$arch" ] || return 1
+  [ "$arch" = "aarch64" ] || return 1
+  [ "$(basename -- "$f")" = "${pkg}_${ver}_${arch}.deb" ] || return 1
+  dpkg-deb -c "$f" >/dev/null 2>&1 || return 1
+  printf '%s %s %s' "$pkg" "$ver" "$arch"
+}
+
+dep_output_seed() {
+  local d deps out man n=0 seeded=0 skipped=0 sha name f meta
+  d="$(need_termux_dir "${1:?usage: ci.sh dep-output-seed <termux-packages>}")"
+  deps="$d/.termux-depcache/deps"; out="$d/output"; man="$deps/MANIFEST"
+  if [ ! -d "$deps" ] || [ ! -f "$man" ]; then
+    echo "DEPSED seed cold: no persisted dependency debs"
+    return 0
+  fi
+  mkdir -p "$out"
+  while IFS=$'\t' read -r sha name; do
+    n=$((n+1))
+    case "${name:-}" in
+      ''|'#'*) continue ;;
+      chromium-sandboxed_*|*/*|.|..) echo "DEPSED seed SKIP unsafe entry '${name}'"; skipped=$((skipped+1)); continue ;;
+    esac
+    f="$deps/$name"
+    if [ ! -f "$f" ]; then skipped=$((skipped+1)); continue; fi
+    if [ "$(sha256sum "$f" | cut -d' ' -f1)" != "$sha" ]; then
+      echo "DEPSED seed SKIP sha mismatch: $name"; skipped=$((skipped+1)); continue
+    fi
+    if ! meta=$(_dep_deb_meta "$f"); then
+      echo "DEPSED seed SKIP not a usable aarch64 deb: $name"; skipped=$((skipped+1)); continue
+    fi
+    cp -f -- "$f" "$out/$name" || { skipped=$((skipped+1)); continue; }
+    seeded=$((seeded+1))
+  done < "$man"
+  echo "DEPSED seed entries=$n seeded=$seeded skipped=$skipped"
+}
+
+dep_output_collect() {
+  local d out deps man tmp f name sha have new=0 total=0
+  d="$(need_termux_dir "${1:?usage: ci.sh dep-output-collect <termux-packages>}")"
+  out="$d/output"; deps="$d/.termux-depcache/deps"
+  mkdir -p "$deps"
+  tmp="$deps/MANIFEST.$$.tmp"; : > "$tmp"
+  for f in "$out"/*.deb; do
+    [ -e "$f" ] || continue
+    name=$(basename -- "$f")
+    case "$name" in chromium-sandboxed_*) continue ;; esac
+    _dep_deb_meta "$f" >/dev/null || { echo "DEPSED collect SKIP unusable $name"; continue; }
+    sha=$(sha256sum "$f" | cut -d' ' -f1)
+    have=""
+    if [ -f "$deps/$name" ]; then have=$(sha256sum "$deps/$name" | cut -d' ' -f1); fi
+    if [ "$have" != "$sha" ]; then
+      cp -f -- "$f" "$deps/$name" || continue
+      new=$((new+1))
+    fi
+    printf '%s\t%s\n' "$sha" "$name" >> "$tmp"
+    total=$((total+1))
+  done
+  LC_ALL=C sort -u -o "$tmp" "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$deps/MANIFEST"
+  echo "DEPSED collect new=$new total=$total"
+  dep_output_report "$d"
+}
+
+dep_output_report() {
+  local d deps
+  d="$(need_termux_dir "${1:-}")"; deps="$d/.termux-depcache/deps"
+  if [ ! -d "$deps" ]; then echo "DEPSED report empty"; return 0; fi
+  echo "DEPSED report debs=$(find "$deps" -maxdepth 1 -type f -name '*.deb' | wc -l) size=$(du -sh "$deps" 2>/dev/null | cut -f1)"
+  find "$deps" -maxdepth 1 -type f -name '*.deb' -printf '%f %s\n' 2>/dev/null | LC_ALL=C sort | sed -n '1,12p'
 }
 
 # ---- Layer 4: persistent VERIFIED source cache -----------------------------
@@ -783,7 +901,7 @@ build_started=$(date +%s)
     files=$(find "$SCCACHE_DIR" -type f 2>/dev/null | wc -l)
     echo "SCCACHE_TICK_JSON elapsed=${el}s sccache_files=${files} stats=${stats:-unavailable}"
   done ) & tickpid=$!
-timeout 14400 ./build-package.sh -f -I -a aarch64 chromium-sandboxed
+timeout 14400 ./build-package.sh -f -I -a aarch64 --reuse-built-packages chromium-sandboxed
 build_rc=$?
 kill "$tickpid" 2>/dev/null || true
 wait "$tickpid" 2>/dev/null || true
@@ -865,6 +983,9 @@ case "$cmd" in
   docker-perms-smoke)    docker_perms_smoke "${2:?usage: ci.sh docker-perms-smoke <termux-packages>}" ;;
   build)                  build_chromium "${2:?usage: ci.sh build <termux-packages>}" ;;
   dep-cache-prune)     dep_cache_prune "${2:?usage: ci.sh dep-cache-prune <termux-packages>}" ;;
+  dep-output-seed)     dep_output_seed "${2:?usage: ci.sh dep-output-seed <termux-packages>}" ;;
+  dep-output-collect)  dep_output_collect "${2:?usage: ci.sh dep-output-collect <termux-packages>}" ;;
+  dep-output-report)   dep_output_report "${2:?usage: ci.sh dep-output-report <termux-packages>}" ;;
   source-cache-restore) source_cache_restore "${2:?usage: ci.sh source-cache-restore <termux-packages>}" ;;
   source-cache-collect) source_cache_collect "${2:?usage: ci.sh source-cache-collect <termux-packages>}" ;;
   download-preflight)  download_preflight "${2:?usage: ci.sh download-preflight <termux-packages>}" ;;
@@ -877,7 +998,7 @@ case "$cmd" in
     gh api --method GET "repos/termux/termux-packages/commits/${2:-master}" --jq .sha
     ;;
   *)
-    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | prepare-zram-workspace <tp> | prepare-builder <tp> | docker-perms-smoke <tp> | image-fingerprint <base> <pkgs> <dockerfile> | build <tp> | dep-cache-prune <tp> | source-cache-restore <tp> | source-cache-collect <tp> | download-preflight <tp> | deb-key <tp> | deb-reuse-verify <tp> | deb-reuse-save <tp> | resolve-ref [ref]" >&2
+    echo "commands: selftest | apply <src> | verify <src> | recipe-prepare <tp> | recipe-audit <tp> | prepare-zram-workspace <tp> | prepare-builder <tp> | docker-perms-smoke <tp> | image-fingerprint <base> <pkgs> <dockerfile> | build <tp> | dep-cache-prune <tp> | dep-output-seed <tp> | dep-output-collect <tp> | dep-output-report <tp> | source-cache-restore <tp> | source-cache-collect <tp> | download-preflight <tp> | deb-key <tp> | deb-reuse-verify <tp> | deb-reuse-save <tp> | resolve-ref [ref]" >&2
     exit 2
     ;;
 esac
