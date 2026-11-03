@@ -170,6 +170,16 @@ try:
     ok("R13 collect rejects name/control mismatch (filename must be exactly <pkg>_<ver>_<arch>.deb)",
        not (deps / mis.name).exists(), r.stdout[-300:])
 
+    # arch-independent dependency (mesa / vulkan-headers are built as _all and
+    # looked up with DEP_ARCH=all; rejecting them forces a rebuild every run —
+    # observed live in run 41657628374: 2 _all debs built, both rejected)
+    alld = mkdeb(W / "src" / "vulkan-headers_1.4.366_all.deb",
+                 "vulkan-headers", "1.4.366", "all", b"V" * 60)
+    shutil.copy2(alld, ws / "output" / alld.name)
+    r = cish(ws, "dep-output-collect")
+    ok("R23 collect ACCEPTS arch-independent (_all) dependency debs and persists them",
+       (deps / alld.name).is_file() and alld.name in man.read_text(), r.stdout[-250:])
+
     # ---------- seed ----------
     ws2 = mk_workspace(W / "tp2")
     r = cish(ws2, "dep-output-seed")
@@ -178,13 +188,16 @@ try:
        (r.stdout + r.stderr)[-200:])
 
     (ws2 / ".termux-depcache" / "deps").mkdir(parents=True)
-    shutil.copy2(deps / hosttools.name, ws2 / ".termux-depcache" / "deps" / hosttools.name)
+    for nm in (hosttools.name, alld.name):
+        shutil.copy2(deps / nm, ws2 / ".termux-depcache" / "deps" / nm)
     shutil.copy2(man, ws2 / ".termux-depcache" / "deps" / "MANIFEST")
     r = cish(ws2, "dep-output-seed")
     seeded = ws2 / "output" / hosttools.name
-    ok("R15 seed round-trips the persisted deb into output/ byte-identically (the path upstream reads)",
+    ok("R15 seed round-trips every persisted deb (aarch64 + _all) into output/ byte-identically",
        r.returncode == 0 and seeded.is_file() and sha(seeded) == sha(hosttools)
-       and "DEPSED seed entries=1 seeded=1 skipped=0" in r.stdout,
+       and (ws2 / "output" / alld.name).is_file()
+       and sha(ws2 / "output" / alld.name) == sha(alld)
+       and "DEPSED seed entries=2 seeded=2 skipped=0" in r.stdout,
        (r.stdout + r.stderr)[-300:])
 
     (ws2 / ".termux-depcache" / "deps" / "MANIFEST").write_text(f"{'0' * 64}\t{hosttools.name}\n")
