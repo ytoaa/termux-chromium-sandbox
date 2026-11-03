@@ -191,7 +191,8 @@ try:
     for nm in (hosttools.name, alld.name):
         shutil.copy2(deps / nm, ws2 / ".termux-depcache" / "deps" / nm)
     shutil.copy2(man, ws2 / ".termux-depcache" / "deps" / "MANIFEST")
-    r = cish(ws2, "dep-output-seed")
+    r = cish(ws2, "dep-output-seed",
+             env_extra={"DEP_SEED_ALLOW": "chromium-host-tools vulkan-headers"})
     seeded = ws2 / "output" / hosttools.name
     ok("R15 seed round-trips every persisted deb (aarch64 + _all) into output/ byte-identically",
        r.returncode == 0 and seeded.is_file() and sha(seeded) == sha(hosttools)
@@ -221,6 +222,21 @@ try:
        and not (ws2 / "output" / arm.name).exists()
        and "SKIP unsafe entry" in r.stdout and "seeded=0" in r.stdout,
        r.stdout[-350:])
+
+    # ---------- seed allowlist (measured necessity: parent reuse hides subpackages) ----------
+    ws6 = mk_workspace(W / "tp6")
+    (ws6 / ".termux-depcache" / "deps").mkdir(parents=True)
+    for nm in (hosttools.name, alld.name):
+        shutil.copy2(deps / nm, ws6 / ".termux-depcache" / "deps" / nm)
+    shutil.copy2(man, ws6 / ".termux-depcache" / "deps" / "MANIFEST")
+    r = cish(ws6, "dep-output-seed")   # default allowlist
+    ok("R24 default seed allowlist is chromium-host-tools only (parent reuse that hides subpackages is refused)",
+       r.returncode == 0
+       and (ws6 / "output" / hosttools.name).is_file()
+       and not (ws6 / "output" / alld.name).exists()
+       and "DEPSED seed SKIP not allowlisted: " + alld.name in r.stdout
+       and "seeded=1" in r.stdout,
+       (r.stdout + r.stderr)[-300:])
 
     # ---------- prune ----------
     ws3 = mk_workspace(W / "tp3")
