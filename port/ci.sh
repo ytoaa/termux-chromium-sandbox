@@ -159,6 +159,17 @@ dep_cache_prune() {
 #     exact DEP_VERSION filename, so a stale entry can never be selected.
 # A rejected entry is simply not seeded -> termux falls back to the source
 # build it would have done anyway.
+# ALLOWLIST (measured necessity, run 41704495074): reusing a PARENT package deb
+# suppresses the build that would install its subpackage files. In that run
+# `mesa` was seeded, termux logged "mesa@26.2.5 built - skipping (rm
+# /data/data/.built-packages/mesa to force rebuild)", the mesa build therefore
+# never ran, mesa-dev's headers (gbm.h) were never installed, and the target
+# compile died at [9119/28877]:
+#   ../../../src/ui/gfx/linux/gbm_defines.h:8:10: fatal error: 'gbm.h' file not found
+# So seeding is restricted to DEP_SEED_ALLOW (default: chromium-host-tools only —
+# the 172-min bottleneck, and it has no subpackages). Broadening the allowlist
+# requires proving that every subpackage of the parent is either persisted or
+# harmless; that is deliberately NOT assumed here.
 _dep_deb_meta() { # $1=file -> "<pkg> <ver> <arch>"; rc!=0 => unusable
   local f="$1" pkg ver arch
   [ -f "$f" ] || return 1
@@ -195,6 +206,11 @@ dep_output_seed() {
     if ! meta=$(_dep_deb_meta "$f"); then
       echo "DEPSED seed SKIP not a usable aarch64 deb: $name"; skipped=$((skipped+1)); continue
     fi
+    pkg=${meta%% *}
+    case " ${DEP_SEED_ALLOW:-chromium-host-tools} " in
+      *" $pkg "*) : ;;
+      *) echo "DEPSED seed SKIP not allowlisted: $name"; skipped=$((skipped+1)); continue ;;
+    esac
     cp -f -- "$f" "$out/$name" || { skipped=$((skipped+1)); continue; }
     seeded=$((seeded+1))
   done < "$man"
