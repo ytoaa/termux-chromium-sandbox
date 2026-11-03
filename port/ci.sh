@@ -150,7 +150,10 @@ dep_cache_prune() {
 #   * manifest sha256 must match the bytes on disk;
 #   * dpkg-deb must parse control AND list members (truncated debs rejected);
 #   * Package must not be chromium-sandboxed (we never ship a stale target);
-#   * Architecture must be aarch64;
+#   * Architecture must be aarch64 (or "all" for arch-independent deps: mesa,
+#     vulkan-headers etc. are built as _all and termux looks them up with
+#     DEP_ARCH=all, so rejecting them would force a rebuild every run —
+#     observed in the cancelled 41657628374 run: 2 _all debs built, rejected);
 #   * the filename must be exactly <Package>_<Version>_<arch>.deb, which also
 #     makes version/arch drift self-rejecting: termux only ever looks for the
 #     exact DEP_VERSION filename, so a stale entry can never be selected.
@@ -163,7 +166,7 @@ _dep_deb_meta() { # $1=file -> "<pkg> <ver> <arch>"; rc!=0 => unusable
   ver=$(dpkg-deb -f "$f" Version 2>/dev/null) || return 1
   arch=$(dpkg-deb -f "$f" Architecture 2>/dev/null) || return 1
   [ -n "$pkg" ] && [ -n "$ver" ] && [ -n "$arch" ] || return 1
-  [ "$arch" = "aarch64" ] || return 1
+  case "$arch" in aarch64|all) : ;; *) return 1 ;; esac
   [ "$(basename -- "$f")" = "${pkg}_${ver}_${arch}.deb" ] || return 1
   dpkg-deb -c "$f" >/dev/null 2>&1 || return 1
   printf '%s %s %s' "$pkg" "$ver" "$arch"
