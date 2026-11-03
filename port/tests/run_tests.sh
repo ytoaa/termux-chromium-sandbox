@@ -487,4 +487,13 @@ out=$(python3 "port/tests/f6_side_by_side_test.py" 2>&1); got=$?
   && pass "[54] F6 side-by-side suite (41 checks)" \
   || { fail "[54] F6 side-by-side suite"; printf '%s\n' "$out" | tail -40; }
 
+# [55] Round 28 dependency-.deb persistence (host-tools reuse): upstream
+# --reuse-built-packages wiring, collect/seed round trip with REAL dpkg-deb
+# fixtures, sha/arch/name/target/traversal refusals, prune exemption + count
+# cap, no-network invariant, tolerated no-op paths (22 checks).
+out=$(python3 "port/tests/hosttools_reuse_test.py" 2>&1); got=$?
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^HOSTTOOLS-SUITE PASS=22 FAIL=0$' \
+  && pass "[55] host-tools reuse suite (22 checks)" \
+  || { fail "[55] host-tools reuse suite"; printf '%s\n' "$out" | tail -40; }
+
 exit $rc

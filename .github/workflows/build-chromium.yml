@@ -30,6 +30,10 @@ on:
         description: Stop after keys/preflight/prepare-builder (real-Docker permission smoke) — no compile, no gates, no deb reuse (cache-layer verification runs)
         type: boolean
         default: false
+      cache_producer:
+        description: Write the shared cache layers from THIS ref (Round 28). Default OFF — main is the only standing producer; feature/PR refs are consumers that restore main-scoped caches. Turn ON only for a deliberate pre-merge cache warm-up on a temp branch.
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       termux_ref:
@@ -110,6 +114,26 @@ jobs:
           echo "port_sha=$GITHUB_SHA" >> "$GITHUB_ENV"
           echo "termux_sha=$(git -C termux-packages rev-parse HEAD)" >> "$GITHUB_ENV"
           git -C termux-packages rev-parse HEAD > termux-pin.txt
+      # Round 28 cache-role contract. GitHub cache entries are scoped to the
+      # branch that SAVED them; only default-branch (main) entries are visible
+      # from every other branch (evidence: f6-runC3-era restored the main-scoped
+      # `7.0.0-...-azure-...` entry while every chromium cache key missed on a
+      # fresh branch). Writing from feature refs therefore produces silos that
+      # no other branch can read, while still consuming the repo-wide 10 GB LRU
+      # budget that evicts the genuinely shared entries (2026-11-03 inventory:
+      # 15 entries / ~7.9 GB, 13 of them saved by ONE branch, older branch
+      # generations already evicted). So: main produces, everyone restores.
+      - name: Resolve cache role (main = producer; other refs = consumer)
+        id: role
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_NAME:-}" = "main" ] || [ "${{ inputs.cache_producer }}" = "true" ]; then
+            echo "producer=1" >> "$GITHUB_OUTPUT"
+            echo "CACHE ROLE producer=1 (this run may WRITE shared cache layers)"
+          else
+            echo "producer=0" >> "$GITHUB_OUTPUT"
+            echo "CACHE ROLE producer=0 (consumer: restore main-scoped caches, write nothing)"
+          fi
       - name: Prepare chromium-sandboxed recipe (identity + injected hook)
         run: bash port/ci.sh recipe-prepare "$PWD/termux-packages"
       - name: Compute cache keys (sccache base only)
@@ -222,11 +246,29 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: termux-packages/.termux-srccache
-          key: chromium-srccache-aarch64-v1-${{ github.run_id }}
-          restore-keys: chromium-srccache-aarch64-v1-
+          # Round 28: the L4 payload is only meaningful for the termux pin that
+          # produced it (tarball URL/checksum set + repo-index-anchored _all
+          # debs), so the key is now INPUT-derived (termux sha) instead of
+          # run_id-only. Prefix restore keeps newest-generation semantics; the
+          # legacy v1 prefix is retained as a second fallback so archives
+          # written before this change are still inherited.
+          key: chromium-srccache-aarch64-v2-${{ env.termux_sha }}-${{ github.run_id }}
+          restore-keys: |
+            chromium-srccache-aarch64-v2-${{ env.termux_sha }}-
+            chromium-srccache-aarch64-v1-
       - name: Seed source cache into container (L4)
         if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
         run: bash port/ci.sh source-cache-restore "$PWD/termux-packages"
+      # Round 28: dependency .deb persistence. A dependency whose pinned
+      # version vanished from the live repo is normally rebuilt from source
+      # (chromium-host-tools: 14,487 edges / 160-219 min — it alone exhausts
+      # the 240-min guard). Seeding our previously built debs into output/
+      # makes upstream `--reuse-built-packages` pick them up instead
+      # (termux_download_deb_pac.sh:116-125). Fail-closed: seed only accepts
+      # manifest-verified, aarch64, correctly named non-target debs.
+      - name: Seed dependency debs into output (host-tools reuse path)
+        if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
+        run: bash port/ci.sh dep-output-seed "$PWD/termux-packages"
       # docker_smoke_only = infrastructure validation run (real-Docker
       # permission smoke, preflight, cache restore/save paths). Compile,
       # artifact gates and deb-reuse are meaningless without a package and
@@ -258,6 +300,16 @@ jobs:
       # .termux-srccache). Bookkeeping only: NEVER fails the pipeline —
       # save-gate reads its has_new output; on any error has_new=0 and the
       # run behaves exactly as before L4 existed.
+      # Round 28: persist the dependency debs this run produced. MUST run even
+      # when the build step failed or hit the 240-min guard: the host-tools deb
+      # is finished long before the target's ninja starts, and that deb is the
+      # whole point of the next run being fast. Bookkeeping only — a collect
+      # error never fails the pipeline (the depcache save-gate just sees fewer
+      # files).
+      - name: Collect dependency debs from output (persist for reuse)
+        id: depcollect
+        if: ${{ always() && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1' }}
+        run: bash port/ci.sh dep-output-collect "$PWD/termux-packages"
       - name: Collect source cache (L4)
         id: srccollect
         if: ${{ !cancelled() && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1' && steps.build.outcome != 'skipped' }}
@@ -374,17 +426,36 @@ jobs:
           [ "$sn" -ge 10 ] && echo "sccache_nonempty=1" >> "$GITHUB_OUTPUT" || echo "sccache_nonempty=0"
           [ "$dn" -ge 1 ] && echo "dep_nonempty=1" >> "$GITHUB_OUTPUT" || echo "dep_nonempty=0"
           echo "GUARD sccache_files=$sn (save>=10 required) dep_files=$dn (save>=1 required)"
+      # Round 28 cache-role contract: only a PRODUCER (main, or an explicitly
+      # flagged pre-merge warm-up) may WRITE a shared layer. Consumers restore
+      # main-scoped entries via the default-branch fallback; if they saved too,
+      # they would create branch-private silos that no other ref can read while
+      # still evicting the shared entries from the 10 GB LRU budget. Combined
+      # with the non-empty guard above, a consumer run performs ZERO cache IO
+      # on the write side.
+      # Round 28 observability: make cache reuse/eviction visible instead of
+      # inferred. Informational only (continue-on-error) — never a gate.
+      - name: Cache inventory (informational)
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "CACHE INVENTORY role=producer:${{ steps.role.outputs.producer }} ref=${GITHUB_REF_NAME:-?}"
+          echo "CACHE INVENTORY base=${{ steps.keys.outputs.base }} termux=${{ env.termux_sha }}"
+          for p in .sccache .termux-depcache .termux-srccache .deb-cache; do
+            n=$(find "termux-packages/$p" -type f 2>/dev/null | wc -l); n=${n:-0}
+            echo "CACHE INVENTORY $p files=$n size=$(du -sh "termux-packages/$p" 2>/dev/null | cut -f1)"
+          done
       - name: Prune termux dep cache
         if: always()
         run: bash port/ci.sh dep-cache-prune "$PWD/termux-packages"
       - name: Save termux dep cache
-        if: always() && steps.guard.outputs.dep_nonempty == '1'
+        if: always() && steps.role.outputs.producer == '1' && steps.guard.outputs.dep_nonempty == '1'
         uses: actions/cache/save@v4
         with:
           path: termux-packages/.termux-depcache
           key: termux-depcache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
       - name: Save sccache
-        if: always() && steps.guard.outputs.sccache_nonempty == '1'
+        if: always() && steps.role.outputs.producer == '1' && steps.guard.outputs.sccache_nonempty == '1'
         uses: actions/cache/save@v4
         with:
           path: termux-packages/.sccache
@@ -394,21 +465,21 @@ jobs:
       # promote an empty/partial L4 archive over healthy prefix restores
       # (same guard philosophy as the sccache save-guard above).
       - name: Save source cache (L4)
-        if: always() && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1' && steps.srccollect.outputs.has_new == '1'
+        if: always() && steps.role.outputs.producer == '1' && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1' && steps.srccollect.outputs.has_new == '1'
         uses: actions/cache/save@v4
         with:
           path: termux-packages/.termux-srccache
-          key: chromium-srccache-aarch64-v1-${{ github.run_id }}
+          key: chromium-srccache-aarch64-v2-${{ env.termux_sha }}-${{ github.run_id }}
       # The completed workflow_run payload does NOT reliably expose the
       # workflow_dispatch inputs. Bind the caller's publish consent to
       # the build artifact itself; never infer consent from a missing field.
       - name: Save completed deb to reuse cache
-        if: success() && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
+        if: success() && steps.role.outputs.producer == '1' && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
         env:
           DEB_KEY: ${{ steps.debkey.outputs.debkey }}
         run: bash port/ci.sh deb-reuse-save "$PWD/termux-packages"
       - name: Cache completed deb
-        if: success() && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
+        if: success() && steps.role.outputs.producer == '1' && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
         uses: actions/cache/save@v4
         with:
           path: termux-packages/.deb-cache

@@ -352,7 +352,9 @@ ok("T17 preflight before prepare-builder; gates unconditional; save-deb success-
    "if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'" in build_block and
    "bash port/ci.sh build" in build_block and
    pos(r"Package gates") > pos(r"Build chromium-sandboxed") and
-   "if: success() && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'" in wf)
+   # Round 28 adds the cache-role gate (only a producer writes shared layers);
+   # the success()-only condition is preserved verbatim after it.
+   "if: success() && steps.role.outputs.producer == '1' && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'" in wf)
 
 # ---------- T16: preflight regressions via fake curl (no real network) ------
 FAKE_NET = HERE / "fixtures" / "net"
@@ -642,8 +644,12 @@ ok("T34d workflow order: debcheck -> L4 restore/seed -> build -> collect -> ... 
 seed_block = wf[wf.index("- name: Restore source cache (L4)"):wf.index("- name: Seed source cache into container")]
 ok("T34e L4 restore skipped on smoke-only AND on DEB reuse (4.4-min reuse path: zero L4 IO)",
    "if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'" in seed_block
-   and "key: chromium-srccache-aarch64-v1-${{ github.run_id }}" in seed_block
-   and "restore-keys: chromium-srccache-aarch64-v1-" in seed_block)
+   # Round 28: the L4 key is input-derived (termux sha) instead of run_id-only;
+   # the legacy v1 prefix is kept as the second restore fallback so archives
+   # written before the change are still inherited.
+   and "key: chromium-srccache-aarch64-v2-${{ env.termux_sha }}-${{ github.run_id }}" in seed_block
+   and "chromium-srccache-aarch64-v2-${{ env.termux_sha }}-" in seed_block
+   and "chromium-srccache-aarch64-v1-" in seed_block)
 coll_block = wf[pos_collect:wf.index("- name: Package gates")]
 ok("T34f collect: !cancelled + reuse/smoke gate + build-ran; has_new parsed from L4 COLLECT line only",
    "if: ${{ !cancelled() && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1' && steps.build.outcome != 'skipped' }}" in coll_block
