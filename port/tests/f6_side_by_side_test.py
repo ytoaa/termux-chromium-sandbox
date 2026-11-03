@@ -280,7 +280,8 @@ def run_launcher(home, xdg=None, extra_args=(), user_flags=None, root_like=False
         text = text.replace("[ $(id -u) -eq 0 ] && [ $(stat -c %u -L ${XDG_CONFIG_HOME:-${HOME}}) -eq 0 ]", "true")
     launcher.write_text(text)
     fake = Path(tmpd) / "chrome"  # launcher execs "$PROGDIR/chrome" (PROGDIR = launcher dir)
-    fake.write_text('#!/bin/sh\nfor a in "$@"; do echo "ARG|$a"; done\n')
+    fake.write_text('#!/bin/sh\nfor a in "$@"; do echo "ARG|$a"; done\n'
+                    'echo "ENV|BREAKPAD_DUMP_LOCATION=${BREAKPAD_DUMP_LOCATION:-}"\n')
     fake.chmod(0o755)
     env = dict(os.environ, HOME=str(home), PATH=str(prefix / "bin") + ":" + os.environ["PATH"])
     env.pop("XDG_CONFIG_HOME", None)
@@ -290,6 +291,8 @@ def run_launcher(home, xdg=None, extra_args=(), user_flags=None, root_like=False
         env["CHROMIUM_USER_FLAGS"] = user_flags
     r = run(["sh", str(launcher), *extra_args], env=env)
     args = [l[4:] for l in r.stdout.splitlines() if l.startswith("ARG|")]
+    envs = dict(l[4:].split("=", 1) for l in r.stdout.splitlines() if l.startswith("ENV|"))
+    run_launcher.last_env = envs
     return r.returncode, args, tmpd
 
 rc, args, _ = run_launcher(Path.home())
@@ -318,6 +321,20 @@ rc6, args6, _ = run_launcher(Path.home(), root_like=True)
 udd6 = [a for a in args6 if a.startswith("--user-data-dir=")]
 ok("A6h root failsafe branch keeps isolated path, no double injection",
    rc6 == 0 and len(udd6) == 1 and udd6[0].endswith("/chromium-sandboxed"), str(args6))
+# crashpad isolation (TESTBED-proven: crashpad ignores --user-data-dir)
+rc7, args7, _ = run_launcher(Path.home())
+env7 = run_launcher.last_env.get("BREAKPAD_DUMP_LOCATION", "")
+ok("A6j default run redirects crashpad into the isolated profile",
+   rc7 == 0 and env7 == f"{Path.home()}/.config/chromium-sandboxed/Crash Reports", env7)
+rc8, args8, _ = run_launcher(Path.home(), extra_args=("--user-data-dir=/custom/prof",))
+env8 = run_launcher.last_env.get("BREAKPAD_DUMP_LOCATION", "")
+ok("A6k explicit --user-data-dir moves the crashpad dir with it",
+   rc8 == 0 and env8 == "/custom/prof/Crash Reports", env8)
+rc9, args9, _ = run_launcher(Path.home(), user_flags="--user-data-dir=/env/prof")
+env9 = run_launcher.last_env.get("BREAKPAD_DUMP_LOCATION", "")
+ok("A6l CHROMIUM_USER_FLAGS profile also drives the crashpad dir",
+   rc9 == 0 and env9 == "/env/prof/Crash Reports", env9)
+
 for label, tamper_lt in (
     ("config-glob drift", lambda x: x.replace('@TERMUX_PREFIX@/etc/chromium/*.conf', '@TERMUX_PREFIX@/etc/chromium.d/*.conf')),
     ("desktop-anchor drift", lambda x: x.replace('# Set the .desktop file name', '# CHANGED upstream')),

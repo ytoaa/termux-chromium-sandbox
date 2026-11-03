@@ -86,6 +86,13 @@ def main():
         # f=2 holds here) while exposing CDP (the launcher's exec chain does
         # not keep the debug port up under the full wrapper path here).
         env = dict(os.environ)
+        # Direct-chrome launch bypasses the packaged launcher, so the launcher's
+        # crashpad isolation does not apply here: without this the crashpad
+        # client writes ~/.config/chromium/Crash Reports/settings.dat into the
+        # STOCK profile (observed 2026-11-03 22:07 on TESTBED). Pin it to the
+        # throw-away test profile so diagnostics never touch user data.
+        env.setdefault('BREAKPAD_DUMP_LOCATION',
+                       os.path.join(udd, 'Crash Reports'))
         libdir = os.path.dirname(CHROME)
         preload = os.path.join(libdir, 'libtermux-gnp-fix.so')
         if os.path.exists(preload):
