@@ -1865,3 +1865,21 @@ strict resolution (PHC_WRAPPER env → installed package on PATH → loud
 SystemExit) plus /proc/pid/exe cross-verification gates feeding the verdict
 (no PASS without an exe-verified packaged chrome). T3/T4 execution evidence
 is collected on TESTBED (Phase 4); nothing here claims unexecuted passes.
+
+
+### Round 27 addendum — crashpad isolation (TESTBED-proven, 2026-11-03)
+TESTBED measurement after the user-data-dir fix: the old profile was STILL
+written once per run — exactly one file, `~/.config/chromium/Crash Reports/
+settings.dat` (40 B). Cause: crashpad derives its database from the product
+name, not from --user-data-dir, so an isolated profile alone cannot stop it.
+Fix (launcher): export `BREAKPAD_DUMP_LOCATION` into the effective profile's
+`Crash Reports` (default isolated dir, or the explicit --user-data-dir when
+the user supplied one); an explicit BREAKPAD_DUMP_LOCATION env always wins.
+Verified on device: after the fix the old-profile tree hash and the
+settings.dat mtime were byte-stable across default/XDG/explicit/env runs.
+Second finding: the diagnostic tool `dl_proof.py` launches chrome DIRECTLY
+(bypassing the packaged launcher), so it reproduced the same write; the tool
+now pins BREAKPAD_DUMP_LOCATION to its throw-away test profile. Product path
+(wrapper -> launcher) and tool path are therefore both clean; the only writes
+ever observed in the stock profile are the two pre-fix ones (22:03 old
+launcher, 22:07 dl_proof), both recorded in the evidence logs.

@@ -103,10 +103,18 @@ def rewrite_launcher(text: str) -> str:
 # directory; explicit --user-data-dir (args or flags) is respected by skipping
 # the default, and set -- preserves whitespace in the path.
 for _f in "$@" ${CHROMIUM_USER_FLAGS:-} ${CHROMIUM_FLAGS:-}; do
-    case "$_f" in --user-data-dir*) _udd=1 ;; esac
+    case "$_f" in --user-data-dir=*) _udd=1; _udd_val=${_f#--user-data-dir=} ;; esac
 done
 if [ "${_udd:-0}" != 1 ]; then
     set -- --user-data-dir="${XDG_CONFIG_HOME:-${HOME}/.config}/chromium-sandboxed" "$@"
+fi
+# Port (crashpad isolation, TESTBED-proven 2026-11-03): crashpad derives its
+# database from the product name, NOT --user-data-dir, so it kept writing
+# ~/.config/chromium/Crash Reports/settings.dat during isolated runs. Point it
+# at the effective profile; an explicit BREAKPAD_DUMP_LOCATION always wins.
+if [ -z "${BREAKPAD_DUMP_LOCATION:-}" ]; then
+    BREAKPAD_DUMP_LOCATION="${_udd_val:-${XDG_CONFIG_HOME:-${HOME}/.config}/chromium-sandboxed}/Crash Reports"
+    export BREAKPAD_DUMP_LOCATION
 fi
 
 """ + anchor
@@ -492,6 +500,8 @@ def audit(termux_dir: Path) -> None:
         raise RecipeError("audit fail: stock desktop/config leak in launcher")
     if 'set -- --user-data-dir="${XDG_CONFIG_HOME:-${HOME}/.config}/chromium-sandboxed" "$@"' not in lt:
         raise RecipeError("audit fail: default profile isolation injection missing")
+    if 'BREAKPAD_DUMP_LOCATION="${_udd_val:-' not in lt:
+        raise RecipeError("audit fail: crashpad isolation export missing")
     for forbidden in (
         "share/applications/chromium.desktop", "share/man/man1/chromium.1",
         "apps/chromium.png", "share/metainfo/chromium.appdata.xml",
