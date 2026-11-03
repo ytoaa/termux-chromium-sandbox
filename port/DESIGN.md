@@ -1883,3 +1883,144 @@ now pins BREAKPAD_DUMP_LOCATION to its throw-away test profile. Product path
 (wrapper -> launcher) and tool path are therefore both clean; the only writes
 ever observed in the stock profile are the two pre-fix ones (22:03 old
 launcher, 22:07 dl_proof), both recorded in the evidence logs.
+
+## Round 28 — single-lineage consolidation + cache structure normalisation (2026-11-03)
+
+Scope: investigation, patching and verification ONLY. No PR was merged or
+closed, no branch deleted, `main` was not pushed to, no release/deploy ran.
+
+### 28.1 Branch/PR lineage (measured, not quoted from reports)
+
+The R12 work is ONE linear stack on top of `main` (457e7ee):
+
+    main
+     └─ r12-bionic-set-tid-address           PR#22   +7   (bae5316)
+        └─ perf/ci-cache-layers             PR#24  +13   (9ecb6e3)
+           └─ perf/ci-source-cache          PR#25   +4   (304faba)
+              └─ audit/r12-full-verification PR#26  +5   (9570a3e)
+                 └─ fix/f6-side-by-side     PR#27   +6   (3995f75)
+                    └─ fix/r12-profile-isolation   +3   (b9e0064)  [no PR]
+
+`git merge-base --is-ancestor` shows every other branch is either already
+contained in `main` (all merged PR heads #1-#21) or carries no transferable
+work. No duplicate patch exists ACROSS branches; the duplication is INSIDE the
+stack:
+
+  * 99c0ce7 + 2b53516 + 85125e3 + db1aa61 (the "R12 fallback mirror" experiment)
+    are net-zero: `git diff 99c0ce7^ db1aa61 --stat` is EMPTY, i.e. the removal
+    reverted the addition byte-for-byte. Droppable without touching the tree.
+  * hotfix/chromium-side-by-side-package-paths (3 commits) is a parallel F6
+    attempt whose first two patch-ids are IDENTICAL to d4ea9af/6278bd7 in the
+    stack; the third (1f7b612) is the pre-Round-25 variant of de2a63a.
+  * diag/ci-node24 = 4 stack commits + an equivalent removal (96e0964, different
+    patch-id because it was rebased) + two throw-away probe workflows.
+
+Integration branch `integration/r12-main`: rebase of the stack onto `main`
+dropping the four net-zero commits => 34 commits, and `git rev-parse
+HEAD^{tree}` is byte-identical to b9e0064's tree
+(`a2dba2b83e33bcb41f9a1fd14ffc1f5e08f78794`). Content-wise the consolidation
+is a pure fast-forward: 38 -> 34 commits with ZERO behavioural delta.
+
+### 28.2 Why every R27 CI run failed (root cause, log-proven)
+
+F6-era runs found the prebuilt dependency: `Found chromium-host-tools in
+.../termux-x11/dists/x11` + `extracting ... to _cache-aarch64` (pre-ninja
+14-24 min). From 2026-10-31 the same pin logs
+`Download of chromium-host-tools@156.0.8078.47 from .../termux-main failed,
+building instead` -> `termux - building chromium-host-tools for arch aarch64`
+(14,487 ninja edges, 160-219 min). The live x11 repo now carries only
+156.0.8078.79 while the pin `de1dd3d1` demands 156.0.8078.47, so termux falls
+back to a source build that consumes the 240-minute BUILD_TIMEOUT_GUARD before
+the target's 28,877 edges start => RC=124 on every run. Same class of drift:
+libexpat 2.9.0 (pinned) vs 2.10.0 (live); run7 logged 17 "building instead"
+fallbacks. F6 was green because the prebuilt 8078.47 still existed then.
+
+### 28.3 Dependency-deb persistence (the fix)
+
+Upstream already implements exactly this: `--reuse-built-packages`
+(build-package.sh:548/573) => termux_download_deb_pac.sh:116-125: when the
+Packages lookup yields no hash and `$TERMUX_OUTPUT_DIR/<pkg>_<ver>_<arch>.deb`
+exists, it `ln -sf`s that deb into `_cache-aarch64` and returns 0. Dependency
+builds use the DEFAULT output dir (termux_run_build-package passes no -o), i.e.
+`<termux-packages>/output`, which is on the bind-mounted workspace. So:
+
+  * `ci.sh dep-output-collect` copies every non-target deb from `output/` into
+    `.termux-depcache/deps/` with a sha256 MANIFEST (runs on `always()` so a
+    guard-expired run still persists the host-tools deb it finished hours
+    earlier);
+  * `ci.sh dep-output-seed` copies them back into `output/` before the build;
+  * `build-package.sh` gains `--reuse-built-packages`.
+
+`deps/` is deliberately OUTSIDE the `_cache-aarch64` bind mount so termux can
+never mistake it for a repo hit; the only consumer is the upstream reuse
+branch. Fail-closed validation on both sides: manifest sha256 must match, the
+deb must parse via dpkg-deb control AND member listing, Architecture must be
+aarch64, the filename must be exactly `<Package>_<Version>_<arch>.deb`, and
+`chromium-sandboxed_*` is refused (a stale target can never be reused).
+Version/arch drift self-rejects because termux only ever looks for the exact
+DEP_VERSION filename. Anything rejected simply falls back to the source build
+that would have happened anyway.
+
+Prune policy: `deps/` is exempt from the 30-day age rule (it is the only
+surviving copy of the host-tools deb) and bounded by count
+(TERMUX_DEPCACHE_MAX_DEPS, default 40) inside the existing 2 GiB cap. The
+prune loops were also hardened against `set -e` early-exit (`[ cond ] && cmd`
+inside a pipeline subshell aborted the loop after the first file).
+
+### 28.4 Cache roles: main produces, everything else restores
+
+Measured facts (2026-11-03):
+
+  * GitHub cache entries are scoped to the SAVING branch; only default-branch
+    entries are visible from other branches. Evidence: f6-runC3-era restored
+    the main-scoped `7.0.0-...-azure-...` entry while ALL chromium keys missed
+    on a fresh branch; run7 restored only same-branch generations.
+  * Repo inventory at 2026-11-03: 15 entries / ~7.9 GB against the 10 GB LRU
+    budget, 13 of them saved by ONE branch, with 5 near-identical sccache
+    archives (361-454 MB) and 2 L4 archives (2.13 GB each) differing only by
+    `<run_id>`. Older branch generations (F6, audit) had already been evicted —
+    the "warm lineage" was unreproducible, not merely unused.
+
+Design:
+
+  * `cache_producer` input (default false) + `Resolve cache role` step:
+    producer = `refs/heads/main` OR explicit `cache_producer=true`
+    (pre-merge warm-up only). Producers WRITE; every other ref restores
+    main-scoped entries via the default-branch fallback and writes nothing.
+  * Save gates: producer AND the pre-existing non-empty guards. A consumer run
+    therefore performs ZERO cache IO on the write side, cannot create a
+    branch-private silo, and cannot evict shared entries.
+  * L4 key becomes input-derived: `chromium-srccache-aarch64-v2-<termux_sha>-
+    <run_id>` with a `-v2-<termux_sha>-` prefix and the legacy `-v1-` prefix as
+    a second fallback (existing archives stay inheritable). sccache/depcache
+    keys were already input-derived (base = termux sha + revision +
+    port-input-hash; depcache = termux sha) and keep their namespaces so the
+    14k-object sccache archive and the depcache remain inheritable.
+  * DEB reuse cache keeps `chromium-deb-v1-<DEB_KEY>` (already a pure input
+    hash) and becomes producer-written only.
+
+Consequence to accept explicitly: after the merge, `main`'s FIRST run is cold
+(host-tools source build) and will end RC=124 — but it persists the dep debs
+and the sccache objects. The SECOND main run reuses host-tools (~15 min
+pre-ninja) and has the full guard for the target. That two-run cold start is
+the only remaining cost; key design cannot remove it because cache scope cannot
+be transferred between branches.
+
+### 28.5 Guard decision
+
+BUILD_TIMEOUT_GUARD stays 240 minutes. With host-tools reused, measured warm
+pre-ninja is 14-24 min (F6) and the target's 28,877 edges run at 56-326
+edges/min depending on runner pace; the guard must keep failing loudly rather
+than mask a slow runner, and the 350-minute job cap leaves no room for a
+300-minute inner guard plus diagnostics. Revisit only if a post-fix GREEN run
+shows the target itself exceeding ~200 min.
+
+### 28.6 Verification status (no unexecuted claim)
+
+Local: full harness incl. new suite [55] host-tools reuse (22 checks, real
+dpkg-deb fixtures) — see REPORT-R28-INTEGRATION.md for the recorded counts.
+CI: the two-run producer sequence on `integration/r12-main` is the acceptance
+test for §28.3/§28.4 (run A cold -> dep debs persisted; run B -> "Found
+chromium-host-tools in .../output", pre-ninja collapse, GREEN build). Until
+those runs exist, host-tools elimination is VERIFIED-BY-CONSTRUCTION ONLY and
+must not be reported as measured.
