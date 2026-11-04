@@ -341,8 +341,14 @@ check('[R17] CLI decide with corrupt migrations -> rc!=0 (no plan, no build)',
 # R10 candidate has the original rev-2 content.
 _r10start = REAL_TOML.index('[rules.r10]\n')
 _r10end = REAL_TOML.index('[rules.r9b]\n', _r10start)
-_historical_toml = REAL_TOML[:_r10start] + REAL_TOML[_r10end:]
-check('[R18] frozen rev-2 hash preserved and new R10 contract differs',
+# R12 (Issue #12 fix candidate) is likewise NEW contract content: splice it
+# out for the historical reconstruction; the full-content assertion below
+# (_h0 != canary) still proves the branch diverges from rev-2 semantics.
+_r12start = REAL_TOML.index('[rules.r12]\n')
+_r12end = REAL_TOML.index('[gates]', _r12start)
+_historical_toml = (REAL_TOML[:_r10start] + REAL_TOML[_r10end:_r12start]
+                    + REAL_TOML[_r12end:])
+check('[R18] frozen rev-2 hash preserved and new R10/R12 contracts differ',
       M.port_toml_semantic_sha(_historical_toml) == 'fbf559c15b61e310'
       and _h0 != 'fbf559c15b61e310', _h0)
 _rc = M.main(['port-input-hash', '--root', os.path.join(os.path.dirname(__file__), '..', '..')])

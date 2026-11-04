@@ -217,3 +217,40 @@ SECCOMP_RET_TRAP handling; **do not suppress this finding**.
 A crash-free tab session and BPF causality control are still required
 before any final approval. Keep this diagnostic PR unmerged and its
 `publish` input `false`.
+
+## Experimental R12 gate — renderer Bionic set_tid_address allow (2026-10-28)
+
+Candidate ONLY (branch r12-bionic-set-tid-address, DEB 156.0.8078.47-12,
+workflow_dispatch publish=false). Hard rails of §0 apply unchanged:
+extract-only execution, installed chromium-sandboxed 156.0.8078.47-4
+NEVER modified, real profile NEVER touched (isolated snapshot copy with
+human approval only), --no-sandbox tripwire armed, no new allow-list
+entries beyond the single approved R12 arm.
+
+Required evidence in one sitting (else candidate = FAIL, no promotion):
+1. Static: full run_tests.sh green incl. [47]-[51] + R12 suite 19/19;
+   CI gate greps 'APPLIED ... R12'; verifier scope gates intact.
+2. Binary/runtime markers: strings chrome contains
+   "Termux seccomp-only r12-bionic-tid: renderer allow active"; with
+   --enable-logging=stderr --v=1 the R12 VLOG line count == Activated
+   renderer count (allow compiled into the built filter).
+3. CORE regression gate: tab create/kill burst >= 40 consecutive trials,
+   ZERO renderer SIGSYS deaths (raw wait-status 31 /
+   CrashExitCodes.Renderer==31 forbidden), vs -4 baseline 8/8 = 100%.
+4. Reproduction battery re-run on candidate: Aquarium 1K->5K->10K,
+   reloads, >=33s idle worker trim, real-profile snapshot, Vulkan on/off,
+   renderer/utility spawn-exit churn, clean teardown (browser exit 0).
+5. Instrumented (strace) trials run SEPARATELY from uninstrumented:
+   set_tid_address(0) = 0 at thread exits, no '+++ killed by SIGSYS',
+   no siginfo(si_syscall=178) captures.
+6. Security census per-process: browser 1 / zygote 1 / renderer
+   Seccomp=2 Seccomp_filters=2 NoNewPrivs=1 (every renderer, every
+   trial); GPU + network utility re-measured and reported vs the
+   R11-known state (GPU BPF not engaged = pre-existing WARN, OUT of R12
+   scope); P2b causality control still flips renderer 2->1.
+7. Block-matrix integrity: live SIGSYS trap controls still fire and
+   survive (openat/sched_getparam -> handler -> rt_sigreturn); the ten
+   dangerous arm64 syscalls keep their documented deny path (static
+   citation per syscall: execve/execveat/ptrace/mount/umount2/
+   init_module/delete_module/seccomp/unshare/setns) — R12 must be the
+   ONLY allowlist delta versus -4.

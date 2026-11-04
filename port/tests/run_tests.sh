@@ -56,6 +56,7 @@ grep -qF 'Termux seccomp-only sandbox:' "$WORK/src/content/browser/zygote_host/z
 # [8] recipe prepare/audit on vendored build.sh (side-by-side identity + hook)
 TREP="$WORK/termux"; mkdir -p "$TREP/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$TREP/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$TREP/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$TREP/build-package.sh"; chmod +x "$TREP/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$TREP" >/dev/null 2>&1 \
   && python3 port/prepare_recipe.py audit --termux-dir "$TREP" >/dev/null 2>&1 \
@@ -64,6 +65,7 @@ python3 port/prepare_recipe.py prepare --termux-dir "$TREP" >/dev/null 2>&1 \
 # [10] generated recipe must be bash-parseable
 fresh; TREP2="$WORK/termux2"; mkdir -p "$TREP2/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$TREP2/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$TREP2/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$TREP2/build-package.sh"; chmod +x "$TREP2/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$TREP2" >/dev/null 2>&1
 bash -n "$TREP2/x11-packages/chromium-sandboxed/build.sh" \
@@ -73,6 +75,7 @@ bash -n "$TREP2/x11-packages/chromium-sandboxed/build.sh" \
 # body (cr-patches loop) — chaining, never shadowing.
 fresh; TREP3="$WORK/termux3"; mkdir -p "$TREP3/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$TREP3/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$TREP3/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$TREP3/build-package.sh"; chmod +x "$TREP3/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$TREP3" >/dev/null 2>&1
 g="$TREP3/x11-packages/chromium-sandboxed/build.sh"
@@ -85,6 +88,7 @@ grep -q 'termux_step_post_get_source_upstream()' "$g" \
 # [12] sandbox-disable patches must be excluded from the cr-patches loop
 fresh2="$WORK/t12"; mkdir -p "$fresh2/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$fresh2/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$fresh2/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$fresh2/build-package.sh"; chmod +x "$fresh2/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$fresh2" >/dev/null 2>&1
 grep -q "grep -v -e '1001-chromium-disable-sandbox' -e '1004-chromium-headless-disable-sandbox-by-default'" "$fresh2/x11-packages/chromium-sandboxed/build.sh" \
@@ -112,13 +116,21 @@ grep -q -- '--disable-seccomp-filter-sandbox' $be \
 # [15] marathon: generated recipe must wire cc_wrapper=sccache (run #10 post-mortem)
 fresh; T15="$WORK/t15"; mkdir -p "$T15/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$T15/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$T15/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$T15/build-package.sh"; chmod +x "$T15/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$T15" >/dev/null 2>&1
 g15="$T15/x11-packages/chromium-sandboxed/build.sh"
 [ "$(grep -c 'cc_wrapper="sccache"' "$g15")" = "1" ]   && grep -q 'echo .cc_wrapper="sccache". >> $TERMUX_PKG_BUILDDIR/out/Release/args.gn' "$g15"   && python3 port/prepare_recipe.py audit --termux-dir "$T15" >/dev/null 2>&1   && pass "[15] cc_wrapper wired into args.gn (and audit enforces it)"   || fail "[15] sccache cc_wrapper wiring missing"
 
 # [16] ci.sh build must (re)export the sccache volume IN-STEP + early evidence gate
-grep -q 'TERMUX_DOCKER_RUN_EXTRA_ARGS="--volume $d/.sccache:/home/builder/.cache/sccache"' port/ci.sh   && grep -q 'SCCACHE DEAD' port/ci.sh   && grep -q 'sleep 1800' port/ci.sh   && grep -q 'SCCACHE ALIVE' port/ci.sh   && pass "[16] in-step volume export + 30min evidence watchdog" || fail "[16] ci.sh marathon contract"
+# (3 exports: prepare_builder, docker_perms_smoke — self-contained for
+# standalone use — and build_chromium; GH steps do not share env.)
+grep -q 'docker_volume_args()' port/ci.sh \
+  && grep -q -- '--volume $d/.sccache:/home/builder/.cache/sccache --volume $d/.termux-depcache/aarch64:/home/builder/.termux-build/_cache-aarch64' port/ci.sh \
+  && [ "$(grep -cF 'TERMUX_DOCKER_RUN_EXTRA_ARGS="$(docker_volume_args "$d")"' port/ci.sh)" = "5" ] \
+  && grep -q 'SCCACHE DEAD' port/ci.sh && grep -q 'sleep 1800' port/ci.sh \
+  && grep -q 'SCCACHE ALIVE' port/ci.sh && grep -q 'last_tick' port/ci.sh \
+  && pass "[16] in-step dual-volume export + tick-aware 30min watchdog" || fail "[16] ci.sh marathon contract"
 
 # [17] run #11 false-failure regression: reaped-watchdog kill/wait must be || true
 grep -q 'kill "$wpid" 2>/dev/null || true' port/ci.sh \
@@ -138,7 +150,7 @@ echo "$out" | grep -q 'APPLIED.*R3' \
 
 # [19] R4 zygote passthrough (device-gate round-2: set_tid_address SYS_SECCOMP kill)
 fresh
-out=$(python3 $PORT apply --src "$W/src" 2>/dev/null); out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
 echo "$out" | grep -q 'APPLIED.*R4' \
   && grep -q 'kZygote' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
   && grep -q '#if defined(__BIONIC__)' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
@@ -193,6 +205,7 @@ python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
 #      and route bin/chromium-sandboxed through LD_PRELOAD (round-7 breakthrough)
 fresh; T25="$WORK/t25"; mkdir -p "$T25/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$T25/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$T25/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$T25/build-package.sh"; chmod +x "$T25/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$T25" >/dev/null 2>&1
 g25="$T25/x11-packages/chromium-sandboxed/build.sh"
@@ -216,6 +229,7 @@ python3 port/prepare_recipe.py audit --termux-dir "$T25" >/dev/null 2>&1 \
 #      repointed at it; the real launcher must never receive the shield line
 fresh; T27="$WORK/t27"; mkdir -p "$T27/x11-packages/chromium"
 cp "$FIX/termux-build.sh" "$T27/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$T27/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$T27/build-package.sh"; chmod +x "$T27/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$T27" >/dev/null 2>&1
 g27="$T27/x11-packages/chromium-sandboxed/build.sh"
@@ -270,6 +284,7 @@ python3 -c "import tomllib,sys; d=tomllib.load(open('port/port.toml','rb')); sys
 # unix: form; exec line & LD_PRELOAD path preserved; single wrapper).
 T32=$WORK/t32; rm -rf "$T32"; mkdir -p "$T32/x11-packages/chromium" "$T32/x11-packages/chromium-sandboxed"
 cp "$FIX/termux-build.sh" "$T32/x11-packages/chromium/build.sh"
+cp "$FIX/chromium-launcher.sh.in" "$T32/x11-packages/chromium/chromium-launcher.sh.in"
 touch "$T32/build-package.sh"; chmod +x "$T32/build-package.sh"
 python3 port/prepare_recipe.py prepare --termux-dir "$T32" >/dev/null 2>&1
 G32="$T32/x11-packages/chromium-sandboxed/build.sh"
@@ -399,5 +414,86 @@ else
   fail "[46] R11 SIGSYS ownership/order diagnostics"
   printf '%s\n' "$out" | tail -55
 fi
+
+# [47] R12 renderer-only bionic set_tid_address allow (Issue #12 fix).
+fresh
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+RP="$WORK/src/sandbox/policy/linux/bpf_renderer_policy_linux.cc"
+[ $got -eq 0 ] && echo "$out" | grep -q 'APPLIED.*R12' \
+  && [ "$(grep -c 'Termux seccomp-only r12-bionic-tid:' "$RP")" = "3" ] \
+  && grep -q 'case __NR_set_tid_address:' "$RP" \
+  || { fail "[47] R12 apply/marker"; echo "$out"; }
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+echo "$out" | grep -q 'ALREADY_PRESENT.*R12' \
+  && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
+  && pass "[47] R12 applied+verified+idempotent" || fail "[47] R12 (idempotence/verify)"
+
+# [48] R12 anchor drift -> PORT ERROR (fail closed: candidate must not ship unpatched)
+fresh
+sed -i 's/    case __NR_getcpu:/    case __NR_getcpu_DRIFT:/' "$WORK/src/sandbox/policy/linux/bpf_renderer_policy_linux.cc"
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+[ $got -ne 0 ] && echo "$out" | grep -q 'R12' && pass "[48] R12 anchor drift -> PORT ERROR" || { fail "[48] R12 drift"; echo "$out"; }
+
+# [49] R12 missing file -> PORT ERROR (renderer policy is REQUIRED, not optional)
+fresh; rm "$WORK/src/sandbox/policy/linux/bpf_renderer_policy_linux.cc"
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+[ $got -ne 0 ] && echo "$out" | grep -qi 'missing\|R12' && pass "[49] R12 missing file -> PORT ERROR" || { fail "[49] R12 missing"; echo "$out"; }
+
+# [50] R12 scope guard: exactly one added arm, allow-only, no KILL/TRAP/Error in the block
+fresh; python3 $PORT apply --src "$WORK/src" >/dev/null 2>&1
+RP="$WORK/src/sandbox/policy/linux/bpf_renderer_policy_linux.cc"
+n_tid=$(grep -c 'case __NR_set_tid_address:' "$RP")
+n_mark=$(grep -c 'Termux seccomp-only r12-bionic-tid:' "$RP")
+blk=$(sed -n '/#if defined(__BIONIC__)/,/^#endif/p' "$RP" | grep -A9 'r12-bionic-tid: bionic')
+[ "$n_tid" -eq 1 ] && [ "$n_mark" -eq 3 ] \
+  && grep -q 'VLOG(1) << "Termux seccomp-only r12-bionic-tid: renderer allow active";' "$RP" \
+  && ! grep -qE 'KillProcess|KillThread|CrashSIGSYS|Error\(|Trap\(' <<< "$blk" \
+  && pass "[50] R12 scope: 1 arm, VLOG marker, allow-only, no disposition change" \
+  || fail "[50] R12 scope guard"
+
+# [51] R12 standalone contract suite (19 checks incl. tamper negatives).
+out=$(python3 "port/tests/r12_set_tid_address_test.py" 2>&1); got=$?
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^R12-TESTS PASS=19 FAIL=0$' \
+  && pass "[51] R12 contract suite (19 checks)" \
+  || { fail "[51] R12 contract suite"; printf '%s\n' "$out" | tail -40; }
+
+# [52] cache-layer suites (perf/ci-cache-layers): dep-cache contract,
+# preflight fail-fast/whitelist/redirect+real-transfer probe, prune caps,
+# deb-reuse fail-closed gates + image-id binding (T19-T27), runner/node24 protections, R12 policy
+# immutability, docker bind-parent fix + smoke + save-guard + L4
+# verified source cache + production-layout key sensitivity T42/T43 (78 checks).
+out=$(python3 "port/tests/cache_layers_test.py" 2>&1); got=$?
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=79 FAIL=0$' \
+  && pass "[52] cache layers suite (79 checks)" \
+  || { fail "[52] cache layers suite"; printf '%s\n' "$out" | tail -40; }
+
+# [53] Audit round 2026-10-30 (DESIGN Round 25): verification-hardening
+# contracts — generated hook rc/rule/marker independence from builder shell
+# options, CI Package-gates semantics (anchored rule grep, evidence
+# fail-closed, REUSED skip, bin->wrapper symlink, maintainer scripts),
+# wrapper_guard effective-PREFIX, scan unreadable fail-closed, x11_gate
+# LD_PRELOAD quote-safety. No shipping policy touched.
+out=$(python3 "port/tests/verification_hardening_test.py" 2>&1); got=$?
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^VERIFY-HARDENING PASS=22 FAIL=0$' \
+  && pass "[53] verification-hardening suite (22 checks)" \
+  || { fail "[53] verification-hardening suite"; printf '%s\n' "$out" | tail -40; }
+
+# [54] F6 side-by-side packaging contract (DESIGN Round 26): rewrite chain
+# pin + anchor fail-closed, launcher isolation, audit tamper negatives,
+# package_identity_gate (+ real pre-F6 deb refusal), install-set disjointness
+# vs stock, forged cached-DEB release-chain refusal, stale-key reuse refusal.
+out=$(python3 "port/tests/f6_side_by_side_test.py" 2>&1); got=$?
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^F6-SUITE PASS=41 FAIL=0$' \
+  && pass "[54] F6 side-by-side suite (41 checks)" \
+  || { fail "[54] F6 side-by-side suite"; printf '%s\n' "$out" | tail -40; }
+
+# [55] Round 28 dependency-.deb persistence (host-tools reuse): upstream
+# --reuse-built-packages wiring, collect/seed round trip with REAL dpkg-deb
+# fixtures, sha/arch/name/target/traversal refusals, prune exemption + count
+# cap, no-network invariant, tolerated no-op paths, _all deps, seed allowlist (24 checks).
+out=$(python3 "port/tests/hosttools_reuse_test.py" 2>&1); got=$?
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^HOSTTOOLS-SUITE PASS=24 FAIL=0$' \
+  && pass "[55] host-tools reuse suite (24 checks)" \
+  || { fail "[55] host-tools reuse suite"; printf '%s\n' "$out" | tail -40; }
 
 exit $rc

@@ -10,3 +10,4 @@ chromium-device-gate/
 gate-out/
 build-watch-*.log
 .remote-test/
+.bpf-selftest.*/

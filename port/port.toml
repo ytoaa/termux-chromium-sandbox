@@ -84,6 +84,12 @@ file = "port/prepare_recipe.py"
 marker = "Termux seccomp-only audio-pulse-server:"
 note = "Zero privilege widening — audio server-selection behavior only. No C/C++/BPF/broker/syscall changes; user PULSE_SERVER (incl. empty string) respected; no-socket is a no-op. VALIDATED in run #31: AudioServiceSandbox ON on both devices — sandboxed utility owns PA stream (client pid in ACT set), in-window RMS audible, 60-min D soak, download manager + zombie checks closed. Feature remains DEFAULT-OFF; default-on requires separate approval."
 
+[rules.r12]
+name = "bionic set_tid_address renderer allow (Bionic)"
+file = "sandbox/policy/linux/bpf_renderer_policy_linux.cc"
+marker = "Termux seccomp-only r12-bionic-tid:"
+note = "R12 FIX CANDIDATE (2026-10-28, Issue #12 CONFIRMED root cause, comment 6450693236): renderer BPF routed set_tid_address -> CrashSIGSYS; bionic detached-pthread exit calls set_tid_address(NULL) with ALL signals blocked, so the kernel force_sig's the trap and the whole renderer dies silently (raw wait-status 31 = RESULT_CODE_INVALID_SANDBOX_STATE tab deaths; 21/21 strace siginfo captures si_syscall=__NR_set_tid_address; crashpad blind). Upstream BaselinePolicyAndroid allows the exact syscall unconditionally (baseline_policy_android.cc:188); os=linux builds compile that list out — same bionic blind-spot class as R3/R9a. Scope: renderer policy ONLY, one case arm, __BIONIC__ guard, VLOG marker (binary strings gate + per-activation runtime gate). EXPERIMENTAL: candidate-only build; device gate E-burst >=40 SIGSYS 0 + census filters=2/nnp=1 + strace normal-return proof required; promotion/publish need separate human approval."
+
 [gates]
 # Future candidate gates (firefox-pattern): source verify + binary markers +
 # on-device level checks. Binary markers are checked inside the built

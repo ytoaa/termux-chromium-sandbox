@@ -24,31 +24,130 @@ class RecipeError(RuntimeError):
 def sha(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
+def _replace_expected(text: str, old: str, new: str, count: int, label: str) -> str:
+    """Fail closed if an upstream installer anchor changes, rather than
+    silently packaging stock Chromium-owned files again."""
+    actual = text.count(old)
+    if actual != count:
+        raise RecipeError(
+            f"side-by-side identity drift ({label}): expected {count} "
+            f"occurrences, got {actual}: {old!r}"
+        )
+    return text.replace(old, new)
+
+
 def rewrite_identity(text: str) -> str:
-    # side-by-side identity: distinct lib dir + launcher name
-    t = text
-    t = t.replace("lib/chromium", "lib/chromium-sandboxed")
+    # The original recipe installs MORE than a binary and launcher. The
+    # complete stock-owned surface includes driver/headless symlinks, the
+    # desktop file, manpage, icons and AppStream metadata. Every path must
+    # be independent or dpkg -i fails (or --force-overwrite clobbers stock).
+    t = text.replace("lib/chromium", "lib/chromium-sandboxed")
+    # NOTE (F6 port, 2026-10-30): the hotfix branch re-derived the second
+    # replace from `text`, silently discarding the lib-dir move — a latent
+    # regression that never reached CI (branch unverified). Chained here to
+    # restore main's behavior; pinned by f6_side_by_side_test A1.
     t = t.replace("bin/chromium-browser", "bin/chromium-sandboxed")
-    t = t.replace('desktop="chromium.desktop"', 'desktop="chromium-sandboxed.desktop"')
-    # NOTE: termux_step_post_make_install (dummy-lib cleanup) is deliberately
-    # left intact: it removes files THIS clone's own build created in its own
-    # staging dir. It never touches the stock package.
+    # Each target has a verified location in the pinned Termux recipe.
+    rewrites = (
+        ('ln -sfr $TERMUX_PREFIX/lib/chromium-sandboxed/chromedriver $TERMUX_PREFIX/bin/',
+         'ln -sfr "$TERMUX_PREFIX/lib/chromium-sandboxed/chromedriver" "$TERMUX_PREFIX/bin/chromedriver-sandboxed"', 1, "chromedriver binary"),
+        ('ln -sfr $TERMUX_PREFIX/lib/chromium-sandboxed/headless_shell $TERMUX_PREFIX/bin/',
+         'ln -sfr "$TERMUX_PREFIX/lib/chromium-sandboxed/headless_shell" "$TERMUX_PREFIX/bin/headless_shell-sandboxed"', 1, "headless launcher"),
+        ('share/man/man1/chromium.1', 'share/man/man1/chromium-sandboxed.1', 2, "manpage"),
+        ('share/applications/chromium.desktop', 'share/applications/chromium-sandboxed.desktop', 2, "desktop entry"),
+        ('apps/chromium.png', 'apps/chromium-sandboxed.png', 2, "hicolor icons"),
+        ('share/metainfo/chromium.appdata.xml', 'share/metainfo/chromium-sandboxed.appdata.xml', 2, "AppStream metadata"),
+        ('s/@@usr_bin_symlink_name/chromium-browser/g',
+         's/@@usr_bin_symlink_name/chromium-sandboxed/g', 1, "desktop Exec"),
+        ('s/@@PACKAGE/chromium/g',
+         's/@@PACKAGE/chromium-sandboxed/g', 1, "desktop application ID"),
+        ('s/@@MENUNAME/Chromium/g',
+         's/@@MENUNAME/Chromium (Sandboxed)/g', 1, "desktop visible name"),
+        (r's/chromium-browser\.desktop/chromium.desktop/',
+         r's/chromium-browser\.desktop/chromium-sandboxed.desktop/', 1, "AppStream desktop reference"),
+    )
+    for old, new, count, label in rewrites:
+        t = _replace_expected(t, old, new, count, label)
+    # Preserve the upstream post-make-install dummy-lib cleanup (it executes
+    # only inside the sandboxed package's isolated staging prefix).
     return t
+
+
+def rewrite_launcher(text: str) -> str:
+    # Launcher is a copied, separate recipe file, not build.sh itself.
+    # Do not export the stock desktop ID or consume stock /etc/chromium flags.
+    for old, new, label in (
+        ('export CHROME_DESKTOP="chromium.desktop"',
+         'export CHROME_DESKTOP="chromium-sandboxed.desktop"', "launcher desktop ID"),
+        ('@TERMUX_PREFIX@/etc/chromium/*.conf',
+         '@TERMUX_PREFIX@/etc/chromium-sandboxed/*.conf', "launcher config isolation"),
+        ('/.config}/chromium', '/.config}/chromium-sandboxed', "root failsafe profile path"),
+    ):
+        text = _replace_expected(text, old, new, 1, label)
+    # TESTBED-verified defect (2026-10-31): the block above fires ONLY for
+    # root with root-owned HOME, so regular users silently shared the stock
+    # ~/.config/chromium profile (3413 files incl. Default/Preferences were
+    # written during a test run). Isolate the default profile for EVERY user,
+    # anchored fail-closed on the desktop-id block (upstream drift -> raise).
+    # Design notes:
+    #  - `set --` keeps the injected token quoted through the unquoted exec
+    #    line's "$@", so HOME/XDG paths containing spaces survive intact.
+    #  - Explicit --user-data-dir always wins: user "$@" args and
+    #    CHROMIUM_USER_FLAGS/CHROMIUM_FLAGS appear later on the command line
+    #    (chromium takes the last occurrence); when any already carry the
+    #    flag we skip our default entirely (no duplicates).
+    #  - Same config base as upstream: ${XDG_CONFIG_HOME:-${HOME}/.config}.
+    anchor = ('# Set the .desktop file name\n'
+              'export CHROME_DESKTOP="chromium-sandboxed.desktop"')
+    injection = """# Port (F6 profile isolation): default every user to an isolated profile
+# directory; explicit --user-data-dir (args or flags) is respected by skipping
+# the default, and set -- preserves whitespace in the path.
+for _f in "$@" ${CHROMIUM_USER_FLAGS:-} ${CHROMIUM_FLAGS:-}; do
+    case "$_f" in --user-data-dir=*) _udd=1; _udd_val=${_f#--user-data-dir=} ;; esac
+done
+if [ "${_udd:-0}" != 1 ]; then
+    set -- --user-data-dir="${XDG_CONFIG_HOME:-${HOME}/.config}/chromium-sandboxed" "$@"
+fi
+# Port (crashpad isolation, TESTBED-proven 2026-11-03): crashpad derives its
+# database from the product name, NOT --user-data-dir, so it kept writing
+# ~/.config/chromium/Crash Reports/settings.dat during isolated runs. Point it
+# at the effective profile; an explicit BREAKPAD_DUMP_LOCATION always wins.
+if [ -z "${BREAKPAD_DUMP_LOCATION:-}" ]; then
+    BREAKPAD_DUMP_LOCATION="${_udd_val:-${XDG_CONFIG_HOME:-${HOME}/.config}/chromium-sandboxed}/Crash Reports"
+    export BREAKPAD_DUMP_LOCATION
+fi
+
+""" + anchor
+    text = _replace_expected(text, anchor, injection, 1, "profile isolation injection")
+    return text
 
 HOOK = f"""
 {HOOK_BEGIN}
 termux_step_post_get_source() {{
+\t# Audit round (2026-10-30, DESIGN Round 25): the fail-closed contract must
+\t# NOT lean on the external builder's `set -euo pipefail` (build-package.sh
+\t# de1dd3d1 line 21 — an upstream invariant we do not own). Capture the
+\t# transformer rc from the pipeline itself, keep stderr inside the evidence
+\t# log, then require EVERY unconditional rule record plus the anti-injection
+\t# scan completion marker. The old `>= 8 records` threshold tolerated any
+\t# early rule loss; per-rule presence + rc + marker replaces it.
 \tpython3 "$TERMUX_PKG_BUILDER_DIR/termux-chromium-sandbox-port.py" apply \\
-\t\t--src "$TERMUX_PKG_SRCDIR" --scan content,chrome \\
+\t\t--src "$TERMUX_PKG_SRCDIR" --scan content,chrome 2>&1 \\
 \t\t| tee "$TERMUX_PKG_TMPDIR/port-apply.log"
+\tport_rc=${{PIPESTATUS[0]}}
+\t[ "$port_rc" -eq 0 ] || {{ echo "port hook: transformer exited rc=$port_rc (partial apply refused)" >&2; exit 1; }}
 \t\t# mirror into BUILDER_DIR (repo tree) so the CI host can grep it —
 \t\t# TMPDIR lives under the container home which is not mounted back.
 \t\tcp "$TERMUX_PKG_TMPDIR/port-apply.log" "$TERMUX_PKG_BUILDER_DIR/port-apply.log" 2>/dev/null || true
 \t\t# BUILDER_DIR at hook time is the container-local recipe copy (.termux-build),
 \t\t# NOT the mounted repo — also drop it at the mounted repo root for CI host gates.
 \t\tcat "$TERMUX_PKG_TMPDIR/port-apply.log" > /home/builder/termux-packages/port-apply-chromium.log 2>/dev/null || true
-\tc=$(grep -c "ALREADY_PRESENT\\|APPLIED" "$TERMUX_PKG_TMPDIR/port-apply.log" || true)
-\t[ "$c" -ge 8 ] || {{ echo "port hook: fewer than 8 rules applied" >&2; exit 1; }}
+\tfor r in R1 R2 R3 R4 R5 R7 R9a R10 R11 R12; do
+\t\tgrep -qE "\\] ${{r}} " "$TERMUX_PKG_TMPDIR/port-apply.log" \\
+\t\t\t|| {{ echo "port hook: rule ${{r}} record missing from port-apply.log" >&2; exit 1; }}
+\tdone
+\tgrep -q "anti-injection scan" "$TERMUX_PKG_TMPDIR/port-apply.log" \\
+\t\t|| {{ echo "port hook: anti-injection scan completion marker missing" >&2; exit 1; }}
 }}
 {HOOK_END}
 """
@@ -97,6 +196,34 @@ def parse_version_line(text: str):
     ver = m.group(1) or m.group(2) or m.group(3)
     quote = '"' if m.group(1) is not None else ("'" if m.group(2) is not None else '')
     return ver, quote, m.group(4)
+
+
+RM_TARBALL_RE = re.compile(
+    r'^[ \t]*rm -f "\$TERMUX_PKG_CACHEDIR/chromium-\$TERMUX_PKG_VERSION-linux\.tar\.xz"[ \t]*$',
+    re.M)
+
+def preserve_source_cache(text: str) -> tuple[str, list]:
+    """L4 adapter (clone-only; stock package never touched).
+
+    Upstream deletes the 1.87 GB extracted chromium tarball at the end of
+    post_patch ("keep more space"). That is the single largest repeated
+    download of every full rebuild (github release, sha256-verified at
+    fetch) and L4 can only persist files present in TERMUX_PKG_CACHEDIR
+    at collect time. The container has ~94 GB free after our free-space
+    step, so the space rationale does not apply on this fleet; keeping
+    the file lets the verified tarball be saved to (and restored from)
+    the L4 cache, eliminating the re-download and its failure window
+    across rebuilds. Absence of the line (upstream drift) is harmless:
+    the file simply stays, and we note it.
+    """
+    notes: list[str] = []
+    new, n = RM_TARBALL_RE.subn(
+        "\t: 'tarball kept for the L4 source cache - was an upstream "
+        "rm -f; disk is managed by the ci.sh free-space step'", text, count=1)
+    if n == 0:
+        notes.append("preserve_source_cache: upstream tarball-removal line "
+                     "not found (already removed upstream?) - no change")
+    return new, notes
 
 
 def align_versions(text: str, termux_dir: Path) -> tuple[str, list]:
@@ -272,6 +399,9 @@ def prepare(termux_dir: Path) -> dict:
             text = rewrite_identity(text)
             text = exclude_sandbox_disable_patches(text)
             text = wire_sccache(text)
+            text, keep_notes = preserve_source_cache(text)
+            for n in keep_notes:
+                print("NOTE:", n)
             text = chain_shield_hook(text)
             text, align_notes = align_versions(text, termux_dir)
             for n in align_notes:
@@ -319,9 +449,13 @@ def prepare(termux_dir: Path) -> dict:
             shutil.copytree(f, target, dirs_exist_ok=True)
             report[f.name + "/"] = "tree"
         else:
-            if target.is_file() and sha(target) == sha(f):
+            if f.name == "chromium-launcher.sh.in":
+                data = rewrite_launcher(f.read_text()).encode()
+            else:
+                data = f.read_bytes()
+            if target.is_file() and target.read_bytes() == data:
                 continue
-            target.write_bytes(f.read_bytes())
+            target.write_bytes(data)
             report[f.name] = sha(target)
     # marker: package identity
     if "chromium-sandboxed" not in (dst_dir / "build.sh").read_text():
@@ -343,6 +477,12 @@ def audit(termux_dir: Path) -> None:
         (SHIELD_BEGIN, "bionic shield hook present"),
         ("libtermux-gnp-fix.so", "pthread_getattr_np shield install"),
         ("termux_step_post_make_install_upstream", "shield chain calls upstream hook"),
+        ("share/applications/chromium-sandboxed.desktop", "isolated desktop file"),
+        ("share/man/man1/chromium-sandboxed.1", "isolated manpage"),
+        ("apps/chromium-sandboxed.png", "isolated icons"),
+        ("share/metainfo/chromium-sandboxed.appdata.xml", "isolated AppStream metadata"),
+        ("bin/chromedriver-sandboxed", "isolated driver symlink"),
+        ("bin/headless_shell-sandboxed", "isolated headless symlink"),
     ):
         if needle not in text:
             raise RecipeError(f"audit fail: missing {label}")
@@ -351,6 +491,23 @@ def audit(termux_dir: Path) -> None:
         raise RecipeError("audit fail: sandbox-disable patch exclusion missing")
     if re.search(r"\blib/chromium\b(?!-sandboxed)", text):
         raise RecipeError("audit fail: residual stock lib/chromium path")
+    launcher = termux_dir / PKG_DST / "chromium-launcher.sh.in"
+    if not launcher.is_file():
+        raise RecipeError("audit fail: isolated launcher template missing")
+    lt = launcher.read_text()
+    if ('CHROME_DESKTOP="chromium-sandboxed.desktop"' not in lt
+            or '/etc/chromium-sandboxed/*.conf' not in lt):
+        raise RecipeError("audit fail: stock desktop/config leak in launcher")
+    if 'set -- --user-data-dir="${XDG_CONFIG_HOME:-${HOME}/.config}/chromium-sandboxed" "$@"' not in lt:
+        raise RecipeError("audit fail: default profile isolation injection missing")
+    if 'BREAKPAD_DUMP_LOCATION="${_udd_val:-' not in lt:
+        raise RecipeError("audit fail: crashpad isolation export missing")
+    for forbidden in (
+        "share/applications/chromium.desktop", "share/man/man1/chromium.1",
+        "apps/chromium.png", "share/metainfo/chromium.appdata.xml",
+    ):
+        if forbidden in text:
+            raise RecipeError(f"audit fail: stock-owned installer path {forbidden}")
     if not (termux_dir / PKG_DST / "gnp_shim.c").is_file():
         raise RecipeError("audit fail: gnp_shim.c not shipped in the recipe dir")
     print("[AUDIT OK] chromium-sandboxed recipe contract holds")
