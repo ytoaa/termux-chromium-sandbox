@@ -12,25 +12,25 @@
  },
  "last_successful_build": {
   "upstream_version": "156.0.8078.79",
-  "revision": 1,
-  "package_version": "156.0.8078.79",
-  "deb_version": "156.0.8078.79",
-  "pkg_revision_env": "",
-  "termux_ref": "1a6ff36aed82f2acd10cde7cf3e44e81bf453e49",
+  "revision": 2,
+  "package_version": "156.0.8078.79-2",
+  "deb_version": "156.0.8078.79-2",
+  "pkg_revision_env": "2",
+  "termux_ref": "db19d119c3a473b797d8a94a9f1a99c92c11ea53",
   "port_sha": "061ae7ead9c3b2b8",
-  "signature": "613184cb8f6ebf07",
+  "signature": "6368be05e65512e4",
   "signature_schema": 2,
-  "recipe_sha": "7a9cb87a71096eec",
+  "recipe_sha": "482513f36fbe8689",
   "host_sha": "b5434a253863b9e2",
-  "is_revision": false,
+  "is_revision": true,
   "status": "BUILD_VERIFIED_CANDIDATE",
-  "deb_sha256": "65edd82029f013fdfccf20fc3666b8722279e45a43206d46ec2dfe5e0e307d5e",
-  "termux_sha": "1a6ff36aed82f2acd10cde7cf3e44e81bf453e49",
-  "ci_run": 41593371383,
-  "ci_url": "https://github.com/ytoaa/termux-chromium-sandbox/actions/runs/41593371383",
-  "artifact": "build-41593371383",
+  "deb_sha256": "3153092c44aa9523fe3f51a7375d7b2c520d1fd27429c16b23430430959e263e",
+  "termux_sha": "db19d119c3a473b797d8a94a9f1a99c92c11ea53",
+  "ci_run": 41787315890,
+  "ci_url": "https://github.com/ytoaa/termux-chromium-sandbox/actions/runs/41787315890",
+  "artifact": "build-41787315890",
   "artifact_verified": false,
-  "recorded_at": "2026-11-03T07:00:05Z",
+  "recorded_at": "2026-11-04T06:42:33Z",
   "validated": false
  },
  "candidates": [
@@ -112,6 +112,29 @@
    "artifact_verified": false,
    "recorded_at": "2026-11-03T07:00:05Z",
    "validated": false
+  },
+  {
+   "upstream_version": "156.0.8078.79",
+   "revision": 2,
+   "package_version": "156.0.8078.79-2",
+   "deb_version": "156.0.8078.79-2",
+   "pkg_revision_env": "2",
+   "termux_ref": "db19d119c3a473b797d8a94a9f1a99c92c11ea53",
+   "port_sha": "061ae7ead9c3b2b8",
+   "signature": "6368be05e65512e4",
+   "signature_schema": 2,
+   "recipe_sha": "482513f36fbe8689",
+   "host_sha": "b5434a253863b9e2",
+   "is_revision": true,
+   "status": "BUILD_VERIFIED_CANDIDATE",
+   "deb_sha256": "3153092c44aa9523fe3f51a7375d7b2c520d1fd27429c16b23430430959e263e",
+   "termux_sha": "db19d119c3a473b797d8a94a9f1a99c92c11ea53",
+   "ci_run": 41787315890,
+   "ci_url": "https://github.com/ytoaa/termux-chromium-sandbox/actions/runs/41787315890",
+   "artifact": "build-41787315890",
+   "artifact_verified": false,
+   "recorded_at": "2026-11-04T06:42:33Z",
+   "validated": false
   }
  ],
  "blocked": {
@@ -155,6 +178,10 @@
   {
    "at": "2026-11-03T07:00:05Z",
    "success": "156.0.8078.79 sig=613184cb8f6ebf07"
+  },
+  {
+   "at": "2026-11-04T06:42:33Z",
+   "success": "156.0.8078.79-2 sig=6368be05e65512e4"
   }
  ]
 }
