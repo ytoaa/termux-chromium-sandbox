@@ -732,5 +732,20 @@ kxr2 = run(["bash", str(CI), "deb-key", str(tp)], env=env).stdout.strip().splitl
 ok("T43 repo.json change still rotates DEB key (no key relaxation after Round 25 upgrade)",
    kxr2.startswith("DEB_KEY=") and kxr2 != kx2, f"{kxr2} vs {kx2}")
 
+# ---------- T44: C-1 — a REUSED=1 run must not write new cache generations ----
+# Measured on run 41739299836 (7.5 min, build skipped): the depcache and sccache
+# save steps still ran and added ~1 GB of byte-equivalent generations. The fix is
+# the `reused != '1'` gate on both saves; '' (deb reuse disabled => debcheck
+# skipped) must keep the normal path enabled.
+_dep_save = wf[wf.index("- name: Save termux dep cache"):wf.index("- name: Save sccache")]
+_sc_save = wf[wf.index("- name: Save sccache"):wf.index("- name: Save source cache (L4)")]
+ok("T44 C-1: depcache and sccache saves are skipped on REUSED=1 (no cache generation churn)",
+   "steps.debcheck.outputs.reused != '1'" in _dep_save.split("\n")[1]
+   and "steps.debcheck.outputs.reused != '1'" in _sc_save.split("\n")[1]
+   and "steps.role.outputs.producer == '1'" in _dep_save.split("\n")[1]
+   and "steps.guard.outputs.dep_nonempty == '1'" in _dep_save.split("\n")[1]
+   and "steps.guard.outputs.sccache_nonempty == '1'" in _sc_save.split("\n")[1],
+   _dep_save.split("\n")[1] + " | " + _sc_save.split("\n")[1])
+
 print(f"\nCACHE-LAYERS PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)

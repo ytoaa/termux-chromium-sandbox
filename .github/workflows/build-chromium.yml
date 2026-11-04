@@ -448,14 +448,21 @@ jobs:
       - name: Prune termux dep cache
         if: always()
         run: bash port/ci.sh dep-cache-prune "$PWD/termux-packages"
+      # Round 30 (C-1, measured on run 41739299836): a REUSED=1 run performs no
+      # build, so re-saving depcache/sccache only creates a byte-equivalent new
+      # generation (~1 GB per occurrence against the 10 GB budget). The restore
+      # steps already refresh the entries' last-access time, so skipping the
+      # write on REUSED=1 does not age them out. reused is '' when deb reuse is
+      # disabled (debcheck step skipped) => condition stays true and the normal
+      # REUSED=0 path is unchanged.
       - name: Save termux dep cache
-        if: always() && steps.role.outputs.producer == '1' && steps.guard.outputs.dep_nonempty == '1'
+        if: always() && steps.role.outputs.producer == '1' && steps.debcheck.outputs.reused != '1' && steps.guard.outputs.dep_nonempty == '1'
         uses: actions/cache/save@v4
         with:
           path: termux-packages/.termux-depcache
           key: termux-depcache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
       - name: Save sccache
-        if: always() && steps.role.outputs.producer == '1' && steps.guard.outputs.sccache_nonempty == '1'
+        if: always() && steps.role.outputs.producer == '1' && steps.debcheck.outputs.reused != '1' && steps.guard.outputs.sccache_nonempty == '1'
         uses: actions/cache/save@v4
         with:
           path: termux-packages/.sccache
