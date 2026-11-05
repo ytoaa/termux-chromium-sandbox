@@ -496,4 +496,12 @@ out=$(python3 "port/tests/hosttools_reuse_test.py" 2>&1); got=$?
   && pass "[55] host-tools reuse suite (24 checks)" \
   || { fail "[55] host-tools reuse suite"; printf '%s\n' "$out" | tail -40; }
 
+# [56] Round 31 (C-5): essential dependency debs survive the depcache prune;
+# missing entries are named instead of silently skipped.
+out=$(python3 port/tests/depcache_prune_test.py 2>&1); got=$?
+printf '%s\n' "$out" | grep -q '^FAIL' && got=1
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^DEPCACHE-PRUNE PASS=20 FAIL=0$' \
+  && pass "[56] C-5 depcache prune suite (20 checks)" \
+  || { fail "[56] C-5 depcache prune suite"; printf '%s\n' "$out" | tail -40; }
+
 exit $rc
