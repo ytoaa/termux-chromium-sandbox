@@ -104,19 +104,75 @@ dep_cache_prune() {
   # Round 28: deps/ holds dependency .debs WE built (host-tools etc.) and is the
   # only surviving copy once the live repo drops the pinned version — never
   # age-prune it; bound it by count instead.
+  #
+  # Round 31 (C-5, measured on run 41906007952): the count cap was applied to
+  # ALL debs, but the dependency set is 41 while the cap defaults to 40, and
+  # the ordering key is mtime (ties are arbitrary). The allowlisted
+  # chromium-host-tools deb was therefore evicted, the next run's seed found
+  # 40/41 entries, and the host-tools reuse path silently degraded into a
+  # 157-minute source rebuild. Allowlisted ("essential") debs are now exempt
+  # from BOTH prune passes; the cap bounds only ordinary deps, and a separate
+  # hard bound keeps the essential set small.
+  local allow keep=0 ordinary=0 total_n=0 f name pkg trimmed=0
+  allow=" ${DEP_SEED_ALLOW:-chromium-host-tools} "
   find "$root" -type f -mtime +30 -not -path "$root/deps/*" -delete 2>/dev/null || true
   if [ -d "$root/deps" ]; then
-    find "$root/deps" -maxdepth 1 -type f -name '*.deb' -printf '%T@ %p\n' 2>/dev/null | \
-      LC_ALL=C sort -rn | tail -n +$(( ${TERMUX_DEPCACHE_MAX_DEPS:-40} + 1 )) | cut -d' ' -f2- | \
-      while IFS= read -r f; do
-        if [ -n "$f" ]; then rm -f -- "$f" || true; fi
+    local list; list="$(mktemp)"
+    find "$root/deps" -maxdepth 1 -type f -name '*.deb' -printf '%T@ %p\n' 2>/dev/null | LC_ALL=C sort -rn > "$list" || true
+    total_n=$(wc -l < "$list" | tr -d ' ')
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      name=$(basename -- "${line#* }"); pkg=${name%%_*}
+      case "$allow" in *" $pkg "*) keep=$((keep+1));; esac
+    done < "$list"
+    ordinary=$(( total_n - keep ))
+    local deleted=0
+    if [ "$ordinary" -gt "${TERMUX_DEPCACHE_MAX_DEPS:-40}" ]; then
+      # oldest first, skipping essential debs
+      LC_ALL=C sort -n "$list" | cut -d' ' -f2- | while IFS= read -r f; do
+        [ "$ordinary" -le "${TERMUX_DEPCACHE_MAX_DEPS:-40}" ] && break
+        [ -n "$f" ] || continue
+        name=$(basename -- "$f"); pkg=${name%%_*}
+        case "$allow" in *" $pkg "*) continue;; esac
+        rm -f -- "$f" || true; ordinary=$((ordinary-1)); deleted=$((deleted+1))
       done
+    fi
+    # hard bound on the essential set itself (a widened allowlist must not
+    # grow without limit); oldest essential debs go first, never ordinary ones
+    local keep_max=${TERMUX_DEPCACHE_MAX_ESSENTIAL:-8}
+    if [ "$keep" -gt "$keep_max" ]; then
+      LC_ALL=C sort -n "$list" | cut -d' ' -f2- | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        name=$(basename -- "$f"); pkg=${name%%_*}
+        case "$allow" in *" $pkg "*) ;; *) continue;; esac
+        [ "$keep" -le "$keep_max" ] && break
+        rm -f -- "$f" || true; keep=$((keep-1)); trimmed=$((trimmed+1))
+      done
+      echo "DEPCACHE essential trimmed to $keep_max (removed $trimmed oldest essential debs)"
+    fi
+    rm -f -- "$list"
+    # Keep MANIFEST consistent with what survived: a capped dep is an intended
+    # eviction, not a lost file, and must not surface as "missing" forever.
+    if [ -f "$root/deps/MANIFEST" ]; then
+      local mtmp; mtmp="$(mktemp)"
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        nm=${line#*$'\t'}
+        [ -f "$root/deps/$nm" ] && printf '%s\n' "$line" >> "$mtmp"
+      done < "$root/deps/MANIFEST"
+      mv -f -- "$mtmp" "$root/deps/MANIFEST"
+      echo "DEPCACHE manifest reconciled: $(wc -l < "$root/deps/MANIFEST" | tr -d ' ') entries"
+    fi
+    echo "DEPCACHE deps: total=$total_n essential=$keep ordinary=$ordinary deleted=$deleted cap=${TERMUX_DEPCACHE_MAX_DEPS:-40}"
   fi
   total=$(du -sb "$root" 2>/dev/null | cut -f1); total=${total:-0}
   if [ "$total" -gt "$cap_bytes" ]; then
-    echo "DEPCACHE over cap ($total B > $cap_bytes B); pruning oldest first"
+    echo "DEPCACHE over cap ($total B > $cap_bytes B); pruning oldest first (essential debs protected)"
     find "$root" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2- | \
     while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      name=$(basename -- "$f"); pkg=${name%%_*}
+      case "$allow" in *" $pkg "*) continue;; esac
       total=$(du -sb "$root" | cut -f1)
       if [ "$total" -le "$cap_bytes" ]; then break; fi
       rm -f -- "$f" || true
@@ -184,7 +240,7 @@ _dep_deb_meta() { # $1=file -> "<pkg> <ver> <arch>"; rc!=0 => unusable
 }
 
 dep_output_seed() {
-  local d deps out man n=0 seeded=0 skipped=0 sha name f meta
+  local d deps out man n=0 seeded=0 skipped=0 missing=0 req_missing="" sha name f meta pkg
   d="$(need_termux_dir "${1:?usage: ci.sh dep-output-seed <termux-packages>}")"
   deps="$d/.termux-depcache/deps"; out="$d/output"; man="$deps/MANIFEST"
   if [ ! -d "$deps" ] || [ ! -f "$man" ]; then
@@ -199,7 +255,19 @@ dep_output_seed() {
       chromium-sandboxed_*|*/*|.|..) echo "DEPSED seed SKIP unsafe entry '${name}'"; skipped=$((skipped+1)); continue ;;
     esac
     f="$deps/$name"
-    if [ ! -f "$f" ]; then skipped=$((skipped+1)); continue; fi
+    # Round 31 (C-5): a manifest entry with no file used to be a SILENT skip,
+    # which is how run 41906007952 showed "entries=41 seeded=0" with no cause
+    # in the log. Name it, count it, and warn when the missing package is one
+    # we require for reuse.
+    if [ ! -f "$f" ]; then
+      echo "DEPSED seed MISSING $name (manifest entry has no file)"
+      skipped=$((skipped+1)); missing=$((missing+1))
+      case "$name" in
+        chromium-sandboxed_*) ;;
+        *) pkg=${name%%_*}; case " ${DEP_SEED_ALLOW:-chromium-host-tools} " in *" $pkg "*) req_missing="$req_missing $pkg";; esac ;;
+      esac
+      continue
+    fi
     if [ "$(sha256sum "$f" | cut -d' ' -f1)" != "$sha" ]; then
       echo "DEPSED seed SKIP sha mismatch: $name"; skipped=$((skipped+1)); continue
     fi
@@ -214,7 +282,15 @@ dep_output_seed() {
     cp -f -- "$f" "$out/$name" || { skipped=$((skipped+1)); continue; }
     seeded=$((seeded+1))
   done < "$man"
-  echo "DEPSED seed entries=$n seeded=$seeded skipped=$skipped"
+  echo "DEPSED seed entries=$n seeded=$seeded skipped=$skipped missing=$missing"
+  if [ "$missing" -gt 0 ]; then
+    echo "DEPSED seed INCOMPLETE: $missing manifest entr(y|ies) have no file (depcache is lossy)"
+    echo "::warning::depcache incomplete: $missing entr(y|ies) missing - affected deps will be rebuilt"
+  fi
+  if [ -n "$req_missing" ]; then
+    echo "DEPSED seed REQUIRED-MISSING:$req_missing"
+    echo "::warning::required dependency deb(s) missing from depcache:$req_missing - host-tools reuse will NOT happen"
+  fi
 }
 
 dep_output_collect() {
