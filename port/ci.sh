@@ -127,10 +127,10 @@ dep_cache_prune() {
     done < "$list"
     ordinary=$(( total_n - keep ))
     local deleted=0
-    if [ "$ordinary" -gt "${TERMUX_DEPCACHE_MAX_DEPS:-40}" ]; then
+    if [ "$ordinary" -gt "${TERMUX_DEPCACHE_MAX_DEPS:-64}" ]; then
       # oldest first, skipping essential debs
       LC_ALL=C sort -n "$list" | cut -d' ' -f2- | while IFS= read -r f; do
-        [ "$ordinary" -le "${TERMUX_DEPCACHE_MAX_DEPS:-40}" ] && break
+        [ "$ordinary" -le "${TERMUX_DEPCACHE_MAX_DEPS:-64}" ] && break
         [ -n "$f" ] || continue
         name=$(basename -- "$f"); pkg=${name%%_*}
         case "$allow" in *" $pkg "*) continue;; esac
@@ -172,7 +172,7 @@ dep_cache_prune() {
       mv -f -- "$mtmp" "$root/deps/MANIFEST"
       echo "DEPCACHE manifest reconciled: $(wc -l < "$root/deps/MANIFEST" | tr -d ' ') entries"
     fi
-    echo "DEPCACHE deps: total=$total_after essential=$keep_after ordinary=$((total_after-keep_after)) deleted=$((total_n-total_after)) cap=${TERMUX_DEPCACHE_MAX_DEPS:-40}"
+    echo "DEPCACHE deps: total=$total_after essential=$keep_after ordinary=$((total_after-keep_after)) deleted=$((total_n-total_after)) cap=${TERMUX_DEPCACHE_MAX_DEPS:-64}"
   fi
   total=$(du -sb "$root" 2>/dev/null | cut -f1); total=${total:-0}
   if [ "$total" -gt "$cap_bytes" ]; then
