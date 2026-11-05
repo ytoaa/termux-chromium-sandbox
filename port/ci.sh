@@ -127,10 +127,10 @@ dep_cache_prune() {
     done < "$list"
     ordinary=$(( total_n - keep ))
     local deleted=0
-    if [ "$ordinary" -gt "${TERMUX_DEPCACHE_MAX_DEPS:-40}" ]; then
+    if [ "$ordinary" -gt "${TERMUX_DEPCACHE_MAX_DEPS:-64}" ]; then
       # oldest first, skipping essential debs
       LC_ALL=C sort -n "$list" | cut -d' ' -f2- | while IFS= read -r f; do
-        [ "$ordinary" -le "${TERMUX_DEPCACHE_MAX_DEPS:-40}" ] && break
+        [ "$ordinary" -le "${TERMUX_DEPCACHE_MAX_DEPS:-64}" ] && break
         [ -n "$f" ] || continue
         name=$(basename -- "$f"); pkg=${name%%_*}
         case "$allow" in *" $pkg "*) continue;; esac
@@ -148,9 +148,18 @@ dep_cache_prune() {
         [ "$keep" -le "$keep_max" ] && break
         rm -f -- "$f" || true; keep=$((keep-1)); trimmed=$((trimmed+1))
       done
-      echo "DEPCACHE essential trimmed to $keep_max (removed $trimmed oldest essential debs)"
+      echo "DEPCACHE essential bound $keep_max applied (post-trim count logged below)"
     fi
     rm -f -- "$list"
+    # Round 31: the prune loops above run in a pipeline subshell, so their
+    # counters do not survive. Recompute from disk; a stale summary line is how
+    # a "deleted=0" was printed while 8 debs had actually been removed.
+    local total_after=0 keep_after=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      total_after=$((total_after+1)); name=$(basename -- "$f"); pkg=${name%%_*}
+      case "$allow" in *" $pkg "*) keep_after=$((keep_after+1));; esac
+    done < <(find "$root/deps" -maxdepth 1 -type f -name '*.deb')
     # Keep MANIFEST consistent with what survived: a capped dep is an intended
     # eviction, not a lost file, and must not surface as "missing" forever.
     if [ -f "$root/deps/MANIFEST" ]; then
@@ -163,7 +172,7 @@ dep_cache_prune() {
       mv -f -- "$mtmp" "$root/deps/MANIFEST"
       echo "DEPCACHE manifest reconciled: $(wc -l < "$root/deps/MANIFEST" | tr -d ' ') entries"
     fi
-    echo "DEPCACHE deps: total=$total_n essential=$keep ordinary=$ordinary deleted=$deleted cap=${TERMUX_DEPCACHE_MAX_DEPS:-40}"
+    echo "DEPCACHE deps: total=$total_after essential=$keep_after ordinary=$((total_after-keep_after)) deleted=$((total_n-total_after)) cap=${TERMUX_DEPCACHE_MAX_DEPS:-64}"
   fi
   total=$(du -sb "$root" 2>/dev/null | cut -f1); total=${total:-0}
   if [ "$total" -gt "$cap_bytes" ]; then

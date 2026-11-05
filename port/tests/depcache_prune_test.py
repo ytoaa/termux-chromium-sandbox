@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Round 31 — C-5 regression: essential dependency debs survive depcache prune.
 
-Measured defect (run 41906007952): TERMUX_DEPCACHE_MAX_DEPS=40 < 41 dependency
+Measured defect (run 41906007952): TERMUX_DEPCACHE_MAX_DEPS=40 < 41+ dependency
 debs, the count prune ordered by mtime, and the allowlisted chromium-host-tools
 deb was evicted -> the next seed reported "entries=41 seeded=0" with NO cause in
 the log, and host-tools was rebuilt from source (157 min).
@@ -25,6 +25,8 @@ Checks the fix at the ci.sh level with real dpkg-deb fixtures (no network):
   P18 workflow skips seed on REUSED=1 (no pointless seed of a reused deb)
   P19 C-1 save gates still present (REUSED=1 writes nothing)
   P20 no essential deb is ever removed by the ordinary cap (10x shuffle)
+  P21 prune summary reports post-deletion counts
+  P22 default cap keeps the real 49-deb set (no churn)
 """
 import os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
@@ -96,7 +98,7 @@ def prune(d, env=None):
 # ---- fixture pool: host-tools + 45 ordinary debs (built once) -------------
 POOL.mkdir(parents=True)
 mkdeb("chromium-host-tools", "156.0.8078.47", "aarch64", POOL)
-for i in range(1, 46):
+for i in range(1, 49):
     mkdeb(f"dep{i:02d}", "1.0", "aarch64", POOL)
 
 wf = WF.read_text()
@@ -137,14 +139,14 @@ ok("P5 equal mtimes: tie-break can no longer evict the essential deb",
 # P6/P7 boundary counts
 for name, n, want_files in (("p6", 38, 39), ("p7", 39, 40)):
     d, deps = termux_dir(name, n, hosttools_mtime=1000000000, ordinary_mtime=2000000000)
-    prune(d); r, s = seed(d)
+    prune(d, {"TERMUX_DEPCACHE_MAX_DEPS": "40"}); r, s = seed(d)
     ok(f"P6/P7 boundary ordinary={n}: no cap applied, seed works",
        len(list(deps.glob('*.deb'))) == want_files and s[1] == 1, f"files={len(list(deps.glob('*.deb')))} seed={s}")
 
 # P8/P9 above cap
 for name, n in (("p8", 41), ("p9", 44)):
     d, deps = termux_dir(name, n, hosttools_mtime=1000000000, ordinary_mtime=2000000000)
-    prune(d); r, s = seed(d)
+    prune(d, {"TERMUX_DEPCACHE_MAX_DEPS": "40"}); r, s = seed(d)
     ok(f"P8/P9 ordinary={n}: capped to 40 ordinary + essential, manifest reconciled, seed ok",
        len(list(deps.glob('*.deb'))) == 41 and s == (41, 1, 40, 0),
        f"files={len(list(deps.glob('*.deb')))} seed={s}")
@@ -190,7 +192,7 @@ ok("P13 byte cap: ordinary debs pruned, essential deb survives",
 
 # P14 manifest reconciled
 d, deps = termux_dir("p14", 44, hosttools_mtime=1000000000, ordinary_mtime=2000000000)
-prune(d)
+prune(d, {"TERMUX_DEPCACHE_MAX_DEPS": "40"})
 manifest = (deps / "MANIFEST").read_text().splitlines()
 ok("P14 manifest reconciled with disk after prune (no permanent phantom missing)",
    len(manifest) == len(list(deps.glob("*.deb"))) == 41, f"manifest={len(manifest)}")
@@ -205,7 +207,8 @@ ok("P15 missing required deb does not fail the seed step (build recovers by rebu
 
 # P16 idempotent prune
 d, deps = termux_dir("p16", 44, hosttools_mtime=1000000000, ordinary_mtime=2000000000)
-prune(d); n1 = len(list(deps.glob("*.deb"))); prune(d); n2 = len(list(deps.glob("*.deb")))
+CAP = {"TERMUX_DEPCACHE_MAX_DEPS": "40"}
+prune(d, CAP); n1 = len(list(deps.glob("*.deb"))); prune(d, CAP); n2 = len(list(deps.glob("*.deb")))
 ok("P16 prune is idempotent", n1 == n2 == 41, f"{n1}->{n2}")
 
 # P17 summary format
@@ -222,11 +225,25 @@ ok("P19 C-1 save gates intact (REUSED=1 writes no cache generation)",
    "steps.debcheck.outputs.reused != '1'" in save_dep.split("\n")[1]
    and "steps.debcheck.outputs.reused != '1'" in save_sc.split("\n")[1])
 
+# P22 default cap (64) keeps the real 49-dep set: no churn, no missing
+d, deps = termux_dir("p22", 48, hosttools_mtime=1000000000, ordinary_mtime=2000000000)
+prune(d); r, s = seed(d)
+ok("P22 default cap keeps a 49-deb set intact (no per-run churn)",
+   len(list(deps.glob('*.deb'))) == 49 and s == (49, 1, 48, 0), f"files={len(list(deps.glob('*.deb')))} seed={s}")
+
+# P21 prune summary reports post-deletion counts (no stale "deleted=0")
+d, deps = termux_dir("p21", 44, hosttools_mtime=1000000000, ordinary_mtime=2000000000)
+r = prune(d, {"TERMUX_DEPCACHE_MAX_DEPS": "40"})
+m = re.search(r"DEPCACHE deps: total=(\d+) essential=(\d+) ordinary=(\d+) deleted=(\d+)", r.stdout)
+ok("P21 prune summary reports post-deletion counts (deleted reflects real removals)",
+   bool(m) and m.group(1) == "41" and m.group(2) == "1" and m.group(3) == "40" and m.group(4) == "4",
+   m.group(0) if m else r.stdout[-200:])
+
 # P20 10 shuffles: essential never removed by the ordinary cap
 survived = 0
 for k in range(10):
     d, deps = termux_dir(f"p20_{k}", 40 + (k % 5), hosttools_mtime=1000000000 + k, ordinary_mtime=1000000000 + (k % 3))
-    prune(d)
+    prune(d, {"TERMUX_DEPCACHE_MAX_DEPS": "40"})
     survived += 1 if (deps / "chromium-host-tools_156.0.8078.47_aarch64.deb").exists() else 0
 ok("P20 essential deb survives 10 mixed-mtime/over-cap shuffles", survived == 10, f"{survived}/10")
 

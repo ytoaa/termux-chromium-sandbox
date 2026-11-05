@@ -500,8 +500,8 @@ out=$(python3 "port/tests/hosttools_reuse_test.py" 2>&1); got=$?
 # missing entries are named instead of silently skipped.
 out=$(python3 port/tests/depcache_prune_test.py 2>&1); got=$?
 printf '%s\n' "$out" | grep -q '^FAIL' && got=1
-[ "$got" -eq 0 ] && echo "$out" | grep -q '^DEPCACHE-PRUNE PASS=20 FAIL=0$' \
-  && pass "[56] C-5 depcache prune suite (20 checks)" \
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^DEPCACHE-PRUNE PASS=22 FAIL=0$' \
+  && pass "[56] C-5 depcache prune suite (22 checks)" \
   || { fail "[56] C-5 depcache prune suite"; printf '%s\n' "$out" | tail -40; }
 
 exit $rc
