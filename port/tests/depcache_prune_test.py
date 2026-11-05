@@ -25,6 +25,7 @@ Checks the fix at the ci.sh level with real dpkg-deb fixtures (no network):
   P18 workflow skips seed on REUSED=1 (no pointless seed of a reused deb)
   P19 C-1 save gates still present (REUSED=1 writes nothing)
   P20 no essential deb is ever removed by the ordinary cap (10x shuffle)
+  P21 prune summary reports post-deletion counts
 """
 import os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
@@ -221,6 +222,14 @@ ok("P18 seed step is skipped on REUSED=1",
 ok("P19 C-1 save gates intact (REUSED=1 writes no cache generation)",
    "steps.debcheck.outputs.reused != '1'" in save_dep.split("\n")[1]
    and "steps.debcheck.outputs.reused != '1'" in save_sc.split("\n")[1])
+
+# P21 prune summary reports post-deletion counts (no stale "deleted=0")
+d, deps = termux_dir("p21", 44, hosttools_mtime=1000000000, ordinary_mtime=2000000000)
+r = prune(d)
+m = re.search(r"DEPCACHE deps: total=(\d+) essential=(\d+) ordinary=(\d+) deleted=(\d+)", r.stdout)
+ok("P21 prune summary reports post-deletion counts (deleted reflects real removals)",
+   bool(m) and m.group(1) == "41" and m.group(2) == "1" and m.group(3) == "40" and m.group(4) == "4",
+   m.group(0) if m else r.stdout[-200:])
 
 # P20 10 shuffles: essential never removed by the ordinary cap
 survived = 0
