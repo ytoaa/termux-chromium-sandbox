@@ -182,6 +182,21 @@
    "at": "2026-11-06T07:01:39Z",
    "infra_failures": 1,
    "failure_jobs": "build (result=failure)"
+  },
+  "cc16c8033a84f9a6": {
+   "classification": "unknown",
+   "issue": 33,
+   "retry_approved": false,
+   "approval_consumed_issues": [],
+   "inputs": {
+    "recipe_sha": "cab167a6d8d556c1",
+    "host_sha": "99eb778d59a46958",
+    "port_sha": "a5dda278aadf898d"
+   },
+   "stage": "build",
+   "at": "2026-11-07T06:14:22Z",
+   "infra_failures": 1,
+   "failure_jobs": "build (result=failure)"
   }
  },
  "history": [
@@ -220,6 +235,10 @@
   {
    "at": "2026-11-06T07:01:39Z",
    "blocked": "34e6408a059195c6 build/unknown"
+  },
+  {
+   "at": "2026-11-07T06:14:22Z",
+   "blocked": "cc16c8033a84f9a6 build/unknown"
   }
  ]
 }
