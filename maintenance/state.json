@@ -199,15 +199,19 @@
    "failure_jobs": "build (result=failure)"
   },
   "7118b5845178507d": {
-   "classification": "infra",
-   "infra_failures": 1,
+   "classification": "unknown",
+   "issue": 34,
+   "retry_approved": false,
+   "approval_consumed_issues": [],
    "inputs": {
     "recipe_sha": "c5b13668046d3422",
     "host_sha": "ca3a0d83998a5fbe",
     "port_sha": "a5dda278aadf898d"
    },
    "stage": "build",
-   "at": "2026-11-08T06:20:25Z"
+   "at": "2026-11-09T06:53:50Z",
+   "infra_failures": 2,
+   "failure_jobs": "build (result=failure)"
   }
  },
  "history": [
@@ -254,6 +258,10 @@
   {
    "at": "2026-11-08T06:20:25Z",
    "infra-retry-pending": "7118b5845178507d"
+  },
+  {
+   "at": "2026-11-09T06:53:50Z",
+   "blocked": "7118b5845178507d build/unknown"
   }
  ]
 }
