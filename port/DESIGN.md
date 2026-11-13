@@ -2067,3 +2067,21 @@ port refused to build. Fail-closed behaviour is correct; the anchor was stale.
   bae5316, the patch order, and the R8 security semantics of both variants.
 * Full harness: see the commit message for the exact suite count/RC. A real 157
   build on `main` is the acceptance test and is NOT claimed here.
+
+### 33.5 Maintenance gate — do not build a version the recipe does not declare
+
+The 157 outage had a second cause beyond the R8 anchor: the daily probe targets
+`host-tools`' version and `prepare_recipe` aligns the chromium recipe to it. When
+termux bumps **chromium-host-tools before the chromium recipe** (157.0.8103.38 on
+2026-11-05 while the recipe still said 156.0.8078.79), that alignment produces a
+tree whose recipe/cr-patches are one version behind: the attempt died in
+`gn gen` with `Undefined identifier … //v8/BUILD.gn run_metagen` after 235 min
+(run 43453888322).
+
+`decide()` now refuses such a target:
+
+    action=skip reason=upstream-recipe-not-ready
+
+The previous validated baseline is kept, no issue is opened, and no 4-hour runner
+is burned. The build resumes automatically once termux bumps the chromium recipe
+(measured: master `f6bf3c45` declares 157.0.8103.50 in BOTH files).
