@@ -431,6 +431,19 @@ def decide(state: dict, probes: dict, port_sha: str, now: str,
         diag.append(f'recipe version {recipe["version"]} != host-tools '
                     f'{recipe["host_version"]}; building the ALIGNED value '
                     f'(prepare_recipe policy) = {buildable}')
+        # Round 33 (measured on run 43453888322): when termux bumps
+        # chromium-host-tools BEFORE the chromium recipe itself, the pinned tree
+        # still carries the previous version's recipe + cr-patches. Aligning the
+        # version then produces a build that cannot work (the 157 attempt died in
+        # `gn gen` with 'Undefined identifier //v8/BUILD.gn run_metagen' after
+        # ~235 min). Refuse to attempt such a target: the upstream tree has to
+        # declare the version it builds. This keeps the previous validated
+        # baseline and stops the pipeline from burning a 4-hour runner per day.
+        plan['reason'] = 'upstream-recipe-not-ready'
+        diag.append('REFUSING aligned build: chromium recipe still declares '
+                    f'{recipe["version"]} while host-tools declares '
+                    f'{recipe["host_version"]}; wait for the termux recipe bump')
+        return plan
 
     last = state.get('last_successful_build') or {}
     sig = build_signature(buildable, recipe['recipe_sha'],

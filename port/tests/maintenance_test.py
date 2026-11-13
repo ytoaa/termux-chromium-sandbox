@@ -31,6 +31,14 @@ p=probes(); s=base_state(); s['last_successful_build']['signature']=SIG
 pl=M.decide(s,p,'PORT-A','t',[],None)
 check('[m1] identical-inputs skip', pl['action']=='skip' and pl['reason']=='identical-inputs-already-built', pl['reason'])
 
+# [1b] Round 33: host-tools bumped ahead of the chromium recipe -> refuse
+pl=M.decide(s,probes('157.0.100.5','R2','H2',host_version='158.0.900.1'),'PORT-A','t',[],None)
+check('[m1b] recipe lagging host-tools -> skip upstream-recipe-not-ready (no doomed aligned build)',
+      pl['action']=='skip' and pl['reason']=='upstream-recipe-not-ready', pl['reason'])
+pl_ok=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
+check('[m1c] equal recipe/host versions still build (gate does not block the normal path)',
+      pl_ok['action']=='build' and pl_ok['target']['upstream_version']=='157.0.100.5', pl_ok['reason'])
+
 # [2] new version -> build
 pl=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],None)
 check('[m2] new-upstream build rev1=PLAIN version', pl['action']=='build' and pl['target']['upstream_version']=='157.0.100.5' and pl['target']['revision']==1 and pl['target']['package_version']=='157.0.100.5' and pl['target']['pkg_revision_env']=='', json.dumps(pl)[:120])
@@ -135,9 +143,15 @@ check('[14b] without label stays blocked', pl['action']=='skip' and pl['reason']
 # [15] full-sig title matching is consistent (dedup==stamp==label)
 check('[15] full-sig matcher', M.issue_matches_sig(tL, sigL) and not M.issue_matches_sig(tL.replace(sigL, sigL[:8]), sigL))
 
-# [16] buildable follows host-tools alignment (prepare_recipe policy)
+# [16] Round 33 policy: alignment is applied only when the chromium recipe
+# already declares the host-tools version. A host-tools-only bump is refused
+# (measured: run 43453888322 died in gn gen after 235 min on a lagging tree).
 pl=M.decide(s,probes('157.0.100.5','R2','H2',host_version='157.0.100.7'),'PORT-A','t',[],None)
-check('[16] aligned host version built', pl['action']=='build' and pl['target']['upstream_version']=='157.0.100.7', json.dumps(pl)[:100])
+check('[16] lagging recipe refused instead of a doomed aligned build',
+      pl['action']=='skip' and pl['reason']=='upstream-recipe-not-ready', json.dumps(pl)[:100])
+pl=M.decide(s,probes('157.0.100.7','R2','H2'),'PORT-A','t',[],None)
+check('[16b] recipe bump to the host-tools version unblocks the build',
+      pl['action']=='build' and pl['target']['upstream_version']=='157.0.100.7', json.dumps(pl)[:100])
 
 # [17] actions API error marker -> busy skip
 pl=M.decide(s,probes('157.0.100.5','R2','H2'),'PORT-A','t',[],{'signature':'API-ERROR'})

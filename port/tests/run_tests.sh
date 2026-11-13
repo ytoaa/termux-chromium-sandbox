@@ -339,7 +339,7 @@ BODY=$(sed -n '/cat > "\$_wrap" <<.SHIMWRAP./,/^SHIMWRAP$/p' "$G32")
   || fail "[34] R9b forbidden token in wrapper"
 
 # [35] Round 15/16 maintenance engine scenario tests (offline, mocked).
-python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS=70 FAIL=0$' \
+python3 "port/tests/maintenance_test.py" 2>&1 | grep -q '^MAINTENANCE-TESTS PASS=73 FAIL=0$' \
   && pass "[35] maintenance engine 70/70 scenarios" \
   || fail "[35] maintenance engine scenarios"
 
