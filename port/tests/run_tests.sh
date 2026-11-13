@@ -463,8 +463,8 @@ out=$(python3 "port/tests/r12_set_tid_address_test.py" 2>&1); got=$?
 # immutability, docker bind-parent fix + smoke + save-guard + L4
 # verified source cache + production-layout key sensitivity T42/T43 (78 checks).
 out=$(python3 "port/tests/cache_layers_test.py" 2>&1); got=$?
-[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=79 FAIL=0$' \
-  && pass "[52] cache layers suite (79 checks)" \
+[ "$got" -eq 0 ] && echo "$out" | grep -q '^CACHE-LAYERS PASS=81 FAIL=0$' \
+  && pass "[52] cache layers suite (81 checks)" \
   || { fail "[52] cache layers suite"; printf '%s\n' "$out" | tail -40; }
 
 # [53] Audit round 2026-10-30 (DESIGN Round 25): verification-hardening
@@ -503,5 +503,39 @@ printf '%s\n' "$out" | grep -q '^FAIL' && got=1
 [ "$got" -eq 0 ] && echo "$out" | grep -q '^DEPCACHE-PRUNE PASS=22 FAIL=0$' \
   && pass "[56] C-5 depcache prune suite (22 checks)" \
   || { fail "[56] C-5 depcache prune suite"; printf '%s\n' "$out" | tail -40; }
+
+# [57] Round 33 (upstream 157 drift): the R8 anchor must pick the shape that
+# the tree actually has — 156 (void* GetStackTop) vs 157 (uintptr_t + #elif
+# POSIX), report ALREADY_PRESENT on re-apply, and stay fail-closed on a third
+# shape. Pinned to the real upstream file (fixtures/upstream-shapes).
+PA_STACK_REL=base/allocator/partition_allocator/src/partition_alloc/stack/stack.cc
+fresh
+cp port/tests/fixtures/upstream-shapes/pa_stack-157.0.8103.50.cc "$WORK/src/$PA_STACK_REL"
+out=$(python3 $PORT apply --src "$WORK/src" 2>&1); got=$?
+echo "$out" | grep -q 'APPLIED. R8 bionic stack-top cache (PA stack.cc): variant 157 (uintptr_t)' \
+  && echo "$out" | grep -q 'VERIFIED. R8 (PA stack.cc) marker' \
+  && pass "[57a] 157 shape -> variant 157 applied + marker verified" \
+  || { fail "[57a] 157 shape"; echo "$out" | grep -i "R8\|PORT ERROR" | head -6; }
+[ $got -eq 0 ] || { fail "[57a] 157 shape exit"; echo "$out" | tail -5; }
+out2=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+echo "$out2" | grep -q 'ALREADY_PRESENT. R8 bionic stack-top cache (PA stack.cc): variant 157' \
+  && pass "[57b] re-apply on 157 -> ALREADY_PRESENT (idempotent)" \
+  || { fail "[57b] 157 idempotency"; echo "$out2" | grep -i "R8" | head -4; }
+fresh
+out3=$(python3 $PORT apply --src "$WORK/src" 2>&1)
+echo "$out3" | grep -q 'R8 bionic stack-top cache (PA stack.cc): variant 156 (void\*)' \
+  && pass "[57c] 156 fixture -> variant 156 still selected" \
+  || { fail "[57c] 156 variant"; echo "$out3" | grep -i "R8 bionic" | head -3; }
+fresh
+python3 - "$WORK/src/$PA_STACK_REL" <<'PYFIX'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); t = p.read_text()
+t = t.replace("    PA_CHECK(!error);", "    PA_CHECK(!error);\n    // third upstream shape: unknown refactor")
+p.write_text(t)
+PYFIX
+out4=$(python3 $PORT apply --src "$WORK/src" 2>&1); got4=$?
+[ $got4 -ne 0 ] && echo "$out4" | grep -q 'PORT ERROR. R8 bionic stack-top cache' \
+  && pass "[57d] unknown third shape -> PORT ERROR (fail-closed)" \
+  || { fail "[57d] fail-closed drift"; echo "$out4" | tail -4; }
 
 exit $rc

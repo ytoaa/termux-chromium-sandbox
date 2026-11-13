@@ -110,6 +110,37 @@ class Port:
         self.record(name, rel, "APPLIED")
         self.remember_after(rel)
 
+    def replace_optional_variants(self, rel: str, name: str,
+                                  variants: list[tuple[str, str, str]]) -> None:
+        """Apply the single variant whose old form matches the tree.
+
+        Used when upstream refactors a function (return type / branch guards)
+        without changing the semantics we patch. Fail-closed rules: exactly one
+        variant may match, and an already-patched tree is recognised so a re-run
+        reports ALREADY_PRESENT instead of drifting.
+        """
+        path = self.root / rel
+        if not path.is_file():
+            self.record(name, rel, "SKIPPED", "file not present in this source tree")
+            return
+        text = path.read_text()
+        present = [label for label, _old, new in variants if new in text]
+        if present:
+            self.record(name, rel, "ALREADY_PRESENT", f"variant {present[0]}")
+            return
+        matches = [(label, old, new) for label, old, new in variants
+                   if text.count(old) == 1]
+        if len(matches) != 1:
+            counts = ", ".join(f"{label}={text.count(old)}"
+                               for label, old, _new in variants)
+            raise PortError(f"{name}: expected exactly one recognisable form, "
+                            f"found {counts}")
+        label, old, new = matches[0]
+        self.remember_before(rel)
+        path.write_text(text.replace(old, new, 1))
+        self.record(name, rel, "APPLIED", f"variant {label}")
+        self.remember_after(rel)
+
     # ---------- rules ----------
     ZYGOTE_HOST = "content/browser/zygote_host/zygote_host_impl_linux.cc"
     SANDBOX_LINUX = "sandbox/policy/linux/sandbox_linux.cc"
@@ -349,6 +380,49 @@ namespace sandbox {'''
     return PA_UNSAFE_TODO(reinterpret_cast<uint8_t*>(base) + size);
   }'''
 
+    # R8 (upstream 157.0.8103.x, Milestone 157): GetStackTop() moved to
+    # `uintptr_t` (it used to return `void*`, and the POSIX arm used to be a
+    # plain `#else`). The patch has to compile against BOTH generations, so the
+    # anchor is selected per source tree instead of being rewritten blindly.
+    # Same security semantics: one bionic-guarded cache, main thread only.
+    R8A_OLD_157 = '''uintptr_t GetStackTop() {
+  pthread_attr_t attr;
+  int error = pthread_getattr_np(pthread_self(), &attr);
+  if (!error) {
+    void* base;
+    size_t size;
+    error = pthread_attr_getstack(&attr, &base, &size);
+    PA_CHECK(!error);
+    pthread_attr_destroy(&attr);
+    return reinterpret_cast<uintptr_t>(base) + size;
+  }'''
+
+    R8A_NEW_157 = '''uintptr_t GetStackTop() {
+#if defined(__BIONIC__)
+  // ''' + R8_MARKER + ''' cache the main thread's stack top: it never
+  // changes, and bionic's pthread_getattr_np reads /proc/self/maps (main
+  // thread only) which the seccomp BPF denies after sandbox engagement.
+  static uintptr_t cached_main_top = 0;
+  const bool is_main_thread =
+      pthread_equal(pthread_self(), g_termux_main_thread) != 0;
+  if (is_main_thread && cached_main_top)
+    return cached_main_top;
+#endif
+  pthread_attr_t attr;
+  int error = pthread_getattr_np(pthread_self(), &attr);
+  if (!error) {
+    void* base;
+    size_t size;
+    error = pthread_attr_getstack(&attr, &base, &size);
+    PA_CHECK(!error);
+    pthread_attr_destroy(&attr);
+#if defined(__BIONIC__)
+    if (is_main_thread)
+      cached_main_top = reinterpret_cast<uintptr_t>(base) + size;
+#endif
+    return reinterpret_cast<uintptr_t>(base) + size;
+  }'''
+
     R8B_OLD = '''#else  // PA_BUILDFLAG(IS_WIN)
 #error "Unsupported GetStackTop"
 #endif  // PA_BUILDFLAG(IS_WIN)'''
@@ -360,8 +434,11 @@ namespace sandbox {'''
 #if defined(__BIONIC__)
 // ''' + R8_MARKER + ''' prewarm entry point (called from
 // SandboxLinux::StartSeccompBPF before the BPF is installed).
+// Returns void* for portability: upstream 156 returns `void*` here, upstream
+// 157 returns `uintptr_t`; the reinterpret cast is valid for both and the
+// caller only needs the side effect (filling the cache).
 void* TermuxPrewarmStackTop() {
-  return GetStackTop();
+  return reinterpret_cast<void*>(GetStackTop());
 }
 #endif  // defined(__BIONIC__)'''
 
@@ -577,8 +654,10 @@ const pthread_t g_termux_main_thread = pthread_self();
                               self.R7B_OLD, self.R7B_NEW)
         self.replace_optional(self.PA_STACK, "R8 main-thread capture (PA stack.cc)",
                               self.R8C_OLD, self.R8C_NEW)
-        self.replace_optional(self.PA_STACK, "R8 bionic stack-top cache (PA stack.cc)",
-                              self.R8A_OLD, self.R8A_NEW)
+        self.replace_optional_variants(
+            self.PA_STACK, "R8 bionic stack-top cache (PA stack.cc)",
+            [("156 (void*)", self.R8A_OLD, self.R8A_NEW),
+             ("157 (uintptr_t)", self.R8A_OLD_157, self.R8A_NEW_157)])
         self.replace_optional(self.PA_STACK, "R8 prewarm entry point (PA stack.cc)",
                               self.R8B_OLD, self.R8B_NEW)
 

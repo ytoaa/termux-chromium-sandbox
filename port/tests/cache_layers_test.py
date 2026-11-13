@@ -313,6 +313,12 @@ ok("T15 R12 policy fixture + port.toml byte-unchanged on this branch",
 # marker constants, apply/verify/replace_once). Non-rule helpers may be
 # hardened (anti-injection scan); any rule/flow tamper changes the digest.
 import ast as _ast2
+# Round 33: upstream 157 refactored GetStackTop() (void* -> uintptr_t, POSIX arm
+# no longer a plain #else), so the R8 anchor had to become shape-aware. The pin
+# therefore excludes exactly the two shape-dependent constants (R8A_*, R8B_*)
+# and pins them separately against bae5316 + semantics in T15e; every other
+# rule constant, marker, verify() and replace_once() stays byte-pinned.
+_SHAPE_DEP = re.compile(r"^R8[AB]_(OLD|NEW)$")
 def _rule_digest(src: str) -> str:
     tree = _ast2.parse(src)
     parts = []
@@ -321,19 +327,89 @@ def _rule_digest(src: str) -> str:
             for st in node.body:
                 if isinstance(st, _ast2.Assign) and any(
                         isinstance(tg, _ast2.Name) and re.match(r"^R\d+[a-z]?_(OLD|NEW)$", tg.id)
+                        and not _SHAPE_DEP.match(tg.id)
                         for tg in st.targets):
                     parts.append("A:" + _ast2.dump(st))
-        elif isinstance(node, _ast2.FunctionDef) and node.name in ("apply", "verify", "replace_once"):
+        elif isinstance(node, _ast2.FunctionDef) and node.name in ("verify", "replace_once"):
             parts.append("F:" + node.name + ":" + _ast2.dump(node))
         elif isinstance(node, _ast2.Assign) and any(
                 isinstance(tg, _ast2.Name) and tg.id.endswith("_MARKER") for tg in node.targets):
             parts.append("M:" + _ast2.dump(node))
     return hashlib.sha256("\n".join(sorted(parts)).encode()).hexdigest()
+
+def _apply_rule_order(src: str) -> list:
+    """Ordered rule names passed to replace_* inside Port.apply()."""
+    tree = _ast2.parse(src)
+    order = []
+    for node in _ast2.walk(tree):
+        if isinstance(node, _ast2.FunctionDef) and node.name == "apply":
+            for call in _ast2.walk(node):
+                if (isinstance(call, _ast2.Call) and isinstance(call.func, _ast2.Attribute)
+                        and call.func.attr in ("replace_once", "replace_optional",
+                                               "replace_optional_variants")
+                        and len(call.args) >= 2
+                        and isinstance(call.args[1], _ast2.Constant)
+                        and isinstance(call.args[1].value, str)):
+                    order.append(call.args[1].value)
+    return order
+
 _old_src = subprocess.run(["git", "-C", str(ROOT), "show", "bae5316:port/chromium_sandbox_port.py"],
                           capture_output=True, text=True).stdout if _b5_ok else ""
-ok("T15d port.py rule constants + apply/verify/replace_once AST-identical to bae5316 (non-rule scan hardening is the only permitted delta)",
-   (not _b5_ok) or (bool(_old_src) and _rule_digest(_old_src) == _rule_digest((ROOT / "port/chromium_sandbox_port.py").read_text())),
+_new_src = (ROOT / "port/chromium_sandbox_port.py").read_text()
+ok("T15d port.py rule constants (shape-independent) + markers + verify/replace_once AST-identical to bae5316",
+   (not _b5_ok) or (bool(_old_src) and _rule_digest(_old_src) == _rule_digest(_new_src)),
    "skipped on shallow checkout (verified on full clone)" if not _b5_ok else "digest drift")
+ok("T15d2 apply() patch order and rule names unchanged vs bae5316 (R8 swap does not reorder rules)",
+   (not _b5_ok) or (bool(_old_src) and _apply_rule_order(_old_src) == _apply_rule_order(_new_src)),
+   "skipped on shallow checkout" if not _b5_ok else
+   f"old={_apply_rule_order(_old_src) if _b5_ok else []}")
+
+def _consts(src: str) -> dict:
+    """Port class constants, evaluating "..." + R8_MARKER style concatenations."""
+    tree = _ast2.parse(src)
+    raw = {}
+    for node in _ast2.walk(tree):
+        if isinstance(node, _ast2.ClassDef) and node.name == "Port":
+            for st in node.body:
+                if isinstance(st, _ast2.Assign):
+                    for tg in st.targets:
+                        if isinstance(tg, _ast2.Name):
+                            raw[tg.id] = st.value
+    out = {}
+    for name, val in raw.items():
+        try:
+            out[name] = _ast2.literal_eval(val)
+        except Exception:
+            try:
+                out[name] = eval(compile(_ast2.Expression(val), "<const>", "eval"), dict(out))
+            except Exception:
+                out[name] = _ast2.dump(val)
+    return out
+_old_k = _consts(_old_src) if _old_src else {}
+_new_k = _consts(_new_src)
+_same_156 = all(_old_k.get(k) == _new_k.get(k) for k in
+                ("R8A_OLD", "R8A_NEW", "R8B_OLD", "R8C_OLD", "R8C_NEW")) if _old_k else False
+v157 = _new_k.get("R8A_NEW_157", "")
+# R8B_NEW is the only constant allowed to differ: it now returns
+# reinterpret_cast<void*>(GetStackTop()) so it compiles against both the 156
+# (void*) and 157 (uintptr_t) return types. Semantics unchanged: no cache logic,
+# no policy logic, only the return conversion.
+r8b_ok = (isinstance(_new_k.get("R8B_NEW"), str)
+          and "reinterpret_cast<void*>(GetStackTop())" in _new_k["R8B_NEW"]
+          and _new_k["R8B_NEW"].count("TermuxPrewarmStackTop") == 1
+          and "cached_main_top" not in _new_k["R8B_NEW"])
+ok("T15e R8 security semantics: 156 rule constants unchanged, 157 variant keeps one bionic-guarded main-thread cache, prewarm portable",
+   (not _b5_ok)
+   or (_same_156 and r8b_ok
+       and isinstance(_new_k.get("R8A_OLD_157"), str)
+       and "uintptr_t GetStackTop()" in _new_k["R8A_OLD_157"]
+       and v157.count("#if defined(__BIONIC__)") == 2     # cache decl guard + store guard
+       and v157.count("pthread_equal(pthread_self(), g_termux_main_thread)") == 1
+       and v157.count("cached_main_top") == 4              # decl + early read + return + store
+       and "case __NR_" not in v157                        # never a syscall policy change
+       and "Allow()" not in v157),
+   "skipped on shallow checkout" if not _b5_ok else
+   f"same156={_same_156} r8b={r8b_ok} guards={v157.count('#if defined(__BIONIC__)')}")
 
 # ---------- T16: inner script + watchdog ----------
 inner = re.search(r"<<'SCCACHE_PROFILE_SCRIPT'\n(.*?)\nSCCACHE_PROFILE_SCRIPT", ci_txt, re.S)

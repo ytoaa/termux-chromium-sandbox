@@ -2024,3 +2024,46 @@ test for §28.3/§28.4 (run A cold -> dep debs persisted; run B -> "Found
 chromium-host-tools in .../output", pre-ninja collapse, GREEN build). Until
 those runs exist, host-tools elimination is VERIFIED-BY-CONSTRUCTION ONLY and
 must not be reported as measured.
+
+## Round 33 — upstream 157 GetStackTop refactor (R8 anchor drift)
+
+### 33.1 Symptom
+The scheduled pipeline moved to upstream 157.0.8103.38/.50 and every build
+failed closed at the transformer:
+
+    [    PORT ERROR] R8 bionic stack-top cache (PA stack.cc): expected exactly one old form, found 0
+
+(auto-build issues #29/#32-#36; runs 42178147103 .. 43175216128).
+
+### 33.2 Root cause (measured against the real upstream file)
+`refs/tags/157.0.8103.50` changes `partition_alloc/stack/stack.cc`:
+
+* `void* GetStackTop()` -> `uintptr_t GetStackTop()` (return type widened);
+* the POSIX arm is now `#elif PA_BUILDFLAG(IS_POSIX) || PA_BUILDFLAG(IS_FUCHSIA)`
+  instead of a plain `#else`;
+* the base return becomes `reinterpret_cast<uintptr_t>(base) + size` (no
+  `PA_UNSAFE_TODO` wrapper).
+
+Our R8 anchor was written against 156's `void*` form, so the count was 0 and the
+port refused to build. Fail-closed behaviour is correct; the anchor was stale.
+
+### 33.3 Fix (shape-aware anchor, same security semantics)
+* `replace_optional_variants()` selects the single variant whose old form matches
+  the tree; ambiguous (2+) or unknown (0) shapes still raise `PortError`, and an
+  already-patched tree reports ALREADY_PRESENT with the variant label.
+* R8A has two approved bodies: `156 (void*)` (unchanged) and `157 (uintptr_t)`
+  (same bionic-guarded, main-thread-only single cache).
+* `TermuxPrewarmStackTop()` returns `reinterpret_cast<void*>(GetStackTop())` so
+  one definition compiles against both return types.
+* No syscall policy, packaging or release surface is touched.
+
+### 33.4 Verification status
+* Transformer run against the **real** 157.0.8103.50 sources (11 files fetched
+  from chromium.googlesource.com): every rule APPLIED, all markers VERIFIED,
+  re-apply idempotent.
+* Suite [57] pins the three shapes: 157 -> variant 157, re-apply -> ALREADY_PRESENT,
+  156 -> variant 156, unknown drift -> PORT ERROR.
+* Suite [52] T15d/T15d2/T15e now pin the shape-independent rule constants to
+  bae5316, the patch order, and the R8 security semantics of both variants.
+* Full harness: see the commit message for the exact suite count/RC. A real 157
+  build on `main` is the acceptance test and is NOT claimed here.
