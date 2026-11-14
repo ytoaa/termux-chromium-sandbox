@@ -185,7 +185,7 @@ fresh
 out=$(python3 $PORT apply --src "$WORK/src" 2>&1)
 ST="$WORK/src/base/allocator/partition_allocator/src/partition_alloc/stack/stack.cc"
 echo "$out" | grep -q 'APPLIED.*R8 bionic stack-top cache' \
-  && grep -q 'g_termux_main_thread' "$ST" \
+  && grep -q 'gettid() == getpid()' "$ST" \
   && grep -q 'void\* TermuxPrewarmStackTop()' "$ST" \
   && grep -q 'TermuxPrewarmStackTop' "$WORK/src/sandbox/policy/linux/sandbox_linux.cc" \
   && python3 $PORT check --src "$WORK/src" >/dev/null 2>&1 \
@@ -517,6 +517,11 @@ echo "$out" | grep -q 'APPLIED. R8 bionic stack-top cache (PA stack.cc): variant
   && pass "[57a] 157 shape -> variant 157 applied + marker verified" \
   || { fail "[57a] 157 shape"; echo "$out" | grep -i "R8\|PORT ERROR" | head -6; }
 [ $got -eq 0 ] || { fail "[57a] 157 shape exit"; echo "$out" | tail -5; }
+PATCHED="$WORK/src/$PA_STACK_REL"
+grep -q 'gettid() == getpid()' "$PATCHED" && grep -q '#include <unistd.h>' "$PATCHED" \
+  && ! grep -q 'g_termux_main_thread' "$PATCHED" \
+  && pass "[57a2] fork-safe main-thread cache (gettid==getpid, unistd include)" \
+  || { fail "[57a2] fork-safe predicate"; grep -n "is_main_thread\|unistd\|g_termux" "$PATCHED" | head -5; }
 out2=$(python3 $PORT apply --src "$WORK/src" 2>&1)
 echo "$out2" | grep -q 'ALREADY_PRESENT. R8 bionic stack-top cache (PA stack.cc): variant 157' \
   && pass "[57b] re-apply on 157 -> ALREADY_PRESENT (idempotent)" \

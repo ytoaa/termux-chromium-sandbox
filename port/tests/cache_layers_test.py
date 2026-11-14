@@ -359,10 +359,14 @@ _new_src = (ROOT / "port/chromium_sandbox_port.py").read_text()
 ok("T15d port.py rule constants (shape-independent) + markers + verify/replace_once AST-identical to bae5316",
    (not _b5_ok) or (bool(_old_src) and _rule_digest(_old_src) == _rule_digest(_new_src)),
    "skipped on shallow checkout (verified on full clone)" if not _b5_ok else "digest drift")
-ok("T15d2 apply() patch order and rule names unchanged vs bae5316 (R8 swap does not reorder rules)",
-   (not _b5_ok) or (bool(_old_src) and _apply_rule_order(_old_src) == _apply_rule_order(_new_src)),
+# Round 32: rule LABELS may be clarified (R8 gained a fork-safe predicate), but
+# the R-id ORDER and the number of applied rules must not change.
+def _rule_ids(src: str) -> list:
+    return [n.split()[0] for n in _apply_rule_order(src)]
+ok("T15d2 apply() R-id patch order and rule count unchanged vs bae5316 (labels may be clarified)",
+   (not _b5_ok) or (bool(_old_src) and _rule_ids(_old_src) == _rule_ids(_new_src)),
    "skipped on shallow checkout" if not _b5_ok else
-   f"old={_apply_rule_order(_old_src) if _b5_ok else []}")
+   f"old={_rule_ids(_old_src) if _b5_ok else []}")
 
 def _consts(src: str) -> dict:
     """Port class constants, evaluating "..." + R8_MARKER style concatenations."""
@@ -387,8 +391,10 @@ def _consts(src: str) -> dict:
     return out
 _old_k = _consts(_old_src) if _old_src else {}
 _new_k = _consts(_new_src)
+# R8A_NEW/157 and R8C changed in Round 32 (fork-safe predicate + unistd
+# include); only the ANCHOR texts and the prewarm shell must stay identical.
 _same_156 = all(_old_k.get(k) == _new_k.get(k) for k in
-                ("R8A_OLD", "R8A_NEW", "R8B_OLD", "R8C_OLD", "R8C_NEW")) if _old_k else False
+                ("R8A_OLD", "R8B_OLD")) if _old_k else False
 v157 = _new_k.get("R8A_NEW_157", "")
 # R8B_NEW is the only constant allowed to differ: it now returns
 # reinterpret_cast<void*>(GetStackTop()) so it compiles against both the 156
@@ -398,13 +404,14 @@ r8b_ok = (isinstance(_new_k.get("R8B_NEW"), str)
           and "reinterpret_cast<void*>(GetStackTop())" in _new_k["R8B_NEW"]
           and _new_k["R8B_NEW"].count("TermuxPrewarmStackTop") == 1
           and "cached_main_top" not in _new_k["R8B_NEW"])
-ok("T15e R8 security semantics: 156 rule constants unchanged, 157 variant keeps one bionic-guarded main-thread cache, prewarm portable",
+ok("T15e R8 security semantics: anchors unchanged, 157 variant keeps one bionic-guarded fork-safe main-thread cache, prewarm portable",
    (not _b5_ok)
    or (_same_156 and r8b_ok
        and isinstance(_new_k.get("R8A_OLD_157"), str)
        and "uintptr_t GetStackTop()" in _new_k["R8A_OLD_157"]
+       and "gettid() == getpid()" in v157                # fork-safe main-thread test
+       and "g_termux_main_thread" not in v157
        and v157.count("#if defined(__BIONIC__)") == 2     # cache decl guard + store guard
-       and v157.count("pthread_equal(pthread_self(), g_termux_main_thread)") == 1
        and v157.count("cached_main_top") == 4              # decl + early read + return + store
        and "case __NR_" not in v157                        # never a syscall policy change
        and "Allow()" not in v157),

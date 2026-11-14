@@ -2085,3 +2085,41 @@ tree whose recipe/cr-patches are one version behind: the attempt died in
 The previous validated baseline is kept, no issue is opened, and no 4-hour runner
 is burned. The build resumes automatically once termux bumps the chromium recipe
 (measured: master `f6bf3c45` declares 157.0.8103.50 in BOTH files).
+
+## Round 32 — device gate root cause: fork-unsafe main-thread test in R8
+
+R32 ran the 157.0.8103.50 deb on the remote testbed (clean, Android 13, aarch64):
+
+* `dpkg -i` path **PASS**;
+* renderer sandbox **activated** 15,423 times in 2 minutes
+  (`r12-bionic-tid: renderer allow active` + `Activated seccomp-bpf sandbox for
+  process type: renderer.`);
+* but every renderer died immediately:
+
+      couldn't open /proc/self/stat: Operation not permitted
+      libc: couldn't open /proc/self/stat: Operation not permitted
+      -> SIGABRT (ImmediateCrash), 30,848 times
+
+strace: `seccomp(SECCOMP_SET_MODE_FILTER)` -> handshake -> writev(2, message) ->
+`rt_sigaction(SIGABRT, SIG_DFL)` -> `tgkill(SIGABRT)`; all filter-using processes
+died by SIGABRT and **no SIGSYS kill** occurred.
+
+Cause: R8's cache predicate was
+`pthread_equal(pthread_self(), g_termux_main_thread)`, where the global was
+captured at static-init time and inherited across `fork()`. In a renderer the
+predicate is false, the cache is bypassed, and bionic's main-thread
+`pthread_getattr_np` opens `/proc/self/stat` (157-era bionic; 156 used
+`/proc/self/maps`), which the BPF denies -> LOG(FATAL) -> abort loop.
+
+Fix: replace the predicate with the fork-safe `gettid() == getpid()` (the same
+rule upstream 157 uses in `partition_alloc_base/debug/stack_trace.cc`), and add a
+bionic-guarded `#include <unistd.h>` so both are declared. The prewarm in
+`StartSeccompBPF` still fills the cache per process **before** the filter.
+
+Gate harness fixes (test tooling, not product): `remote_gate.sh` now points
+`bpf_evidence.sh` at `chromium-device-gate/extracted`; the existing
+presence-proxy path in `device_gate.sh` stays the fallback because this Android
+13 kernel does not export `Seccomp_filters`.
+
+Verification status: local transformer/harness only until the rebuilt deb is
+re-tested on the testbed; no device PASS is claimed here.
