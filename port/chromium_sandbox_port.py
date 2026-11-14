@@ -357,11 +357,14 @@ namespace sandbox {'''
     R8A_NEW = '''void* GetStackTop() {
 #if defined(__BIONIC__)
   // ''' + R8_MARKER + ''' cache the main thread's stack top: it never
-  // changes, and bionic's pthread_getattr_np reads /proc/self/maps (main
-  // thread only) which the seccomp BPF denies after sandbox engagement.
+  // changes, and bionic's pthread_getattr_np reads /proc/self/stat (main
+  // thread) on 157-era bionic (/proc/self/maps on 156) which the seccomp BPF
+  // denies after sandbox engagement.
   static void* cached_main_top = nullptr;
-  const bool is_main_thread =
-      pthread_equal(pthread_self(), g_termux_main_thread) != 0;
+  // Fork-safe main-thread test: a child (zygote -> renderer) has its own tid
+  // equal to its own pid; comparing against a browser-side captured tid is
+  // false in every child and silently disabled this cache (R32 device gate).
+  const bool is_main_thread = gettid() == getpid();
   if (is_main_thread && cached_main_top)
     return cached_main_top;
 #endif
@@ -400,11 +403,12 @@ namespace sandbox {'''
     R8A_NEW_157 = '''uintptr_t GetStackTop() {
 #if defined(__BIONIC__)
   // ''' + R8_MARKER + ''' cache the main thread's stack top: it never
-  // changes, and bionic's pthread_getattr_np reads /proc/self/maps (main
-  // thread only) which the seccomp BPF denies after sandbox engagement.
+  // changes, and bionic's pthread_getattr_np reads /proc/self/stat (main
+  // thread) on 157-era bionic (/proc/self/maps on 156) which the seccomp BPF
+  // denies after sandbox engagement.
   static uintptr_t cached_main_top = 0;
-  const bool is_main_thread =
-      pthread_equal(pthread_self(), g_termux_main_thread) != 0;
+  // Fork-safe main-thread test (see the 156 variant note above).
+  const bool is_main_thread = gettid() == getpid();
   if (is_main_thread && cached_main_top)
     return cached_main_top;
 #endif
@@ -442,13 +446,24 @@ void* TermuxPrewarmStackTop() {
 }
 #endif  // defined(__BIONIC__)'''
 
-    R8C_OLD = '''namespace partition_alloc::internal {'''
+    # R8c (Round 32): gettid()/getpid() need <unistd.h>; bionic declares both
+    # there. Guarded so glibc builds keep the upstream include set untouched.
+    R8C_OLD = '''#if PA_BUILDFLAG(IS_WIN)
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif'''
 
-    R8C_NEW = '''namespace partition_alloc::internal {
+    R8C_NEW = '''#if PA_BUILDFLAG(IS_WIN)
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 #if defined(__BIONIC__)
-// ''' + R8_MARKER + ''' captured during static init, i.e. on the main
-// thread before any sandbox exists; used to recognise main-thread callers.
-const pthread_t g_termux_main_thread = pthread_self();
+// ''' + R8_MARKER + ''' gettid()/getpid(): fork-safe main-thread test
+// (upstream 157 uses the same rule in partition_alloc_base/debug/stack_trace.cc).
+#include <unistd.h>
 #endif'''
 
     # R9a (round 10, A/B matrix on run #28): the network service queries
@@ -652,7 +667,7 @@ const pthread_t g_termux_main_thread = pthread_self();
                           self.R7_OLD, self.R7_NEW)
         self.replace_optional(self.PA_STACK_TRACE, "R7 bionic stack cache (PA copy)",
                               self.R7B_OLD, self.R7B_NEW)
-        self.replace_optional(self.PA_STACK, "R8 main-thread capture (PA stack.cc)",
+        self.replace_optional(self.PA_STACK, "R8 unistd include (PA stack.cc)",
                               self.R8C_OLD, self.R8C_NEW)
         self.replace_optional_variants(
             self.PA_STACK, "R8 bionic stack-top cache (PA stack.cc)",
