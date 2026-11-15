@@ -11,6 +11,12 @@ on:
       - 'port/tests/**'
       - 'port/publish_release.py'
       - 'port/bpf_evidence.sh'
+      - 'port/chromium_sandbox_port.py'
+      - 'port/prepare_recipe.py'
+      - 'port/gnp_shim.c'
+      - 'port/device_gate.sh'
+      - 'port/remote_gate.sh'
+      - 'port/DESIGN.md'
   workflow_dispatch:
 
 permissions:
