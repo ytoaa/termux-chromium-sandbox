@@ -504,6 +504,11 @@ printf '%s\n' "$out" | grep -q '^FAIL' && got=1
   && pass "[56] C-5 depcache prune suite (22 checks)" \
   || { fail "[56] C-5 depcache prune suite"; printf '%s\n' "$out" | tail -40; }
 
+# [58] Round 34 P0: device-gate census parsing unit tests (real gate_lib.sh)
+python3 port/tests/gate_parsing_test.py >"$WORK/gate_parse.log" 2>&1 \
+  && pass "[58] device-gate census parsing (zygote->renderer, seccomp fallback, verdict)" \
+  || { fail "[58] device-gate census parsing"; tail -15 "$WORK/gate_parse.log"; }
+
 # [57] Round 33 (upstream 157 drift): the R8 anchor must pick the shape that
 # the tree actually has — 156 (void* GetStackTop) vs 157 (uintptr_t + #elif
 # POSIX), report ALREADY_PRESENT on re-apply, and stay fail-closed on a third

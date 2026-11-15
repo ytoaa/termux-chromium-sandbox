@@ -71,7 +71,7 @@ jobs:
     steps:
       # Publisher code is pinned from the default branch (supply-chain),
       # NOT from the triggered run's commit (which may be any ref).
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (node24)
         with:
           ref: ${{ github.event.repository.default_branch }}
 
@@ -216,7 +216,7 @@ jobs:
 
       - name: Download candidate artifact (pinned to the audited run)
         if: env.SKIP_REMAIN != 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7 (node24)
         with:
           name: ${{ steps.cls.outputs.artifact }}
           github-token: ${{ github.token }}

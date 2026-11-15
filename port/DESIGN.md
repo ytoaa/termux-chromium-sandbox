@@ -2157,3 +2157,28 @@ Verified on the testbed with the pre-built 157 chrome plus the recompiled shim
 Device PASS is still NOT claimed: the rebuilt deb must be re-gated, and
 `device_gate.sh` now launches the shipped shield wrapper (product path) instead
 of the raw binary.
+
+## Round 34 — maintainability P0 (protection, gate unit tests, action pins)
+
+Audit of the repository at `b13c8ec` rated maintainability ~7/10; the three P0
+items were applied:
+
+1. **main branch protection**: required status check `selftest`, no force pushes,
+   no branch deletion. `publisher-regression.yml` now runs the selftest on
+   **every** pull request (the old paths filter would have left docs-only PRs
+   permanently unmergeable once the check became required).
+2. **device-gate census extraction + unit tests**: the parsing that shipped three
+   real bugs on the R32 testbed (label prefix looked up in the wrong stream,
+   missing zygote->renderer reclassification, filter-count-only verdict on
+   kernels that hide `Seccomp_filters`) now lives in `port/gate_lib.sh` with
+   `gate_classify` / `gate_field` / `gate_present` / `gate_decide`.
+   `port/tests/gate_parsing_test.py` builds a fake `PROC_ROOT` and exercises the
+   real shell code (7 tests), wired into the harness as `[58]`. `gate_decide`
+   also fails on any crash signature, even when filters are exported.
+3. **GitHub Actions pinned to Node-24 major versions by SHA**:
+   checkout v5, cache/restore+save v5, upload-artifact v6, download-artifact v7;
+   local `./.github/actions/zram` unchanged. This removes the Node-20
+   deprecation warnings and hardens supply chain (no floating tags).
+
+Device-level behaviour is unchanged; `device_gate.sh` keeps its CLI and now
+requires `gate_lib.sh` next to it.
