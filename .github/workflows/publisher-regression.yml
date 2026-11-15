@@ -3,20 +3,9 @@
 name: Publisher Regression Checks
 
 on:
+  # Runs on EVERY pull request: main is protected with this check required, so a
+  # path-filtered trigger would leave docs-only PRs unmergeable.
   pull_request:
-    paths:
-      - '.github/workflows/build-chromium.yml'
-      - '.github/workflows/publish-release.yml'
-      - '.github/workflows/publisher-regression.yml'
-      - 'port/tests/**'
-      - 'port/publish_release.py'
-      - 'port/bpf_evidence.sh'
-      - 'port/chromium_sandbox_port.py'
-      - 'port/prepare_recipe.py'
-      - 'port/gnp_shim.c'
-      - 'port/device_gate.sh'
-      - 'port/remote_gate.sh'
-      - 'port/DESIGN.md'
   workflow_dispatch:
 
 permissions:
@@ -27,6 +16,6 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (node24)
       - name: Run existing publisher, maintenance, and seccomp fixture regressions
         run: bash port/ci.sh selftest

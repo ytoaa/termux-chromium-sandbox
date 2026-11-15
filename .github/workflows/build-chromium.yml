@@ -76,14 +76,14 @@ jobs:
   gate:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (node24)
       - name: Transformer + recipe self-test (fail closed)
         run: bash port/ci.sh selftest
       - name: Resolve termux-packages ref to exact commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash port/ci.sh resolve-ref '${{ inputs.termux_ref }}' > termux-commit.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6 (node24)
         with:
           name: gate
           path: |
@@ -102,9 +102,9 @@ jobs:
       termux_sha: ${{ steps.emit.outputs.termux_sha }}
       port_sha: ${{ steps.emit.outputs.port_sha }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (node24)
       - name: Checkout termux-packages (ref from inputs; sha recorded for audit)
-        uses: actions/checkout@v7
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (node24)
         with:
           repository: termux/termux-packages
           path: termux-packages
@@ -157,7 +157,7 @@ jobs:
           # repo.json or the image tag here, before those steps mutate
           # them, would desync the key from the actual build inputs.
       - name: Restore sccache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5 (node24)
         with:
           path: termux-packages/.sccache
           key: chromium-sccache-aarch64-${{ steps.keys.outputs.base }}-${{ github.run_id }}
@@ -168,7 +168,7 @@ jobs:
       # re-enforced per-file by termux against GPG-verified repo metadata on
       # every run, so stale/corrupted entries self-heal via re-download).
       - name: Restore termux dep cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5 (node24)
         with:
           path: termux-packages/.termux-depcache
           key: termux-depcache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
@@ -219,7 +219,7 @@ jobs:
           echo "DEBKEY=$dk IMAGE_FP=$imgfp IMAGE_ID=$imgid REPOJSON=$(sha256sum "$PWD/termux-packages/repo.json" | cut -c1-16)"
       - name: Restore cached completed deb
         if: inputs.allow_deb_reuse && inputs.docker_smoke_only != true
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5 (node24)
         with:
           path: termux-packages/.deb-cache
           key: chromium-deb-v1-${{ steps.debkey.outputs.debkey }}
@@ -243,7 +243,7 @@ jobs:
       # REUSED=1 path performs ZERO extra cache IO.
       - name: Restore source cache (L4)
         if: inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5 (node24)
         with:
           path: termux-packages/.termux-srccache
           # Round 28: the L4 payload is only meaningful for the termux pin that
@@ -457,13 +457,13 @@ jobs:
       # REUSED=0 path is unchanged.
       - name: Save termux dep cache
         if: always() && steps.role.outputs.producer == '1' && steps.debcheck.outputs.reused != '1' && steps.guard.outputs.dep_nonempty == '1'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5 (node24)
         with:
           path: termux-packages/.termux-depcache
           key: termux-depcache-aarch64-${{ env.termux_sha }}-${{ github.run_id }}
       - name: Save sccache
         if: always() && steps.role.outputs.producer == '1' && steps.debcheck.outputs.reused != '1' && steps.guard.outputs.sccache_nonempty == '1'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5 (node24)
         with:
           path: termux-packages/.sccache
           key: chromium-sccache-aarch64-${{ steps.keys.outputs.base }}-${{ github.run_id }}
@@ -473,7 +473,7 @@ jobs:
       # (same guard philosophy as the sccache save-guard above).
       - name: Save source cache (L4)
         if: always() && steps.role.outputs.producer == '1' && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1' && steps.srccollect.outputs.has_new == '1'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5 (node24)
         with:
           path: termux-packages/.termux-srccache
           key: chromium-srccache-aarch64-v2-${{ env.termux_sha }}-${{ github.run_id }}
@@ -487,7 +487,7 @@ jobs:
         run: bash port/ci.sh deb-reuse-save "$PWD/termux-packages"
       - name: Cache completed deb
         if: success() && steps.role.outputs.producer == '1' && inputs.allow_deb_reuse && inputs.docker_smoke_only != true && steps.debcheck.outputs.reused != '1'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5 (node24)
         with:
           path: termux-packages/.deb-cache
           key: chromium-deb-v1-${{ steps.debkey.outputs.debkey }}
@@ -501,7 +501,7 @@ jobs:
         run: bash port/record_publish_intent.sh
       - name: Upload artifacts (debs + logs)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6 (node24)
         with:
           name: build-${{ github.run_id }}
           path: |

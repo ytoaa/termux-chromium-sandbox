@@ -63,7 +63,7 @@ jobs:
       dry: ${{ steps.mode.outputs.dry }}
       event: ${{ steps.mode.outputs.event }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (node24)
 
       - name: Resolve run mode (fail-closed; explicit strings, no implicit coercion)
         id: mode
@@ -182,7 +182,7 @@ jobs:
           echo "relink=$(python3 -c "import json;print('true' if json.load(open('plan.json')).get('relink') else 'false')")" >> "$GITHUB_OUTPUT"
           { echo "### Maintenance plan"; echo '```json'; cat plan.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6 (node24)
         with:
           name: maintenance-plan-${{ github.run_id }}
           path: |
@@ -216,9 +216,9 @@ jobs:
       issues: write     # deduplicated block issues
       actions: read     # job-level classification of the called workflow
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (node24)
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7 (node24)
         with:
           name: maintenance-plan-${{ github.run_id }}
 
