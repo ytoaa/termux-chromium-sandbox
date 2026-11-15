@@ -11,7 +11,7 @@ Target: desktop-Linux Chromium built by Termux (Bionic aarch64), where
 CLONE_NEWUSER is kernel-blocked (EINVAL) and no setuid helper can ship,
 yet seccomp-bpf self-install is proven viable (poc/seccomp_probe.c).
 
-Rules (see port/DESIGN.md Phase 0.3 / FINAL verdict):
+Rules (see docs/design/ARCHITECTURE.md; Phase 0.3 / FINAL verdict; formerly port/DESIGN.md):
   R1  content/browser/zygote_host/zygote_host_impl_linux.cc
       ZygoteHostImpl::Init(): under Bionic, do NOT LOG(FATAL) when neither
       userns nor setuid layer-1 is usable; continue with both layer-1 modes

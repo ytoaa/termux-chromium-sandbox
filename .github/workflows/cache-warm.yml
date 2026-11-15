@@ -1,0 +1,117 @@
+# Cache warm producer + cache budget guard (Round 35, maintainability P1).
+#
+# Why: the sccache/L4/depcache layers only get refreshed when a producer build
+# runs. Long upstream gaps (recipe lag, upstream drift) leave the caches cold,
+# so the next real build pays the full 240-minute guard. This workflow keeps a
+# known-good pin warm by calling the reusable build workflow with
+# publish=false + force=true, but only when:
+#   * the termux master recipe and chromium-host-tools versions MATCH (a build
+#     of a lagging tree is unbuildable and burns the runner), and
+#   * the last successful producer build on main is older than 72 hours.
+# A second job keeps the 10 GB cache budget honest and opens/closes one
+# `cache-budget` issue at 8 GB.
+name: Cache warm + budget guard
+
+on:
+  schedule:
+    - cron: '17 5 * * *'   # 14:17 KST daily
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Probe only (no build dispatch); ignored for scheduled runs
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cache-warm
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Probe upstream readiness + producer age
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      warm: ${{ steps.p.outputs.warm }}
+      termux_ref: ${{ steps.p.outputs.termux_ref }}
+      reason: ${{ steps.p.outputs.reason }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (node24)
+      - id: p
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dry="${{ github.event_name != 'schedule' && inputs.dry_run }}"
+          ref=$(git ls-remote https://github.com/termux/termux-packages master | awk '{print $1}')
+          fetch_version() {
+            curl -fsSL "https://raw.githubusercontent.com/termux/termux-packages/$ref/$1/build.sh" \
+              | sed -n 's/^TERMUX_PKG_VERSION="\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -1
+          }
+          chromium=$(fetch_version x11-packages/chromium)
+          host=$(fetch_version chromium-host-tools)
+          echo "termux_ref=$ref chromium=${chromium:-?} host=${host:-?}"
+          ready=no; reason="recipe-not-ready"
+          if [ -n "${chromium:-}" ] && [ "$chromium" = "${host:-}" ]; then ready=yes; reason="versions-match"; fi
+          age_h=9999
+          last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/build-chromium.yml/runs?per_page=1&branch=main&status=success" --jq '.workflow_runs[0].created_at // empty')
+          if [ -n "$last" ]; then
+            age_h=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 3600 ))
+            reason="$reason producer_age_h=$age_h"
+          fi
+          warm=no
+          if [ "$ready" = yes ] && [ "$age_h" -ge 72 ]; then warm=yes; fi
+          if [ "$dry" = "true" ]; then warm=no; reason="$reason dry_run"; fi
+          echo "warm=$warm reason=$reason"
+          {
+            echo "warm=$warm"
+            echo "reason=$reason"
+            echo "termux_ref=$ref"
+          } >> "$GITHUB_OUTPUT"
+
+  warm:
+    name: Warm build (publish=false, force=true)
+    needs: probe
+    if: needs.probe.outputs.warm == 'yes'
+    uses: ./.github/workflows/build-chromium.yml
+    # workflow_call accepts only termux_ref/pkg_revision/source; publish and
+    # deb-reuse default to false for callers, and `force` is dispatch-only.
+    with:
+      termux_ref: ${{ needs.probe.outputs.termux_ref }}
+      source: cache-warm
+
+  cache-budget:
+    name: Cache budget guard (8 GB)
+    needs: probe
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bytes=$(gh api "repos/${GITHUB_REPOSITORY}/actions/cache/usage" --jq '.active_caches_size_in_bytes')
+          count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/cache/usage" --jq '.active_caches_count')
+          gb=$(( bytes / 1000000000 ))
+          echo "active caches: ${count}, ${gb} GB"
+          open=$(gh issue list --label cache-budget --state open --json number --jq '.[0].number // empty')
+          if [ "$bytes" -gt 8000000000 ]; then
+            body="Cache pool is at **${gb} GB / ${count} entries** (limit 8 GB warning, 10 GB hard). Prune superseded generations (keep newest L4 + sccache + depcache)."
+            if [ -n "$open" ]; then
+              gh issue comment "$open" --body "$body"
+            else
+              gh issue create --title "[cache] pool above 8 GB (${gb} GB, ${count} entries)" --label cache-budget --body "$body"
+            fi
+          elif [ -n "$open" ]; then
+            gh issue comment "$open" --body "Pool back to **${gb} GB / ${count} entries** — closing."
+            gh issue close "$open"
+          fi

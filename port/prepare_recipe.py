@@ -319,7 +319,7 @@ termux_step_post_make_install() {
 	local _wrap="$_p/chromium-shield-wrapper.sh"
 	cat > "$_wrap" <<'SHIMWRAP'
 #!/data/data/com.termux/files/usr/bin/bash
-# termux-chromium-sandbox-port: bionic pthread_getattr_np shield (port/DESIGN.md)
+# termux-chromium-sandbox-port: bionic pthread_getattr_np shield (docs/design/ROUNDS.md)
 _p="${PREFIX:-/data/data/com.termux/files/usr}/lib/chromium-sandboxed"
 export LD_PRELOAD="$_p/libtermux-gnp-fix.so${LD_PRELOAD:+:$LD_PRELOAD}"
 # Termux seccomp-only audio-pulse-server: (R9b candidate — port/DESIGN.md)

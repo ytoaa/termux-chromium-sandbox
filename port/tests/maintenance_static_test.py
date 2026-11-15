@@ -269,7 +269,7 @@ _msrc=open(ROOT+'/maintenance.py').read()
 check('[s48c] engine denylist is EXACT (new keys hash by default) and documented in DESIGN',
       "'last_validated_promoted'" in _msrc and "'device_gate_history'" in _msrc
       and 'TOML_METADATA_ONLY' in _msrc
-      and 'Signature schema v2' in open(ROOT+'/DESIGN.md').read())
+      and 'Signature schema v2' in open(ROOT+'/../docs/design/ROUNDS.md').read())
 check('[s48d] engine keeps v1 frozen (sig_version=1 path) and tags v2 payload',
       "if sig_version == 1" in _msrc and "'sigv2'" in _msrc
       and "unsupported signature schema" in _msrc)
