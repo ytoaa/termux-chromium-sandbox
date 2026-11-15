@@ -44,7 +44,10 @@ for run in "$@"; do
   dg=$?
   CHROME=$(find "$OUT" -path '*chromium-sandboxed/chrome' 2>/dev/null | head -1) # local copy not kept; use remote path
   echo "--- bpf_evidence (P0/P2/P2b/P3) ---"
-  $SSH "cd ~/chromium-gate && B=\$(find chromium-device-gate/extracted -path '*chromium-sandboxed/chrome' | head -1) && ./bpf_evidence.sh \"\$B\" --ws chromium-device-gate" | tee "$OUT/bpf_evidence.log"
+  # bpf_evidence refuses EXTRACTED wrappers by design (they would exec the
+  # installed launcher); the supported installed-mode identity is the shipped
+  # wrapper, so point it at the installed package (ipc: R32b measurement fix).
+  $SSH "cd ~/chromium-gate && B=/data/data/com.termux/files/usr/lib/chromium-sandboxed/chromium-shield-wrapper.sh && ./bpf_evidence.sh \"\$B\" --ws chromium-device-gate" | tee "$OUT/bpf_evidence.log"
   bg=$?
   # cleanup installed deb state so next run starts clean
   $SSH "dpkg -r chromium-sandboxed >/dev/null 2>&1; true"
