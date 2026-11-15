@@ -13,7 +13,12 @@ ROOT="$WS/extracted"; rm -rf "$ROOT"; mkdir -p "$ROOT"
 dpkg-deb -x "$DEB" "$ROOT" || { echo "GATE FAIL: extract"; exit 1; }
 CHROME=$(find "$ROOT" -type f -path '*chromium-sandboxed/chrome' | head -1)
 [ -n "$CHROME" ] || { echo "GATE FAIL: chrome binary not found in deb"; exit 1; }
+# Product path: users launch the shield wrapper (sets LD_PRELOAD=gnp shim);
+# probing the raw binary bypasses the shield and is not what the deb ships.
+LAUNCH=$(find "$ROOT" -type f -path '*chromium-sandboxed/chromium-shield-wrapper.sh' | head -1)
+[ -n "$LAUNCH" ] || LAUNCH=$CHROME
 echo "ported chrome: $CHROME"
+echo "ported launcher: $LAUNCH"
 
 sample() { # $1=binary path, $2=label  → prints "type filters" lines
   local bin=$1 label=$2 out="$WS/procs-$2.txt"
@@ -32,12 +37,12 @@ sample() { # $1=binary path, $2=label  → prints "type filters" lines
   sort -u "$out" | sed "s/^/[$label] /"
 }
 
-run_probe() { # $1=binary $2=label  (headless=new keeps gpu/utility/renderer alive)
-  local bin=$1 label=$2 udd="$WS/udd-$2"
+run_probe() { # $1=binary $2=label [$3=launcher] (headless=new keeps children alive)
+  local bin=$1 label=$2 launch=${3:-$1} udd="$WS/udd-$2"
   rm -rf "$udd"
   # setsid + process-group kill: NEVER pkill -f (our own cmdline contains
   # the pattern and pkill would SIGTERM the gate itself).
-  setsid "$bin" --headless=new --user-data-dir="$udd" --no-first-run \
+  setsid "$launch" --headless=new --user-data-dir="$udd" --no-first-run \
       --disable-dev-shm-usage --remote-debugging-port=0 \
       "file://$here/media-capabilities.html" >"$WS/run-$2.log" 2>&1 &
   local gpid=$!
@@ -57,11 +62,11 @@ run_probe "$BASELINE" baseline
 echo "=== B) PORTED build ==="
 CODEC_OUT="$WS/codecs-ported.txt"
 rm -rf "$WS/udd-codecs"
-timeout 40 "$CHROME" --headless=new --user-data-dir="$WS/udd-codecs" --no-first-run \
+timeout 40 "$LAUNCH" --headless=new --user-data-dir="$WS/udd-codecs" --no-first-run \
   --disable-dev-shm-usage --virtual-time-budget=8000 --dump-dom \
   "file://$here/media-capabilities.html" 2>/dev/null | sed -n '/CHROMIUM_CODECS_BEGIN/,/CHROMIUM_CODECS_END/p' > "$CODEC_OUT"
 cat "$CODEC_OUT"
-run_probe "$CHROME" ported
+run_probe "$CHROME" ported "$LAUNCH"
 
 echo "=== C) VERDICT ==="
 base_max=$(sed -n 's/^\[baseline\] renderer \([0-9]*\)$/\1/p' "$WS/procs-baseline.txt" 2>/dev/null | sort -n | tail -1)

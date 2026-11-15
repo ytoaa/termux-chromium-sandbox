@@ -2123,3 +2123,37 @@ presence-proxy path in `device_gate.sh` stays the fallback because this Android
 
 Verification status: local transformer/harness only until the rebuilt deb is
 re-tested on the testbed; no device PASS is claimed here.
+
+## Round 32b — the actual renderer crash: the gnp shield was fork-unsafe
+
+After the R8 fork-safe change the testbed still showed the same fatal:
+
+    libc: couldn't open /proc/self/stat: Operation not permitted
+
+Bionic 13 implements `pthread_getattr_np()` for the main thread via
+`__find_main_stack_limits()` -> `__get_main_stack_startstack()`, which reads
+`/proc/self/stat` (and next `/proc/self/maps`) and `async_safe_fatal()`s when the
+read fails. The port's catch-all answer is `port/gnp_shim.c`
+(libtermux-gnp-fix.so, LD_PRELOADed by chromium-shield-wrapper.sh): a constructor
+snapshots the main thread's `pthread_attr_t` before any sandbox exists and hands
+it to later callers.
+
+Defect: the shield matched with `pthread_equal(thread, g_main_thread)`, where
+`g_main_thread` is the loading process's tid, inherited across `fork()`. In a
+renderer the predicate is false, the shield silently falls through to bionic, and
+the first post-activation main-thread `pthread_getattr_np()` aborts.
+
+Fix: recognise the child's own main thread with `gettid() == getpid()` (and keep
+`thread == pthread_self()` so only the calling main thread is served). The
+snapshot bounds stay exact because sandboxed children are forked, never exec'd,
+so the main stack mapping is a byte-copy at identical addresses.
+
+Verified on the testbed with the pre-built 157 chrome plus the recompiled shim
+(preload experiment, no CI rebuild needed):
+
+    activations=7  procstat_eperm=0
+    --dump-dom -> <body data-js="yes"><h1 id="x">ok-rendered</h1>
+
+Device PASS is still NOT claimed: the rebuilt deb must be re-gated, and
+`device_gate.sh` now launches the shipped shield wrapper (product path) instead
+of the raw binary.
