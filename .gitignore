@@ -3,6 +3,7 @@ poc/clone_ns_probe
 *.o
 *.deb
 evidence/
+!docs/evidence/
 __pycache__/
 chromium-test-profile*/
 chromium-probe-profile*/

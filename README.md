@@ -96,7 +96,7 @@ and invites a PR. This project is that attempt.
   value other than explicit `false`) runs DRY-ONLY; a real candidate build
   from dispatch requires the explicit `-f dry_run=false` go-ahead, and
   unsupported events can never reach the build path.
-  Device-gate procedure and validated promotion policy: port/DESIGN.md.
+  Device-gate procedure and validated promotion policy: docs/design/ARCHITECTURE.md, docs/design/ROUNDS.md.
 
 - **Current validated baseline (2026-10-25):** `chromium-sandboxed
   156.0.8078.47-2` (upstream 156.0.8078.47 + packaging revision 2),
@@ -136,7 +136,7 @@ and invites a PR. This project is that attempt.
 
 ## Layout
 
-- `port/DESIGN.md` — architecture notes and the decision record (v0)
+- `docs/design/ARCHITECTURE.md` + `docs/design/ROUNDS.md` — architecture/decision record and round log (split from DESIGN.md in R35)
 - `port/port.toml` — contract/state ledger
 - `poc/seccomp_probe.c` — reproducible Phase-0 evidence
 

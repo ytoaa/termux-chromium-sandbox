@@ -12,7 +12,7 @@
 # Phase 3 (GPU·Utility·Network 확대):
 #   - gpu-process / utility filter census (recommended >=2, non-fatal WARN)
 #   - network: informational (Linux network sandbox is opt-in upstream)
-# Failure diagnostics follow the DESIGN.md priority:
+# Failure diagnostics follow the docs/design/ROUNDS.md priority:
 #   R1 marker -> R2 marker -> zygote presence -> No usable sandbox / SIGSYS log.
 #
 # NEVER dpkg-install. Run against a deb EXTRACTED by device_gate.sh.

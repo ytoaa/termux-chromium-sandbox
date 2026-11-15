@@ -1,0 +1,1920 @@
+# Design record — rounds and investigations
+
+Chronological investigation log moved from `port/DESIGN.md` (R35 split).
+Entries are append-only; newest at the bottom.
+
+## Mystery #2 solved (run #11 device-gate round 1) — the prctl wall
+First-port deb on both devices (main kernel 6.1 + S20 FE 4.19): zygote alive
+(R1/R2 healthy!) but every sandboxed child boot-loops:
+    sigsys_handlers.cc:**CRASHING**:seccomp-bpf failure in syscall nr=0xa7 arg1=0x36
+= prctl(PR_PAC_RESET_KEYS). RestrictPrctl() (syscall_parameters_restrictions.cc)
+allow-lists arm64-Android prctl options only under BUILDFLAG(IS_ANDROID); Termux
+builds os=linux (IS_ANDROID=false) yet runs on Android/arm64, where bionic's
+clone/fork child setup resets PAC keys. This is the real class of problem
+cr-patch 1001 "fixed" by disabling the entire sandbox.
+Fix: R3 — __BIONIC__-guarded extension of the Cases allow-list (PAC 54/55/56,
+THP 44, TIMERSLACK_PID 41/43/127, SECCOMP_CACHE_FLUSH 58). trap.cc:106
+existing-handler noise and /proc/self/stat EPERM are non-fatal (upstream
+DLOG(FATAL) not compiled fatal in release; libc logs and proceeds).
+Measurement: kernel 4.19 testbed does not export Seccomp_filters in
+/proc/pid/status — gates use renderer-presence + zero-CRASHING proxy there;
+authoritative filter census stays on the main device (kernel >= 6.1).
+
+## Device-gate round 2 (run #12 deb): zygote inherited filter kills renderer
+With R3, CRASHING-prctl is gone but renderers still never ping ("Did not
+receive ping from zygote child"). strace (installed on main device) shows the
+whole renderer family dying simultaneously:
+    SIGSYS {si_code=SYS_SECCOMP, si_errno=EPERM, si_syscall=__NR_set_tid_address}
+seccomp filters are inherited across fork and can never be removed; bionic's
+clone-child setup calls set_tid_address before the broker relaxes the zygote
+filter — a syscall pattern glibc desktop never exhibits, hence zero upstream
+coverage. Fix R4: on __BIONIC__ pass the ZYGOTE type through StartSeccompBPF
+(same precedent as IsUnsandboxedSandboxType: return true without installing).
+The zygote is a launcher, not a security boundary; child types (renderer/
+gpu/utility) still install their own policies — where this port's enforcement
+lives. bpf_evidence still requires the zygote to exist; renderer census >=2
+remains the authoritative gate on the main device.
+
+## Device-gate round 3 (run #14 deb): the silent post-activation abort
+Ported X11 run: renderer printed "Activated seccomp-bpf sandbox for process
+type: renderer" then died silently in a boot loop (214 activations, no stderr,
+no logcat abort message, no crashpad dump — crashpad snapshots also fail on
+this build: 'tag not found'). --no-sandbox renders the page perfectly (all 5
+codecs "probably") -> crash is purely BPF-policy interaction.
+Forensics chain: LD_PRELOAD abort() PLT-hook + backtrace_symbols_fd captured
+91 IDENTICAL stacks: chrome(GetStackTop wrapper) -> pthread_getattr_np@plt ->
+bionic abort. llvm-objdump at the exact file offsets (0xb94e304/0xb94a364)
+matched partition_alloc/stack/stack.cc GetStackTop(). Root cause: PA's
+StackTopRegistry lazily calls pthread_getattr_np per TID; post-filter /proc is
+unopenable and BIONIC pthread_getattr_np LOG(FATAL)s internally. glibc instead
+degrades gracefully (and PA even has a __libc_stack_end fallback for glibc) —
+bionic has neither, so desktop chrome never hit this. The registry is keyed by
+TID, and forked children have fresh TIDs -> a zygote prewarm cannot work.
+Fix R5: at the top of StartSeccompBPF under __BIONIC__, call
+StackTopRegistry::Get().GetCurrentThreadStackTop() (forward-declared) so the
+cache is warm before the filter engages, in every sandboxed process type.
+Probe lesson: headless=new NEVER works on termux chromium (stock included) —
+device gates must use --ozone-platform=x11 + console-log capture.
+
+## Device-gate round 6 (run #22 deb, R6 build): why the prewarm was dead code
+R6 prewarmed GetStackEnd and R7/R8 later exposed the real shape of the wall.
+Forensics with a pthread_getattr_np interposer (gnp shim, logs pid/tid and
+whether /proc/self/status is still readable):
+  - exactly 3 gnp call sites per process; 2 fire PRE-filter, 1 fires
+    POST-filter (filt=-1 => /proc unreadable) and is the SIGABRT killer;
+  - all calls are tid==pid => main thread, exactly the case upstream documents
+    ("Bionic reads proc/maps on every call ... when called from the main
+    thread", base/debug/stack_trace.cc:228);
+  - abort() PLT-hook backtrace: the fatal frame is a pthread_getattr_np caller
+    reached through a lazily-initialised singleton.
+Root cause of the dead prewarm: upstream gates the bionic main-thread cache
+behind BUILDFLAG(IS_ANDROID) (and PA_BUILDFLAG(IS_ANDROID) for the vendored
+copy). Termux builds chromium with os=linux, so `static uintptr_t
+main_stack_end` never existed -> GetStackEnd called pthread_getattr_np on every
+invocation and the R6 prewarm stored its value nowhere. R5 was dead for a
+different reason: StackTopRegistry::GetCurrentThreadStackTop() is a pure map
+lookup, it never computes a value.
+
+### Fix set (round 6)
+- R7: enable upstream's own bionic cache under __BIONIC__ in base/debug/
+  stack_trace.cc and the vendored PA copy (PA rule is optional-if-absent).
+- R8: partition_alloc stack.cc - capture the main pthread_t during static init,
+  cache the main thread's stack top, and export TermuxPrewarmStackTop() so
+  StartSeccompBPF can fill the cache before the BPF denies /proc.
+- Prewarm block (R5b/R6) now calls base::debug::GetStackEnd,
+  PA base::debug::GetStackEnd and partition_alloc::internal::
+  TermuxPrewarmStackTop, all [[gnu::used]].
+- Verifier: if the vendored PA subtree ships, its R7/R8 markers MUST be
+  present (silently skipping them would ship a build that still dies).
+Harness: 24/24. Ledger: port.toml [rules.r7]/[rules.r8].
+
+## Device-gate round 7 (run #23 deb): BREAKTHROUGH - shield closes the wall
+R7+R8 did land in the compiled paths (verified in the build log: the exact
+patched files were compiled) and they did remove the old post-filter call site
+(gnp interposer: site moved 0xb94e308 -> 0xb94e540), but ONE caller remained:
+the abort backtrace still ran through the same stack-walk family, now reached
+from the crash-handler side. Root fact: bionic's pthread_getattr_np(main) is
+fatal whenever /proc is unreadable, so *any* caller kills the child - chasing
+callers is whack-a-mole and upstream may add more.
+
+### Fix: caller-agnostic bionic shield (port/gnp_shim.c)
+Capture the main thread's pthread_attr_t in a library constructor (before any
+sandbox exists) and serve that snapshot to every main-thread caller; non-main
+threads fall through to real bionic (no /proc involved). The main thread's
+stack bounds are constant for the process lifetime, so the snapshot is exact.
+Shipped as $PREFIX/lib/chromium-sandboxed/libtermux-gnp-fix.so and loaded by
+bin/chromium-sandboxed via LD_PRELOAD (children inherit it).
+
+### Proof (main device, kernel 6.1, real deb, X11)
+  renderer activation pids: 31001 31040 31041 31081 31183
+  codecs: 5/5 "probably" (h264/vp9/av1/aac/opus), 0 unsupported
+  census: 6 live children with Seccomp_filters=2 (Android baseline is 1)
+  X11 DEVICE GATE: PASS
+This is the first PASS in the whole project: renderers now survive BPF
+engagement AND render, with Chromium's own filter installed per process.
+
+### Gate hardening learned here
+zygote children are forked WITHOUT exec, so /proc/pid/cmdline stays
+"--type=zygote" and /proc/pid/comm is "chrome" - neither identifies a renderer.
+The gate now correlates the browser's own VERBOSE activation lines
+("[pid:tid:...] Activated seccomp-bpf ... renderer") with /proc/<pid>/status,
+and falls back to "any live child with >=2 filters".
+
+## Device-gate round 8 (run #25 deb): shield shipped, launcher-clobber bug
+The deb carried libtermux-gnp-fix.so (5000B) and the gate passed on the
+PACKAGED artifact (renderer activations 6, codecs 5/5, 7 live children with
+filters=2, X11 DEVICE GATE: PASS) - but packaging had a real bug:
+bin/chromium-sandboxed is a symlink to chromium-launcher.sh, and the shield
+hook wrote the wrapper with 'cat > $symlink', which FOLLOWS the link and
+overwrote the launcher itself. The 305-byte "launcher" then exec'd
+$P/chromium-launcher.sh - i.e. itself - an infinite exec loop for anyone
+installing the package.
+Fix: the wrapper lives in its own file (chromium-shield-wrapper.sh), the bin
+symlink is removed and repointed at the wrapper, the real launcher is left
+untouched, and the hook fails closed if the launcher ever contains the shield
+line. CI package gates now assert: shield .so present, wrapper present,
+launcher NOT clobbered, wrapper execs the real launcher. Harness 27/27.
+Lesson: never 'cat >' a path that may be a symlink - resolve it first.
+
+## Device-gate round 9 (run #28 deb): FULLY GREEN — first validated candidate
+CI run #28 (commit 239ea89, the run-#26 SIGPIPE+pipefail gate fix) is the
+first end-to-end green pipeline: transformer self-test + build + ALL package
+gates + artifact upload. Harvested deb 155.0.8059.84
+(sha256 4e7dce5226d0576bb33bcb774a3d2816b433aae2fd81faf694725d500dbe820a) and
+re-ran the authoritative X11 device gate on the MAIN device (kernel 6.1):
+
+  baseline (stock chrome) renderer filters=0   (apples-to-apples control ok)
+  renderer activation pids: 19076 19088 19089 19144 19179 19201  (6)
+  codecs: 5/5 "probably" (h264/vp9/av1/aac/opus), 0 unsupported
+  census: 7 live children Seccomp_filters=2 nnp=1 (zygote-forked, exec-less
+          cmdline still --type=zygote; fallback [3] path per round-7 hardening)
+  X11 DEVICE GATE: PASS  (shield LD_PRELOADed from the deb, as shipped)
+
+Packaging verified from the deb itself (round-8 fix holds):
+  bin/chromium-sandboxed -> lib/chromium-sandboxed/chromium-shield-wrapper.sh
+  wrapper (305B) execs chromium-launcher.sh (1379B, untouched, 0 LD_PRELOAD
+  lines); libtermux-gnp-fix.so (5000B) present. No self-exec loop possible.
+
+port.toml: phase=validated, last_validated_port=0.1.0,
+last_validated_chromium=155.0.8059.84, device_gate PASS recorded.
+
+Ops lessons this round:
+- fetch_artifact.sh died on a relative out-dir (subshell cd + relative
+  $out/deb.sha256). Fixed by absolutizing $out right after mkdir; the
+  "next:" hint now names x11_gate.sh (headless never works on termux).
+- gh CLI hangs forever with no DBUS_SESSION_BUS_ADDRESS (keyring lookup on a
+  dead bus, no timeout). Live bus address is readable from
+  /proc/<gnome-keyring-daemon-pid>/environ. Consider a gh fallback that
+  errors instead of hanging (check GH_TOKEN first).
+
+Next (Phase 2): apt channel via gh-pages + package-version lead so
+'pkg upgrade' cannot resurrect the sandbox-off stock build as the default
+entry point; separate-identity naming already holds (chromium-sandboxed).
+
+
+## Round 10 — R9a candidate (run #29): network service sandboxing works (2026-10-23)
+
+Approved scope executed exactly: one (SOL_SOCKET, SO_DOMAIN) getsockopt pair under
+__BIONIC__ inside RestrictGetSockoptForNetworkService() (bpf_network_policy_linux.cc),
+verifier gate + rule-counter 7->8 + workflow R9a grep + harness [28]-[30];
+[forbidden] converted to valid TOML with tomllib parser gate [31] (commits c715866
+security-policy / f2fec44 docs-verification).
+
+run #29: self-test PASS; build SUCCEEDED but took 5h09m — the sccache had partially
+expired (warm baseline #28 was 59m; job cap is 350m — future dispatches should
+either keep the cache warm (periodic rebuild cadence < 7d) or budget cold runs).
+IMPORTANT: the workflow resolves termux-packages via a floating master ref and
+upstream bumped Chromium 155 -> **156.0.8078.47**, so the candidate is a different
+Chromium than the run #28 baseline. R9a anchors survived the bump (build applied
+them), but production validations must pin the termux-packages sha — recorded as a
+known drift risk.
+
+Behavioural battery (candidate 156+R9a, main extract-only + testbed dpkg install):
+- NetworkServiceSandbox ON: restarts 16->0, CRASHING 32->0, utility ACTs 18->2;
+  milestones equal to baseline-A (YouTube iframe timeline T1..T5, AAC done, IDB/LS).
+- Kernel 6.1 census with PID<->role mapping: sub=network.mojom.NetworkService
+  recorded Seccomp_filters=2 NoNewPrivs=1 AT activation instant (4.19 testbed:
+  seccomp=2 nnp=1, no filter export — main census is authoritative).
+- PulseAudio under B: sink-input RUNNING <Chromium>, monitor rms 2591 (main) /
+  4150 (testbed) — first SILENT reading was a 0% sink-volume environment drift,
+  restored to base 100% (not a regression).
+- Testbed dpkg install -> ii -> B battery -> purge: 0 package residuals
+  (empty lib/chromium-sandboxed/extensions was runtime-created; removed).
+- No new syscall traps observed anywhere in the battery -> no list widening.
+
+R9b (diagnostics only, ZERO code/permission changes, per authorization): the audio
+utility DOES engage BPF (ACT log, zero CRASHING); silence stems from the AUDIO hook's
+broker file-permission set not covering Termux's deep XDG runtime layout — PA
+secure-dir verification -> broker EPERM -> libpulse falls back to compiled
+$PREFIX/var/run/pulse/native -> raw connect ENOENT -> refused -> silent + utility
+exit. PULSE_RUNTIME_PATH env probe still EPERMs (so it is directory-self +
+intermediate-component traversal, not a plain path miss). libpulse.so.0 loads fine
+(no dlopen warning). v3 fix proposal drafted (bionic branch in
+AddPulseAudioFilePermissions) — awaiting approval; seccomp policy untouched.
+
+Verdict: R9a candidate = PASS against the approved battery. Promotion to validated,
+default-on of NetworkServiceSandbox, apt publishing: NOT done, separate approvals
+required. run #28 stays the validated baseline.
+
+## Round 10 addendum — R9b reviewer revision & R9a #29 record (2026-10-23)
+
+R9a run #29 (candidate 156.0.8078.47): device battery PASS — restarts 16->0,
+CRASHING 32->0, network utility filters=2/nnp=1 at activation instant (kernel 6.1,
+pid<->sub mapping), audible audio under B (rms 2591 main / 4150 testbed), testbed
+install/purge clean, no new traps. This record is informational: run #28 remains
+the validated baseline; promotion to validated, NetworkServiceSandbox default-on
+and apt publishing all require SEPARATE approvals (none granted).
+
+R9b (reviewer corrections accepted, still zero code/policy changes): the earlier
+"broker permission gap" attribution is WITHDRAWN — observed EPERM(1) matches
+base-policy Error(EPERM) classes (fchmod/fchown are not broker commands; broker
+denies with EACCES), and the PULSE_RUNTIME_PATH probe was an invalid control (it
+moves socket discovery too). Corrected A/B with an extended tracer (lstat/fstatat/
+statx/fchown/fchmodat/openat/syscall) proved a zero-policy fix: with
+PULSE_SERVER=unix:<real $PREFIX/tmp/pulse/native> the sandboxed AudioService
+connects (ret=0), cookie opens via the existing broker grant, no secure-dir
+sequence runs at all, sink-input RUNNING + monitor rms 1936 AUDIBLE, and the
+unsandboxed control is equivalent. v3 proposal = launcher-level env export
+(prepare_recipe.py data change only; respects user PULSE_SERVER; no-op when no
+socket). Priority-2 (minimal broker StatOnlyWithIntermediateDirs) and priority-3
+(extra bionic patches) are unnecessary unless v1 regresses; the exact broker-vs-BPF
+attribution of the ORIGINAL default-discovery failure stays open (tracer filter
+blind spot on non-'pulse' component paths like $PREFIX/tmp itself) — observable
+without builds via filter extension only. Forbidden measures (blanket fchmod,
+$PREFIX RWCR, disabling seccomp) were never applied.
+
+## Round 11 (WIP) — R9b wrapper candidate: packaging proven, utility survival gate BLOCKED (pre-existing)
+
+Implemented (approved scope): guarded PULSE_SERVER export inside
+chromium-shield-wrapper.sh (prepare_recipe.py; original chromium-launcher.sh
+untouched; LD_PRELOAD path preserved; exec line unchanged; user PULSE_SERVER —
+including empty string — never overwritten; XDG absolute-path socket preferred,
+$PREFIX/tmp fallback, no-socket no-op; unix:<abs> form; quoting-safe; harness
+[32]-[34]: 10 new cases incl. behaviour matrix (7 scenarios) + widening-token
+guard; ledger [rules.r9b]; 42/42).
+
+Device pre-validation (testbed, extract-copy + one real dpkg install/purge):
+the wrapper does exactly its job — refused/secure-dir log lines go to 0 with
+AudioServiceSandbox ON (was refused=1-loop before). BUT the §5 survival gate
+(audio utility alive >=30s) FAILS: the sandboxed AudioService utility dies
+silently right after 'Activated seccomp-bpf ... utility' (no SIGSYS/CRASHING,
+no logs, no dumps) — IDENTICALLY on 155 (run #28 tree) and 156 (candidate #29
+tree), with or without LD_PRELOAD tracers, with or without PREFIX override,
+extract or installed. 155/156 audio hook+policy sources are byte-identical
+(diff clean) — this is a pre-existing sandboxed-AudioService problem, NOT a
+regression introduced by the candidate.
+
+SELF-CORRECTION (round-10/R9b findings): the earlier 'C-srv AUDIBLE rms 1936'
+success claim was BROWSER-SIDE FALLBACK audio, not the sandboxed utility — the
+same log's own 'audio-util-alive@14s: NO' was in plain sight. The wrapper is
+still necessary (kills the refused crash-loop) but NOT sufficient; next
+investigation = broker round-trip (sendmsg/poll hook + broker child census +
+last-words capture per utility pid) to find the silent death mechanism.
+
+CI build: NOT dispatched (approval §4 conditions require the pre-validation to
+pass; it did not). No new policy allowances were added anywhere. run #28 stays
+the validated baseline.
+
+## Round 11 addendum — v4 FINAL: no utility death existed (three measurement artifacts corrected)
+
+The "silent death" was an artifact of (1) zygote-forked utilities keep
+cmdline --type=zygote (exec-less) so the cmdline scan was blind — ptrace
+spy proved ACT'd utilities alive; (2) parecord windows all sat AFTER the
+12s clip ended (t30 vs end@16-17s) — re-measured in-window: testbed
+rms=2905 AUDIBLE, main rms=2589 AUDIBLE with AudioServiceSandbox ON
+(wrapper PULSE_SERVER), sink-input RUNNING, PLAY+ENDED, CRASHING 0, PA
+context-refused 0 (the 'refused=41' was dbus-bus noise on a loose grep);
+(3) broker exit(0)/EOF lines = zygote warm-up fork(_exit(0) by design)
+and session-teardown lifecycle, not a broker pathology (single broker fork
+observed per utility: FORKED parent->child; client EOF only at close).
+
+§5 gate status (candidate 156 + wrapper, run #29 binary + injected wrapper):
+- AudioServiceSandbox ON, both devices: utility ALIVE 30s+ (spy/ACT census),
+  0 unexpected restarts, sink RUNNING, in-window monitor rms>150 (2905 TB /
+  2589 main), AAC PLAYING->ENDED, YouTube T1..T5 (D), IDB/LS.
+- D (audio+network) main: network.mojom.NetworkService ACT-at
+  Seccomp_filters=2 nnp=1 preserved; eight zygote-child utilities recorded
+  filters=2 nnp=1 at activation instant; CRASHING 0, 'restarting service' 0.
+- Controls: sandbox OFF healthy; PULSE_SERVER- OFF reproduces refused/
+  secure-dir loop (wrapper is the fix); instrumentation did not alter
+  outcomes (J vs G3 same shape).
+
+CI build: still NOT dispatched — awaiting approval (single build, ref
+64e02760...). Nothing promoted; run #28 remains baseline; no policy or
+broker/allow-list widening anywhere. Evidence: gate-out/r9/{v4*,R9B_FINDINGS.md,
+shield-wrapper-r9b.sh, spy, ipc_diag2.*, exec_catch.*} + device logs.
+
+## Round 11 postmortem — run #30 (R9b candidate CI) failed at SELF-TEST; product code unaffected
+
+Dispatch verified pre-flight (headSha 1ddf25f == approved port commit;
+termux_ref input == 64e02760). gate job self-test FAILed only on harness
+cases [33a]-[33h]: the behaviour-stub launcher embedded a Termux-absolute
+shebang — ubuntu runners have no /data/data path ('bad interpreter').
+40/42 cases PASSed on CI including [32] (R9b markers in generated recipe)
+and [34] (no widening tokens). build job skipped (fail-closed by design);
+no artifact produced; NOT retried per authorization. Fix committed
+(#!/usr/bin/env bash) with local re-verification 42/42. Awaiting
+re-dispatch approval for the single candidate build (port commit advances
+to the fix commit; everything else per prior approval).
+
+## Round 11 FINAL — run #31: R9b candidate CI PASS + both-device A/B/C/D gates PASS (2026-10-24)
+
+Pre-flight: dispatch headSha == approved port commit 403274f; termux_ref input
+pinned to 64e02760... (never master); single dispatch, no retries.
+Result: gate self-test 42/42 on CI (shebang fix effective), build success
+(87m, sccache prefix-restore warm), package gates incl. R9a grep PASS.
+Artifact: chromium-sandboxed 156.0.8078.47 aarch64, sha256
+29c4080d2a849c07eae46a87e44e39231fa92021c1e10e24f363e1e29395b27c.
+
+Artifact verification (extracted DEB, not just logs): R9b wrapper markers +
+guards (user-set incl. empty respected — shipped-wrapper stub-tree behaviour
+test: unset->unix:<socket> exported; empty->kept empty; tcp->kept);
+LD_PRELOAD chain and exec-line intact; chromium-launcher.sh sha256 identical
+to #29 (untouched); port-apply log 'APPLIED] R9a' recorded.
+
+Device gates (A/B/C/D matrix, both devices, server pre-healthcheck, PID-linked
+in-window measurements):
+- MAIN (kernel 6.1, extract-only): every condition AUDIBLE in-window
+  (rms 1103-4664), CRASHING/pa-refused/restarting all 0, milestones full
+  (YouTube T1..T5, AAC done, IDB/LS). D census: 9/9 ACT pids with
+  Seccomp_filters=2 + NoNewPrivs=1 at activation instant, including
+  sub=network.mojom.NetworkService. PA client pid ∩ ACT utility pid
+  (26194@C, 29415@D) != browser pid -> stream owner is the sandboxed
+  utility, browser-side fallback formally excluded.
+- TESTBED (4.19, dpkg install -> matrix -> purge): ii; A-D all AUDIBLE
+  (rms 1169-3113), CRASHING/refused/restarting 0, END-LIVE 6-8 pids at ~63s
+  window (>=30s survival incl. audio utility + zygote children), PA owner =
+  ACT'd sandboxed utility (24772@C, 26940@D). 4.19 cannot export
+  Seccomp_filters (kernel limitation) -> nnp=1 + activation logs + MAIN
+  census serve as filter evidence, per protocol. Purge: dpkg residual 0;
+  only runtime-created empty extensions/ dir (0 files) remained.
+- #28/#29 comparison: #28 B-condition signature (restarts 16 / CRASHING 32)
+  gone on #31 (0/0); defaults-off (A) identical feature set; no regressions
+  found. NET_204_ERR/HTTPS_ERR page fetches: environment quirk identical in
+  ALL conditions incl. A and #28 baselines (not a sandbox effect); YouTube
+  streaming proves real network works.
+Known limits: wrapper no-ops without socket at standard paths (by design,
+user env precedence); third-party PA clients can pollute naive owner-detect
+(avoided via ACT∩PA membership); in-process GPU/WebGL-off on testbed matches
+stock (unchanged since round 9).
+
+STATUS: candidate fully validated. NOT promoted (awaiting explicit approval):
+run #28 remains validated baseline; last_validated_* untouched; Network/
+Audio sandbox remain default-OFF; no apt/release. Recommendation in final
+report.
+
+## Round 12 — long-run soak on #31 artifact (2026-10-24)
+
+Fixed inputs verified: deb sha256 29c4080d... re-checked pre-run; no rebuild,
+no source change, no promotion. Main = extract-only; testbed = dpkg install
+(dpkg -V clean) -> matrix -> purge, residual 0 (only runtime-created empty
+extensions dir, 0 files).
+
+MAIN (kernel 6.1, authoritative):
+- Phases A(15m)/B(12m)/C(12m) + D(60m) + D60 re-run(60m, corrected assets,
+  external auto-detect monitor) + aux2 A/B/C(10m)+D(25m) with fixed pages;
+  10/10 relaunches OK (launch, milestone, graceful exit, residual 0 each).
+- D60@44-min monitored window: 174 unique pids; browser/2 zygotes/2 network
+  utilities/acted-children all span 2640s continuous; ACT-scoped seccomp2
+  rows 635 with filters=2 & nnp=1 -> VIOLATIONS 0 (browser/zygote platform
+  rows correctly filters=1; crashpad nnp=1 pre-sandbox rows are not
+  sandboxed pids and excluded per protocol).
+- CRASHING / SIGSYS / 'restarting service' / PA-context-refused: 0 in every
+  phase, both devices.
+- Resources: RSS plateau 1.9-2.4GB across 15 buckets (no monotonic growth;
+  end ~= mid), browser FD 253->272 stable under tab churn (create/close via
+  CDP every 120s), cpu/min decay 8029->269 (page-load -> steady, no
+  runaway). Zombie state field not captured (NOT_VERIFIED formally;
+  indirectly: exited pids stop appearing -> reaped, END residuals 0).
+- Audio: sandboxed utility owns the stream — PA client pid 29581 ∈ ACT set
+  in 30/49 sampled rows (single stable owner pid, itself filters=2 nnp=1,
+  44-min survival); rms >150 in 27/49 samples, median 2892, max 7504;
+  AUDIO_PLAY 153 loops; WS_OK 3602 (sustained + reconnect cycles); YouTube
+  T5 + AAC DONE; LS 104/IDB OK.
+
+TESTBED (4.19): TB2 30m + TB3 25m + TB4 30m + TB4' 30m (all D, monitor +
+CDP media injector on TB3'/TB4'): stability 0/0/0 everywhere; audio stream
+owner pid 22411 ∈ ACT across 23-min window (4/4 sampled sink rows), rms
+22/23 samples >150 (max 6625); Seccomp_filters not exported on 4.19 (nnp=1
+518 rows + mode=2 + MAIN census as per-protocol evidence).
+
+Method fixes discovered mid-run (measurement-only, no product change):
+initial-argv media tabs can be autoplay-gesture-starved -> CDP-created tabs
+are the reliable media path (injector added); fixed monitor device missed a
+drifted sink -> auto-detect added (r12_mon2); audio page needed JS play() +
+timeupdate logging; DL fetch page never surfaced -> big-file download
+NOT_VERIFIED (honest); pkill -f self-match caused two self-kills (moved to
+script-file cleanup).
+
+Verdict: Round 12 PASS on all enumerated gates except two recorded
+NOT_VERIFIED items (HTTP large-file download path; zombie-state field) and
+LMK visibility (non-root: NOT_VERIFIED). No regressions vs A condition or
+vs #28/#29/#31 signatures. Baselines untouched; promotion still pending.
+
+## Round 12.1 — residual verification closure (2026-10-24, #31 deb, no rebuild)
+
+1) Monitored-window reconciliation: D60 per-pid "44 min" was a metric error
+   (i-index assumed 60s; real cadence ~63s). True coverage: unmonitored gap
+   at launch 38s (covered by first mon-D rows at 05:24:53) + tail 55s
+   (browser alive at TERM: log 'Handling shutdown for signal 15' 06:24:56).
+   Effective continuity: full 60.0-min run, sampling continuity 58.5 min,
+   endpoints attested. The "44 min" claim is corrected here.
+2) Low-RMS triage (49 samples): 27 audible; 21 samples = zero-stream minutes
+   (media tab genuinely absent — churn-close/injector-120s scheduling
+   artifact, workload design, not output faults); 1 sample i=28 (sink RUNNING
+   + owner, rms 0) = clip-end/teardown boundary (i=26/27 audible 2892/2940,
+   i=29 stream already gone). No true output failure observed in-window.
+3) Browser download manager (CDP Page.setDownloadBehavior -> navigate to
+   http 13MB file, isolated dirs, per-condition server health 200):
+   A and D both DL_MGR_RESULT OK, size 13631488, SHA256 MATCH to source.
+4) Zombie state (monitor_state.sh, State column, 5s cadence, teardown
+   covered): state==Z rows 0 in both conditions; 13/14 vanished (reaped)
+   rows — all ended processes fully removed from /proc post-TERM.
+5) LMK: non-root logcat (system + events) visibility 0 lines -> remains
+   NOT_VERIFIED; absence of observation is NOT claimed as absence of LMK.
+   Product-side corroboration (not proof): no mid-run unexpected exits,
+   residuals 0 in every phase.
+
+Tooling bugs found+fixed in closure (measurement only): PREFIX derived via
+dirname-chain instead of suffix-strip (chrome never launched first tries);
+stop-file truncation vs rm -f (monitors exited instantly); CDP ready-wait
+added; orphan print NameError; harness-timeout pipe output loss -> detached
+runs. pkill/self-match discipline upheld via script-file cleanup.
+
+Round 12.1 verdict: items 1-4 CLOSED PASS, item 5 NOT_VERIFIED (structural,
+non-root). NOT_VERIFIED ledger shrinks to: LMK visibility only. Promotion
+recommendation updated in final report; nothing promoted here.
+
+## Round 14 — real-world compatibility & default-enablement fitness (2026-10-24, #31 artifact, no rebuild)
+
+Fixed inputs re-verified pre-run (deb sha256 29c4080d..., ledger 0f0d728).
+Main extract-only (A 15m / B 30m / C 30m / D 60m + supplementary B'/D' 15m
+with fixed injector); testbed dpkg install -> D30 -> purge (residual 0,
+dpkg -V clean); live PulseAudio never touched on either device (isolated
+second instance with null-sink used for alt-socket E2E, own pidfile kill).
+
+Stability (all 6 main phases + TB D30): residuals 0, CRASHING 0,
+Received-SIGSYS 0, 'restarting service' 0, PA-context refused 0 everywhere.
+ACT-scoped BPF rows: violations 0 (D: 635+ rows filters=2 nnp=1 pattern
+reproduced); network-utility cmdlines attest --enable-features propagation
+(B: NetworkServiceSandbox; D: both).
+
+Network compatibility (B/D): HTTP/1.1 local incl. 302->target (8), slow
+streamed body, chunked 15s long-connection completed; WebSocket sustained
+(WS_OK 14954@D60) + netflap (both servers down 60s) -> OPEN storm + full
+reconnect, audio unaffected (AUDIO_PLAY 148 vs baseline 140); Service
+Worker registered + 51-62 intercepted fetch hits; cookie persist + cache
+304 sequence (http-origin required: file:// origin blocks SW/cookies/CORS —
+a harness design lesson, symmetric across A-D, not a sandbox effect);
+downloads via browser download manager during audio: 2x13MB SHA256 match
+(main D) + 2x (supp D'); HTTPS external OK (YouTube T5 x11, AAC x14).
+Tiering: HTTP/2 attested server-side (curl ALPN=2) + pages loaded in
+chrome (client negotiation NOT_VERIFIED — netlog out of scope); HTTP/3
+path available (curl h3 OK) but chrome-side use NOT_VERIFIED; IPv6
+unreachable on this network (curl -6 fail) -> NOT_VERIFIED (environment).
+
+Audio compatibility (C/D + TB): formats page Opus 4131 plays + VPX 23
+(FMT_ERR 20 transient); 3 concurrent streams owner = sandboxed utility
+(30710 in ACT, filters=2); owner-in-ACT on every audio-bearing phase
+(29581/22411/5396/27200); pause/resume+tab churn sustained; clip-end ->
+new stream recreation proven via netflap & injector cycles.
+Wrapper PA branches on testbed 7/7 (B1 prefix-socket export, B2 XDG
+preferred, B3 prefix fallback, B4 tcp kept, B5 EMPTY kept, B6 no-socket
+no-op, B7 custom kept; LD_PRELOAD intact in all). E2E against ISOLATED
+second PA (null-sink r14alt, auth-anonymous, own pidfile): user-specified
+non-standard socket -> AUDIBLE (rms 2893 on r14alt.monitor) and sink-input
+client pid = sandboxed utility (188x != browser) -> fallback excluded.
+Bad-socket injection: expected failure (1 refused, browser alive, no
+crash/restart) — classified distinct from normal-env regression.
+
+Resources: main-run RSS rose monotonically (A 0.35G/min ~= D 0.29G/min,
+same rate, up to 17.8G/188 live renderers) -> traced to UNCAPPED injector
+tab churn + Chromium idle-renderer pool, NOT sandbox: after injector cap
+(<=8 tabs) identical D workload PLATEAUS at 2.0-2.7GB (supp D'). FD and
+cpu trends stable; no LMK observation channel (NOT_VERIFIED standing).
+
+Performance: same-workload dcl medians B' 81 vs D' 131.5 ms (n=4) and
+main B 73.5 vs D 152 (n=24) — audio sandbox correlated with +~50-80ms
+page-load dcl at heavy concurrent load; small-n, no UX jank observed;
+marked 'observed, precision insufficient', NOT a defect claim. Audio
+output latency field not collected (NOT_VERIFIED).
+
+Open observations (non-blocking): (1) WS-close storm occurred in main B
+and D runs (227k/245k lines) but B' rerun was clean (0) — 3/4 net-sandbox
+phases + C clean -> transient tool/environment event; root cause not
+closed, reproduction conditions unknown (ws server stderr was discarded
+in main runs — recorded as measurement gap).
+
+Verdict inputs are in FINAL REPORT; nothing promoted, no defaults changed.
+
+## Round 15 — automated maintenance pipeline (2026-10-24, this PR)
+
+Goal: daily probe -> conditional build -> fail-stop + Issue -> candidate
+retention, with humans as the only path to security-policy or validated
+changes. Nothing here is active until the PR is merged (schedule fires only
+on the default branch) — and merge is a separate approval.
+
+Architecture (single pipeline, no duplicate workflows):
+- `.github/workflows/daily-maintenance.yml` — cron 23 0 * * * (09:23 KST) +
+  manual dry-run/approve-retry. Permissions: actions:read, issues:write,
+  contents:write (ONLY the Contents-API commit of maintenance/state.json on
+  the `maintenance-state` branch (regular, bootstrapped from default-branch head; not orphan) — path+branch hardcoded; branch-
+  scoped tokens don't exist, flagged for review). Concurrency serializes
+  daily runs; the build workflow has its own serial group so
+  manual+scheduled builds never overlap (no cancellation of in-flight
+  ~1h builds).
+- Reuses `.github/workflows/build-chromium.yml` via **workflow_call** —
+  every existing invariant stays: termux_ref pinned to an exact sha,
+  separate package identity, R1~R9b transforms (fail-closed self-test gate
+  job), sccache, package gates, artifacts. Manual workflow_dispatch is
+  unchanged (static test s1). New: optional pkg_revision ->
+  TERMUX_SANDBOXED_REVISION (unset = byte-identical to pre-Round-15 recipe,
+  preserving #31 reproducibility), plus job outputs (deb sha/version,
+  termux/port sha) for the state ledger. (GITHUB_TOKEN cannot
+  workflow_dispatch/repository_dispatch another run; workflow_call is the
+  only token-legal composition — documented.)
+- `port/maintenance.py` — pure offline decision engine (no subprocess/exec
+  surface; network only in `fetch`): build signature =
+  sha256(upstream_version, recipe-blob-sha, host-tools-blob-sha, port_sha).
+  termux-master HEAD drift alone never rebuilds (§4 "actual build inputs").
+  Rules: behind -> skip; identical signature -> skip; candidate exists ->
+  skip; new version -> build rev1; same version + changed inputs ->
+  revision+1 (`156.0.8078.47-2` style — Termux native version-revision,
+  upstream version never synthesized above official); fetch/checksum errors
+  -> fail-closed skip; blocked signature -> skip unless inputs changed or
+  retry_approved.
+- State (`maintenance/state.json` on `maintenance-state`, seed =
+  `maintenance/state.seed.json` recognizing run #31 as the first
+  successful build + the validated baseline verbatim). validated block is
+  read-only to automation (tests s17/s18/s19; apply never rewrites it).
+- Failure handling: called-workflow job conclusions classify stage
+  (gate->port, verify->port, build+transient-keywords->infra); infra gets
+  exactly ONE automatic retry then escalates; port/unknown block
+  immediately with a deduplicated `auto-build-blocked` Issue carrying
+  version, port sha, termux sha, stage, log excerpt, CI link, last success,
+  repro steps, blocked status. Second failure on same signature comments on
+  the existing Issue (no spam). Closing the Issue alone does NOT retry —
+  unblock requires changed inputs, `retry-approved` label, or the
+  approve_retry dispatch (engine test 6d/6e).
+- Success -> candidate recorded with status BUILD_VERIFIED_CANDIDATE,
+  deb sha256, ci links (validated stays untouched — device gates remain
+  human gates). Retention: candidates keep ci_run/artifact ids; GH
+  artifacts expire per repo retention setting (recommend 90d — an OWNER
+  setting); expired artifact => state keeps history, rebuild allowed by
+  human dispatch.
+- Renovate (main) stays untouched: it only bumps the detection ledger
+  `port/upstream.renovate`; no build trigger, no collision (test s25).
+- Supersedes this PR's v1 (check-chromium-upstream.yml +
+  check_chromium_updates.py, issue-only watcher) — removed; probe logic
+  absorbed into maintenance.py fetch.
+
+Verification (all offline/static; NO long CI build was run, NO schedule is
+active until merge):
+- port/tests/maintenance_test.py         23/23 scenarios (§10 list 1-10 +
+  infra-vs-port classification, dedup, closed-issue-still-blocked,
+  retry-approved one-shot, divergence informational)
+- port/tests/maintenance_static_test.py  25/25 workflow/seed invariants
+- port/tests/maintenance_revision_test.sh 4/4 revision injection
+- Full harness now 45/45 (new cases [35][36][37] gate CI self-test too —
+  the build workflow's fail-closed gate now also protects the maintenance
+  code paths).
+
+Merge prerequisites (owner actions, separate approvals):
+1. Review daily-maintenance permissions grant (contents:write rationale).
+2. Decide artifact retention (Settings -> Actions, recommend 90 days) and
+   ensure GitHub Actions status badge/branch protection expectations.
+3. Merge PR #1 -> schedule becomes live on default branch. Until then this
+   is inert.
+4. Optionally create the `maintenance-state` branch beforehand (first run
+   auto-creates it from the seed otherwise).
+
+### Round 15.1 — pre-merge defect fixes (review of 93eb69f)
+
+1. steps[].uses -> **jobs.build.uses** (steps-level reusable-workflow calls
+   are NOT valid Actions syntax; the earlier dry-run merely never reached
+   that step because it was skipped). evaluate -> build -> outcome jobs
+   with needs + job outputs; plan/state/probes/issues transferred via a
+   workflow artifact pair (upload==download name asserted, s30).
+2. outcome runs `if: always() && evaluate succeeded && decided build &&
+   !dry_run`: collects failures AND classifications — cancelled and
+   orchestration-skip are recorded in history but NEVER block or open an
+   Issue (engine tests 18/18b); every other stage incl. unknown stays
+   fail-closed (blocked).
+3. fetch now pins termux master HEAD FIRST, then reads BOTH build.sh files
+   at that exact sha (atomic probe == build checkout; no master fallback).
+   The built version follows prepare_recipe's alignment policy
+   (chromium/build.sh VERSION := chromium-host-tools/build.sh VERSION),
+   so decide builds the host-aligned value (test [16]).
+4. `retry-approved` is a real mechanism: an OPEN block issue carrying that
+   label + the exact full signature in its title authorizes exactly one
+   attempt (test [14]); absence keeps blocking (14b); dispatch flag also
+   supported.
+5. Rebuild trigger uses a **port build-inputs hash** (tree shas of
+   chromium_sandbox_port.py, prepare_recipe.py, port.toml, gnp_shim.c,
+   ci.sh), not the repo HEAD — doc-only commits no longer cause rebuilds.
+6. One signature matcher (`issue_matches_sig`, full 16-hex in the title)
+   everywhere (dedup, stamp, label). GitHub API failures fail closed:
+   issues API error marker -> decide skips with
+   issues-api-error-fail-closed; actions API error -> treated as busy;
+   state API non-404 error aborts the job (no silent seed fallback — only
+   a true first-run 404 seeds).
+7. Ledger honesty: run #31 is recorded with its REAL plain version
+   '156.0.8078.47' (no retroactive -1); rev1 builds stay plain
+   (TERMUX_PKG_REVISION unset = Termux plain version), only rev>=2 get the
+   '-N' suffix + env; checksum_ok renamed to pins_verified with the exact
+   meaning: both files read at pinned sha + literal version lines parsed
+   (deep tarball hash verification remains a build-side duty, never
+   claimed).
+8. Tests: engine 31/31 (13 new-area cases incl. issues fail-closed, label
+   retry, cancelled/skip non-blocking, aligned version, api-busy),
+   static 33/33 (job-level grammar s28, outcome needs+always s29, artifact
+   handoff s30, pinned inputs s31, per-job least-privilege s32), revision
+   suite 4/4; full harness 45/45 (CI self-test gates all of it).
+   Still zero long CI builds and no merge.
+
+### Round 15.2 — post-processing hardening (review of 1310acf)
+
+1. Success result JSON: the old jq passed a JSON literal as an INPUT FILE
+   name (always crashed). Now `echo | jq` builds raw result; SHAPE
+   VALIDATION MOVED INTO THE ENGINE (apply): deb_sha256 must be 64-hex,
+   deb_version must equal the decided package_version, termux_sha 40-hex,
+   ci_run positive int, ci_url https, artifact present — any mismatch
+   downgrades a 'success' to stage=verify (blocked + issue), so a
+   malformed success can never mint a candidate (tests 19a-d).
+2. Failure paths (failure|timed_out) now ALWAYS emit result.json with the
+   failed job NAMES (queried from the same-run jobs API), stage
+   (gate|build from actual reusable-workflow job keys), 4KB log excerpt and
+   run url (test 20). cancelled / skipped-anomaly remain non-blocking.
+3. infra retry contradiction fixed: first infra failure stores
+   infra_failures=1 (no issue); decide then EXPLICITLY allows the single
+   retry (test 11a2); second infra failure -> failures=2 -> issue + block;
+   decide skips at >=2 (11b/11c).
+4. retry-approved is one-shot per signature: label match sets
+   approval_used; the FOLLOWING apply consumes it (retry_approved=False +
+   approval_consumed_issues += [issue]); a still-open labelled issue can
+   never authorize a second daily retry (22a-c). Success clears the block
+   entry entirely.
+5. Durability: outcome job pre-creates required labels (idempotent, hard
+   fail if unavailable). Durable dedup survives state-push loss: an OPEN
+   issue with the exact full signature blocks even when state.blocked is
+   gone, and apply persists the re-link (plan.relink) so the ledger
+   re-attaches to issue #N (23a/b). Approval checks run BEFORE this
+   durable skip, so human-authorized retries are never swallowed.
+Tests: engine 42/42 (19-23 new + 11a2), static 34/34 (s34 = every run:
+block passes bash -n with expressions substituted), revision 4/4, full
+harness 45/45. Still zero long builds; dry-run dispatch re-verified parse.
+
+### Round 15.3 — real state-transfer-path fixes (review of 98e6581)
+
+1. Approval one-shot survives SERIALIZATION: decide no longer keeps the
+   origin in memory only — it writes plan.approval={issue,signature} into
+   plan.json; apply consumes using ONLY the deserialized plan + the
+   ORIGINAL state.json (what the outcome job really reads). A surviving
+   label can never authorize a second attempt (integration iA1-4 across
+   simulated days).
+2. Relink-only repair path executes: evaluate exposes a `relink` output and
+   the outcome job runs for `action==build OR relink==true` (never on
+   dry_run). Relink performs ZERO builds and ZERO issue creations while
+   persisting the issue re-attachment to maintenance-state (iB1-3),
+   repairing the ledger after a state-push loss; the following day's decide
+   keeps skipping from the repaired state.
+3. Failed job names now reach the Issue body (render_issue receives
+   result.failure_jobs — previously read from the wrong dict) with prefix-
+   tolerant normalization (name split at first space; grep -qw), asserted
+   with EXACT substrings (iC1) instead of the old weak stage-substring
+   check. Success validation additionally requires result.termux_sha to
+   equal the PINNED target.termux_ref — a success built from a different
+   source SHA is downgraded to verify (blocked + issue, iD1); candidates
+   carry artifact_verified=false (existence confirmation belongs to the
+   human device-gate fetch, never auto-claimed). classify_failure
+   whitelists stages — any unrecognized stage string becomes 'unknown'
+   and BLOCKS.
+4. Integration simulation (port/tests/maintenance_integration_test.py)
+   mirrors the Actions dataflow EXACTLY: engine invoked via CLI
+   (subprocess), state/plan/issues/running/result as FILES on disk, every
+   step re-reading from disk (never reusing decide's memory) — covering
+   approved-retry-then-block across days, lost-state relink with zero
+   builds, failure job names in bodies, foreign-termux-sha success
+   rejection, busy/issues-error regressions: 13/13.
+Totals: engine 46/46, static 36/36 (s35 relink wiring, s36 prefix
+normalization), revision 4/4, integration 13/13, harness 46/46.
+
+### Round 15.4 — final acceptance & operational readiness (close of dev rounds)
+
+Boundary fix (approval vs lost state): the retry-approved consumption now
+lives on GITHUB ITSELF — the outcome job's FIRST mutation step deletes the
+`retry-approved` label from the approving issue before classify/apply/push.
+One approval = one attempt is therefore durable even when the maintenance-
+state push fails (iF1b: push lost + label consumed -> next run blocked).
+If label removal fails, apply+push still record consumption (backstop); a
+re-attempt then requires BOTH the GitHub API and the state push to fail
+persistently — bounded and documented (iF1c shows the sole fallback path,
+which still creates exactly one more attempt, never an unbounded daily
+loop, because removal succeeds on the next outcome run). Manual re-approval
+(still works: re-add label. No new approval system was introduced.
+
+Integration suite extended to the full operational matrix (file-based,
+CLI subprocess — identical dataflow to Actions jobs): new-version build,
+identical-skip, port-input-change revision build, success->candidate,
+failure->issue+block, infra exactly-one-retry (iF2a-d), approval exactly-
+one (iA/iF1), approval-fail+push-lost -> blocked (iF1b), issue-created+
+ledger-lost -> no duplicate (iF6), lost-state relink (iB), SHA/version
+mismatch -> verify rejection (iD1/iF5), dry-run guards (static s13/s35),
+validated block byte-identical across every scenario (iF7). Static s37-s39
+verify the WORKFLOW SHELL semantics themselves: non-404 state errors abort,
+classify covers success/cancelled/failure|timed_out/skipped/* and hard-
+requires a non-empty result.json, label-consume precedes classify.
+
+Operational settings review (design KEPT as-is):
+- permissions: evaluate = read-only trio; build = none (inherits file);
+  outcome = issues:write + contents:write (single hardcoded Contents-API
+  path/branch) + actions:read. No pull-requests, no deployments.
+- maintenance-state: bot-only branch; pushes carry GITHUB_TOKEN (cannot
+  self-trigger). Recommend (owner) branch protection = admin-only pushes
+  with the Actions actor allowed; history is the audit ledger.
+- labels auto-provisioned (auto-build-blocked + classification/*) with a
+  hard existence check before any issue write.
+- duplicate builds impossible: daily concurrency group + build-chromium
+  serial group + evaluate busy-check (actions API, fail-closed as busy).
+- manual vs automatic share the SAME serial group — never overlap; a
+  running ~1h build is never cancelled.
+- retention: recommend 90 days (owner setting). Expired artifacts keep the
+  state ledger (ci_url + sha remain); rebuild = human dispatch.
+- usage: daily probe+decide = minutes; one full build only when inputs
+  actually change (signature-gated) — typically once per upstream release.
+- seed consistency: #31 recorded with its REAL plain version and full
+  identity fields (static s18/s18b/s19/s20 cross-check port.toml).
+
+Transition plan:
+  Phase A (this round): all code/test/state-transfer verification COMPLETE.
+  Phase B (separate approval): ONE non-dry-run dispatch on the PR branch
+    (or post-merge) exercising probe -> decide -> real build -> outcome ->
+    candidate ledger end to end. validated 156 stays untouched by design.
+  Phase C (separate approval): merge PR #1; the 09:23 KST schedule becomes
+    live on the default branch.
+
+Totals: engine 46/46, static 39/39, integration 25/25, revision 4/4,
+harness 46/46. Verdict: GO (see final report).
+
+### Phase B (first real build, run 40098664387) + Remediation
+
+Real dispatch (dry_run=false) executed the pipeline end-to-end for the
+first time: evaluate seeded state, decided BUILD `156.0.8078.47-2`
+(sig fec82d2d32ef91de; termux drifted to 2af83c387...), TERMUX_SANDBOXED_
+REVISION=2 propagated correctly, gate job PASS, called build died at
+prepare (40s). Outcome behaved EXACTLY as designed: failure classified
+unknown (fail-closed), Issue #2 created with full sig + labels, blocked,
+no candidate, validated 156 untouched; follow-up dry-run re-decided
+`skip / open-issue-exists` proving durable duplicate protection even with
+the state branch never created (push had failed). Verdict was NO-GO on
+three concrete defects, all remediated here with minimal scope:
+
+A  Real upstream drift: at 2af83c387 chromium/build.sh uses QUOTED
+   TERMUX_PKG_VERSION="156.0.8078.47"; align_versions' bare-only regex hit
+   None.group(1). Now parses bare/double/single quotes, preserves the
+   file's quote style on rewrite (lambda replacement keeps surrounding
+   characters), raises RecipeError on unrecognised shapes, and is tested
+   against the REAL recipes at 2af83c387 pinned as fixtures
+   (port/tests/fixtures/real_*_2af83c3), including align-to-host-tools,
+   SHA256 swap from mocked release hashes, revision-2 injection on the
+   quoted file, and bash -n. Source SHA256/patch contracts untouched.
+B  issues.json guard now typed (`if type=="object"...`) — normal arrays
+   (empty or populated) parse cleanly; only the error object fails closed
+   (tests B:*).
+C  State-push bootstrap is honest: branch probe distinguishes legit
+   404-absent from real API errors (both logged), POST git/refs errors
+   are NOT swallowed (`> ref-create.json` kept), existence is re-verified
+   before any PUT, and create-file vs update-file are separate explicit
+   paths with a loud probe-failure branch. maintenance-state documented
+   as what it actually is: a REGULAR branch from the default-branch head,
+   not an orphan (README/workflow text corrected).
+D  Called-workflow jobs are named '<caller job> / <called job>' (observed:
+   'Reusable build (only when decided) / build'). The split-at-space
+   parser saw 'Reusable' -> stage unknown + log unavailable. Now extracts
+   the segment after the LAST '/', ltrim-str, then split-space; job id
+   comes from the same filtered set; log-download failures record the
+   actual gh/HTTP stderr plus job id (never silent). Fixture uses the
+   REAL names from run 40098664387 (tests D1-D3); unknown-still-blocks
+   policy retained.
+
+Test totals after remediation: engine 46/46, static 43/43 (s40-s43 new),
+integration 25/25, recipe/fixtures/classify 10/10, revision 4/4,
+harness 47/47. NO new real build was executed during remediation.
+
+### Phase B pre-revalidation hardening (final, before single re-build)
+
+Two review findings closed with minimal scope:
+A. State bootstrap contract alignment: first-run `maintenance-state`
+   creation now resolves the REPOSITORY DEFAULT BRANCH via the repo API
+   (`--jq .default_branch`) and takes that exact commit SHA for POST
+   git/refs — previously `github.ref_name` meant a dispatch from the PR
+   work-branch would fork state off the feature head, violating the
+   'default-branch head' contract. Existing branch is never recreated;
+   non-404 probe errors still abort; POST is unswallowed; existence
+   re-verified before PUT; create-file vs update-file paths remain split.
+   Static s40 asserts default_branch SHA is the actual POST input and
+   github.ref_name is absent from the push step.
+B. Strict version parsing: ONE shared VER_STRICT parser for recipe and
+   host-tools — bare/"..."/'...' dotted versions only, leading indent and
+   trailing spaces/#comment tolerated (and PRESERVED on rewrite via
+   captured trailing group), junk suffixes ("...47junk"), mismatched
+   quotes, spaced assignments and empty values NO LONGER partially match:
+   recipe path raises RecipeError, host path returns None (align no-ops,
+   upstream's own comparison remains the backstop). 12 boundary cases +
+   comment-preservation rewrite + align junk rejection tested (B-parser).
+Harness after hardening: engine 46/46, static 43/43 (s40 strengthened),
+integration 25/25, recipe/classify 11/11, revision 4/4, harness 47/47,
+CI selftest green. No real build executed; Issue #2 blocked; validated
+156 intact. Verdict: GO for the single non-dry-run Phase B revalidation.
+
+### Phase B final parser boundary (bash comment parity)
+
+VER_STRICT trailing group was `([ \t]*(?:#.*)?)$` — accepted `#junk`
+WITHOUT preceding whitespace. Bash reality (empirically checked):
+`VAR=1.2.3#junk`, `VAR="1.2.3"#junk`, `VAR='1.2.3'#junk` all assign the
+JUNK-CONTAINING value `1.2.3#junk` — the parser partially matching them
+as 1.2.3 violated fail-closed/bash-parity. Fixed to
+`([ \t]+#.*|[ \t]*)$`: a comment requires >=1 whitespace before '#';
+bare/quoted forms and legitimate ' #comment' / '\t#comment' trailers
+still pass (and are preserved verbatim through alignment rewrites, group
+4 unchanged); `=1.2.3junk` remains rejected. New C-boundary suite (13
+PASS total): 10-case table (accept/reject) + per-case EMPIRICAL bash
+assignment comparison (reject set must never be a clean dotted value in
+bash) + comment-preservation rewrite + recipe RecipeError / host-tools
+None. No other logic touched.
+
+## Phase C.2 — final acceptance hardening (test tooling + schedule safety)
+
+A. gui_extra.py verdict integrity: unconditional `return 0` removed. A
+   pure evaluate_verdict(checks) gate (REQUIRED 9 checks; missing keys,
+   pass!=True, exceptions and timeouts all FAIL; OPTIONAL
+   gpu-info-page/downloads-list-item recorded with status and can never
+   flip the verdict) now drives JSON verdict, console output and process
+   exit code identically. Regression matrix (11 scenarios incl. no-window,
+   sha-mismatch, no-completion-event, missing-key, webgl-fail,
+   chooser-fail, optional-only-fail, pass=None) in
+   gui_extra_verdict_test.py, wired as harness [40]; additionally proved
+   LIVE: DISPLAY=:99 injection -> rc=1 with missing_required populated
+   (the pre-fix tool returned 0 there), rerun rc=0.
+B. ws_proof.py now launches through the OFFICIAL packaged shield wrapper
+   (no direct chrome exec, no hand-rolled LD_PRELOAD): 20/20 bidirectional
+   with content-exact m0..m19, PROOF-20 witness, 0 errors, full cleanup.
+   Prior direct-exec results retained only as supplementary.
+C. downloads-ui split into downloads-page-reached (title) and
+   downloads-list-item (REAL item proof): DOM.getFlattenedDocument
+   depth=-1 pierce=True over the WebUI shadow DOM — big.bin hit x5 of 377
+   nodes. If the DOM domain were unreadable the check is recorded
+   INCONCLUSIVE (optional), never a silent PASS; title alone can no
+   longer satisfy any gate. File-level download-gui-cdp (completion event
+   + sha256) remains the transport proof.
+D. Consistency audit of Phase C/C.1 evidence (census rows, causality
+   cohort, broker inodes, soak 45r/540, ANGLE/Vulkan strings) — verdicts
+   match raw files; no overstated PASS found beyond the two defects fixed
+   in A (exit code) and C (title-only UI claim).
+E. ACTIVATION POLICY: on.schedule REMOVED from daily-maintenance.yml.
+   Merging PR #1 activates NO automation — workflow_dispatch only
+   (dry_run default true, approve_retry retained). Restoring the
+   09:23 KST cron requires a dedicated follow-up PR with owner approval.
+   Static s8 now asserts the ABSENCE of any schedule trigger and the
+   presence of both dispatch inputs.
+F. Regression: static 43/43 (s8 rewritten), engine 46/46, integration
+   25/25, recipe 13/13, revision 4/4, verdict 11/11 (new [40]),
+   harness 48/48, ci.sh selftest green. No new Chromium build; device
+   evidence regenerated via the official wrapper (ws + gui-extra PASS,
+   downloads list item proven). main-device symlink removed after tests
+   (extract retained).
+
+## Final acceptance (2026-10-25) — VALIDATED — MANUAL MAINTENANCE ONLY
+
+PR #1 merged as 4a4e0585 (no schedule triggers anywhere).
+Validated promoted (separate auditable commit, human-approved): upstream
+156.0.8078.47, deb 156.0.8078.47-2, sha256 cf2cb2a8...abd4151ba8d, run
+40104615699, termux de1dd3d1..., sig ad5b0fdb8c7a9777, port provenance
+554da59a...; #31 baseline preserved (device_gate_history[0], state
+candidates[0]). maintenance-state CAS-promoted to a6417d6a with explicit
+manual-promotion history event; artifact_verified=true (live download
+sha256 match); engine retains ZERO validated-write authority (static
+tests s17-s20 verify the promoted baseline EXACTLY and #31 history).
+Operational policy: schedule OFF, dispatch-only (dry_run default true),
+no builds without explicit approval, Release/apt never automatic; new
+upstream versions require the full CI + device-gate cycle again; failed
+signatures stay blocked (Issue #2 history untouched).
+
+## Automated maintenance activation (2026-10-25) — AUTOMATED MAINTENANCE / MANUAL PROMOTION
+
+Operational runbook (activation PR):
+1. Schedule: cron 23 0 * * * UTC (09:23 KST); delivery delay tolerated, not a PASS criterion.
+2. Detection: ChromiumDash Stable + termux HEAD-pinned recipe/host-tools blobs; validated/last-success compare; build signature = (aligned-version, recipe-blob-sha, host-blob-sha, port-inputs-hash).
+3. Auto-build condition: NEW signature only (identical inputs skip; candidates dedup; termux drift alone never rebuilds; concurrency serial; in-flight build respected).
+4. Failure classes: gate/verify->port BLOCK+Issue; build+transient->infra exactly ONE retry then BLOCK+Issue; unknown->BLOCK (fail closed); cancelled/skipped->history only.
+5. Blocked signatures: skip; unblock = changed inputs, `retry-approved` label (one-shot, consumed on GitHub + state) or `approve_retry=true` dispatch.
+6. Duplicate-build prevention: signature dedup + daily/build serial groups + running-detect (API error = busy = fail closed).
+7. Device gate: humans only (procedure: Phase C battery — bpf_evidence phases, GUI/X11, downloads, audio, soak).
+8. Validated promotion: humans only via port.toml + maintenance-state CAS (this PR did NOT touch validated; s17 guards engine authority=0).
+9. Releases/apt: never automatic; separate approvals.
+10. Emergency stop: `gh workflow disable daily-maintenance.yml`; recovery: enable + rerun (idempotent).
+11. Retry approval: label on open block issue (exact full-sig title) or dispatch flag.
+12. Manual paths preserved: dry_run default true via dispatch; schedule NEVER approves retries (mode normalization test matrix s44a-e; no implicit GHK coercions, s45).
+Baselines preserved: #31 history + 156.0.8078.47-2 validated (cf2cb2a8...abd4151ba8d).
+
+## Round 16 — Automated Maintenance Safety Hotfix (mode fail-closed + signature schema v2)
+
+### Stage A — dispatch fail-closed (daily-maintenance.yml, `mode` step)
+The step starts from `DRY=true` / `APPROVE=false` (fail-closed) and reads
+event+inputs ONLY through step-level `env:` (no inline `${{ }}` in the
+script body). Exactly two paths may enable a real build:
+1. `schedule` — the activated auto-candidate purpose; inputs are NOT read
+   (stray input strings cannot flip it; approve is forced false).
+2. `workflow_dispatch` with an EXPLICIT `dry_run=false` string — the human
+   go-ahead for an approved manual build.
+Missing input (renders as the empty string), unknown values (`yes`, `null`,
+`0`, …), and any unsupported event stay dry-run => build forbidden.
+`approve_retry` is honored only on dispatch, still one-shot/label-consumed
+(Round 15.3 contract unchanged). Regression: s44-sig, s44a–j, s47 (initial
+assignment must be `DRY=true`), s45 (no implicit coercion patterns).
+
+### Stage B — Signature schema v2 (build inputs vs audit records)
+`build_signature` gained `sig_version` (default 2). v1 stays frozen
+(history is never re-hashed); v2 payload is tagged `sigv2` so a scheme
+switch can never masquerade as a semantic input change.
+Port-input hashing v2 (`port/maintenance.py port-input-hash`):
+* the four RAW contract files — `chromium_sandbox_port.py`,
+  `prepare_recipe.py`, `gnp_shim.c`, `ci.sh` — are hashed by content
+  fingerprint (sha256[:40] of the file bytes; any byte change counts;
+  deleted file => MISSING sentinel, still distinct; the engine itself
+  stays ZERO-exec/pure — s22 invariant);
+* `port.toml` is hashed SEMANTICALLY: parse with tomllib -> drop ONLY the
+  exact audit-record denylist -> `json.dumps(sort_keys, compact, ascii)` ->
+  sha256[:16]. Comments, key order and byte layout of excluded records are
+  irrelevant (deterministic).
+HASHED (contract): `[port] version/phase/policy_mode`, `[termux] *`,
+`[sandbox] *` (mode, namespace_layer, setuid_sandbox, require_bpf_policy,
+bionic_guard), `[rules] r1..r9b` patch markers, `[gates] binary_markers,
+required_media_codecs, require_bpf_per_process, bpf_evidence_script,
+bpf_evidence_phases, broker_socket_inode_inode_proof, causality_control`,
+`[forbidden] items` — plus EVERY key not on the denylist (conservative
+default: new/unknown fields can never be silently ignored).
+EXCLUDED (audit records, proven zero-build-impact):
+`[port] last_validated_port, last_validated_chromium,
+last_validated_deb_version, last_validated_deb_sha256, last_validated_ci_run,
+last_validated_termux_sha, last_validated_build_signature,
+last_validated_port_commit, last_validated_promoted` and
+`[gates] device_gate, device_gate_history`.
+Proof of zero impact: port.toml has NO reader in the build chain —
+`prepare_recipe.py` copies it verbatim into the recipe BUILDER_DIR as an
+audit ledger (`shutil.copy2`); the generated hook runs only the transformer
++ rule-count gate; ci.sh never parses it; BUILDER_DIR is not packaged into
+the DEB. A future audit-only key must be proven likewise before being added
+to `TOML_METADATA_ONLY` (exact keys, code-reviewed); until then it is
+fail-safe counted as a build input.
+
+### Stage C — v1 history compatibility (audited migration, no rewrite)
+`maintenance/signature-migrations.json` registers the single v1→v2
+equivalence for the validated rev-2 baseline:
+v1 `ad5b0fdb8c7a9777` (recipe `7c5c20eb1182e197`, host `34b799517be2a99a`,
+legacy raw port hash `d98814c2a3feee8a` @ build commit
+`554da59a8f021bc65f9c3aab4c25841a0768f373`) == v2 port-input hash
+`7f86b30313338792` (semantic toml hash `fbf559c15b61e310`), so current
+inputs re-sign as v2 `35af420388ac5a5f` WITHOUT a rebuild.
+Key-level proof: between the rev-2 build commit and main, only
+`[port].last_validated_*` and `[gates].device_gate(_history)` changed — the
+four raw contract files are blob-identical.
+Engine guarantees (decide time, every run):
+* equivalence is RECOMPUTED from fresh measurements — the entry must match
+  aligned_version + recipe_sha + host_sha + v2 port-input hash exactly, and
+  status must be `approved`; stale/revoked/forged entries grant nothing;
+* v1 history (signature, ci_run, deb sha256, provenance) is NEVER rewritten;
+  new ledger entries carry `signature_schema: 2`;
+* blocked entries/issues keyed by an equivalent v1 sig are still HONORED
+  (fail-safe toward blocking); malformed migrations JSON aborts the run
+  (fail-closed); absent file = no equivalence (safe toward building);
+* SKIP is only ever granted via this re-proven path — change detection for
+  anything real (BPF rules, patches, shim, recipe, host pin, upstream)
+  remains fully active (verified by engine tests R3/R3b/R4/R10 and the
+  Stage C simulation matrix).
+
+## Round 17 — Automated GitHub Pre-release publishing (v2: self-contained workflow_run)
+
+Policy: CI-verified candidate DEBs publish automatically as GitHub
+**Pre-releases**; device validation is the downloading user's
+responsibility (CI VERIFIED — DEVICE NOT VERIFIED); stable/apt/validated
+promotions remain separate human approvals. Existing builds (incl.
+validated rev-2) are NOT back-published — only runs completing after
+activation can publish.
+
+### Instance constraint discovered (why NOT a called reusable job)
+The first design (PR #7) made the publisher a reusable workflow called
+with `uses:` + caller `permissions: contents: write`. On this GitHub
+instance that produced **startup_failure** on every dispatch; bisection
+(runs 40217322460…40220026845, revert PR #8) proved: caller-side
+`permissions:` on `uses:` jobs and elevated `actions: write` on ordinary
+jobs are both REJECTED at workflow start, while `contents: write` at the
+TOP of a standalone workflow is accepted (and outcome's historic
+job-level contents/issues write keeps working). Round 17 v2 therefore
+uses ZERO caller-side wiring:
+
+* `.github/workflows/publish-release.yml` — a standalone **workflow_run**
+  workflow (`on: workflow_run: [Daily Maintenance, Build Termux Chromium
+  Seccomp Sandbox Port] types:[completed]`), top-level
+  `permissions: contents: write` (the repo's only write scope), constant
+  concurrency group serializing publishes. Job-level condition:
+  `conclusion=='success' && head_branch==default_branch`.
+* `daily-maintenance.yml` — UNCHANGED from Round 16 (proven by static
+  s51: no publisher references, no elevated permissions, no
+  `gh workflow run`).
+* `build-chromium.yml` — gained ONLY a `publish` boolean dispatch input
+  (opt-out). No permissions, no publisher wiring (static s52).
+
+### Decision flow (all fail-closed, publisher-side)
+1. **classify** (real bash, tested via env injection g1–g7): workflow name
+   decides `source=maintenance|manual`; unknown workflow / manual
+   `publish=false` opt-out / malformed run-id/head ⇒ no-op or step fail.
+2. **provenance audit** via API: run `completed+success`, artifact
+   `build-<run>` uniquely present & non-expired; artifact downloaded
+   BY RUN-ID (uploads run under `if: always()`, so existence proves
+   nothing — success must be PROVEN).
+3. **ledger gate re-executed** for maintenance (jq tested g8–g12):
+   maintenance-state `last_successful_build` must show
+   `ci_run==<this run>`, `BUILD_VERIFIED_CANDIDATE`, 64hex sha, 16hex
+   signature — dry-run/skip/blocked/failed/lost-push → `SKIP_REMAIN=true`
+   no-op SUCCESS (never an accidental release). Manual path has no ledger
+   contract: expectations derive from the artifact itself (dpkg identity +
+   measured sha), and the signature stays null — NEVER fabricated.
+4. **verify** (15 integrity checks incl. dpkg-deb -f/-I/-c shield members,
+   pins, basename-dedup) → **plan** (dedup/collision/resume) → **execute**
+   (draft → assets → byte-verify → flip `--draft=false --prerelease` →
+   post-publish API re-read; success claimed only from the re-read).
+5. Publisher code is checked out from the DEFAULT branch (supply-chain),
+   not the triggered run's head.
+
+### Build vs publish separation (core requirement)
+The publisher never imports maintenance.py, never writes
+maintenance-state, and cannot reclassify builds (static s53). A red
+publish run leaves build verdict + candidate ledger intact; recovery is
+`gh run rerun <publish-run>` (or the next nightly) — artifact-only,
+NEVER a Chromium rebuild. Exit-code contract: 0 published / already
+-published, 1 integrity refusal, 2 collision/foreign-ownership (human
+review; existing objects untouched), 3 transient (draft kept unpublished).
+
+### Dedup & naming (unchanged from v1)
+Tag `chromium-sandboxed-v<dpkg Version>` on the repo build commit;
+title `Chromium Sandbox <version> (CI Candidate)`. Same tag+sha →
+idempotent skip; same tag different sha → collision stop; foreign draft →
+untouched; owned draft (`tcs-publish-run` marker) → safe resume.
+Assets: DEB + `SHA256SUMS.txt` + `build-manifest.json` (+ secret-scanned
+logs). Notes: CI VERIFIED — DEVICE NOT VERIFIED + user device checklist
++ no-`--no-sandbox` advice.
+
+### Operations
+* Emergency stop of publishing only: `gh workflow disable
+  publish-release.yml` (nightly builds/ledger unaffected).
+* Manual (re)publish for a specific successful default-branch build:
+  `gh workflow run build-chromium.yml` already triggers via workflow_run;
+  or re-run the failed publish run directly.
+* Tests: `port/tests/publish_test.py` 49 checks (19-row required table +
+  g1–g16 workflow_run classify/ledger/invariants), static s50–s52f +
+  s46 across all three workflows, harness 50/50 RC=0, selftest RC=0.
+
+## Round 18 — Pre-release publisher reliability hotfix (exit-code fidelity + candidate lookup)
+
+Independent audit of Round 17 found two reliability defects; both are
+fixed here WITHOUT touching build/ledger/classification contracts.
+
+### Defect A — negated-if masked publisher failures as success
+The Execute step wrapped the publisher in `if ! python3 ... execute; then
+rc=$?; exit "$rc"; fi`. Bash sets `$?` to 0 inside a *negated* if-body, so
+`rc` was always 0 and a failed publish could exit GREEN. Reproduced
+locally (legacy form: injected rc 3 → captured 0; fixed form: captured 3).
+Fix: positive `if cmd; then …ok…; else rc=$?; …exit "$rc"; fi` — `$?` is
+first-statement in the else branch before any other command can clobber
+it. Full exit contract now propagates verbatim to the Actions job:
+0 published/idempotent-skip → SUCCESS; 1 integrity, 2 collision,
+3 transient → FAILURE with the same code. Audit of all workflow/port
+shell for `if !` + `$?` shapes found no other instance (remaining
+`if !` uses are pure branch predicates with hardcoded handling —
+legitimate no-ops, not masking). While testing the REAL step body in
+bash, a second latent defect surfaced: the failure message contained
+unescaped backticks around `gh run rerun …` — inside double quotes bash
+performs command substitution, so the ERROR HANDLER ITSELF would have
+executed gh on every publish failure (and hung tests). Backticks removed.
+Lesson encoded: failure paths must be executed, not grep'd
+(`port/tests/publish_test.py` e-series runs the extracted Execute step
+against an rc-stub: 0→success, 1/2/3→exact-code failure, plus a LEGACY
+negative control proving the old form masked rc 3, and a no-success-summary
++ rerun-only-recovery assertion).
+
+### Defect B — late publishers missed candidates replaced in last_successful_build
+The ledger gate compared only `last_successful_build.ci_run == run-id`.
+With consecutive builds or workflow_run queue delay, run B's success
+overwrites `last_successful_build`, and publisher A (starting late) found
+no match → candidate A silently never published. Fix: read-only
+`port/publish_release.py ledger-lookup --state S --run-id R --out O`
+(collects claims from last_successful_build AND every candidates[] entry
+with ci_run==R):
+* every claim must satisfy the shape contract: status
+  BUILD_VERIFIED_CANDIDATE, concrete deb_version, 64hex deb_sha256,
+  16hex signature, 40hex termux_sha; `validated` is NOT required (CI
+  success ≠ device verification);
+* claims that exist but are malformed or mutually contradictory (same
+  run id, different version/sha/signature/pin) → rc 1 REFUSE (red) — a
+  broken claim is never downgraded to a green no-op;
+* currently blocked signature (blocked map) → rc 1 refuse (blocked builds
+  never auto-publish; Issue #2-style blocks are honoured);
+* NOTHING claims the run → rc 4 = normal no-op (dry-run/skip/failed runs
+  have no claim by contract; absence of a claim is never guessed into a
+  candidate, and artifact existence alone remains insufficient);
+* never writes state; EXPECT_* values flow from the ledger record and the
+  derive step re-checks the downloaded artifact against them (x-series:
+  version or sha mismatch vs ledger → refuse).
+Queue-order independence verified (l-series): A published from candidates[]
+while last=B; both A and B publishable; duplicates tolerated only when
+byte-identical; empty state → 4. Same-version different-bytes A/B still
+ends in the existing collision policy (no overwrite, rc 2).
+
+### Scope discipline
+daily-maintenance.yml, build-chromium.yml, maintenance.py, port.toml,
+state.seed.json and all security/build-contract files: UNCHANGED
+(verified by diff + static s51/s52). Publisher keeps zero caller-side
+permissions and no actions:write (instance startup_failure invariant).
+Round 18 statics: s50g (ledger-lookup precedes artifact probe), s57
+(positive-if enforced, negated wrapper banned, first-statement rc),
+s58 (exact-code propagation, no unescaped backticks in executable step
+code), s59 (lookup is read-only), s60 (publisher never PUTs state or
+creates issues). Suite: publish 64 checks (19-row table + classify +
+l1–l11 + e1–e6 + x1–x3), static 76/76, harness green, selftest RC=0.
+
+## Round 19 — R12: renderer Bionic set_tid_address allow (Issue #12 root cause, 2026-10-28)
+
+Root cause (CONFIRMED, Issue #12 comment 6450693236; full evidence
+chromium-evidence/r11-sigsys-investigation/REPORT-R11-SIGSYS-INVESTIGATION.md):
+the renderer baseline chain routes __NR_set_tid_address to CrashSIGSYS
+(baseline_policy.cc IsBaselinePolicyAllowed -> SyscallSets::
+IsAllowedProcessStartOrDeath default:false fall-through, syscall_sets.cc).
+Bionic's detached-pthread exit calls set_tid_address(NULL) immediately
+after rt_sigprocmask(SIG_BLOCK, ~[]) blocks every signal; a seccomp
+RET_TRAP delivered to a thread with SIGSYS blocked is force_sig'd by the
+kernel — Chromium's SIGSYS handler never runs, crashpad never fires, and
+the WHOLE renderer dies with raw wait-status 31 (the historical tab
+deaths shown as RESULT_CODE_INVALID_SANDBOX_STATE). 21/21 instrumented
+strace captures show si_syscall=__NR_set_tid_address si_code=SYS_SECCOMP
+si_errno=EPERM (trap index 1); control traps (openat/sched_getparam) on
+UNBLOCKED threads ran the handler (rt_sigreturn) and survived — proving
+blocked-mask force_sig as the silence mechanism, not a missing handler.
+Upstream Android allows the exact syscall unconditionally in
+BaselinePolicyAndroid (baseline_policy_android.cc:188); this port builds
+os=linux (IS_ANDROID=false) so that list is compiled out — the same
+bionic blind-spot class as R3 (prctl PAC) and R9a (getsockopt SO_DOMAIN).
+
+Fix (R12, experimental candidate): RendererProcessPolicy::EvaluateSyscall
+gains exactly ONE case arm under #if defined(__BIONIC__) —
+`case __NR_set_tid_address: VLOG(1) << marker; return Allow();` — plus the
+guarded base/logging include. Renderer-only (the observed death site;
+zygote covered by R4, GPU BPF never engages on device, network utility has
+its own policy), no parameter relaxation, no disposition (KILL/TRAP)
+change, no other syscall touched. Verifier gates: marker count == 3
+(include+comment+VLOG), approved block verbatim once, set_tid_address arm
+exactly once, guarded include present; contract suite
+port/tests/r12_set_tid_address_test.py (19 checks incl. drift/missing/
+dup-arm/unguard/widened/killswap negatives); harness [47]-[51]; CI package
+gate greps R12 APPLIED; binary strings gate via port.toml binary_markers;
+runtime per-activation gate = VLOG line count == Activated-renderer count
+(--v=1). Non-bionic desktop builds: preprocessor strips the block — byte
+behavior unchanged.
+
+Gate (REGRESSION.md §Experimental R12): candidate DEB built from this
+branch ONLY (workflow_dispatch publish=false, revision 12, termux pin
+de1dd3d1); extract-only execution (NEVER dpkg — installed -4 untouched);
+E-burst >=40 consecutive with ZERO renderer SIGSYS deaths is the core
+regression gate against the -4 baseline (8/8 = 100% burst reproduction);
+instrumented strace must show set_tid_address returning 0 with no SIGSYS;
+census invariants renderer Seccomp=2 filters=2 NNP=1; dangerous-syscall
+block matrix via static per-syscall policy citation + live trap controls
+(openat/sched_getparam traps still fire + rt_sigreturn survival) + P2b
+causality (--disable-seccomp-filter-sandbox 2->1). Promotion, publication,
+validated-state and Publisher untouched — separate approvals required.
+
+## Round 20 — CI cache layers (perf/ci-cache-layers, evidence-driven)
+Motivated by the 40662494279 forensics (issue #12 audit trail): pre-ninja
+dependency downloads collapsed (19 × curl(28) to packages-cf.termux.dev) and
+the job later hung 2.5h before timing out mid-compile — compilation itself
+was never the bottleneck while warm caches existed. Three tiers now cooperate:
+
+1. **Dependency tier** — `.termux-depcache/aarch64` ↔ container
+   `_cache-aarch64` (bind volume + actions/cache). Integrity is delegated
+   VERBATIM to the official pipeline: Release(+.gpg) is always re-fetched and
+   `gpg --verify`-ed per run (`termux_get_repo_files.sh`); Packages/.deb names
+   are content-addressed with hashes from that verified metadata and
+   re-checked by `termux_download` (sha256-skip cache). Corrupted or
+   version/arch-mismatched entries self-heal by re-download (tests T1–T5).
+   Prune: 30d age + 2 GiB cap (env override), path-fenced.
+2. **sccache tier** — unchanged storage, hardened keys: restore key
+   `chromium-sccache-aarch64-<base>-<run>` with dual prefix fallback
+   (`<base>-` then legacy), `base = sha256(termux_sha|REVISION|port-input-hash)`;
+   in-container 10-min `SCCACHE_TICK_JSON` (stats JSON + file count) makes
+   hits/misses observable DURING the build; the 30-min watchdog now demands
+   real progress (ninja start or nonzero compile counters) instead of raw
+   file counts; `timeout 14400` converts a hang into a natural failure so
+   diagnostics/artifact steps still run before the 350-min job kill.
+3. **Completed-DEB tier** (input `allow_deb_reuse`, default true) —
+   actions/cache under `chromium-deb-v1-<debkey>`, where
+   `debkey = sha256(pkg|rev|arch|upstream-version|termux_sha|port-input-hash|recipe-dir|repo.json|builder-image)`.
+   Restore alone never skips work: the fail-closed verifier requires
+   manifest-matched deb sha256 + key equality + dpkg metadata + chrome-binary
+   sha256 + `r12-bionic-tid` marker; package security gates ALWAYS re-run
+   against whatever lands in `output/`. Any policy/patch/recipe/repo change
+   flips the key → full build. `reuse-decision.json` records the outcome.
+4. **Download resilience** — `download-preflight` probes every repo.json
+   entry (bounded curl, speed-timeout) and fails the job in <10 min rather
+   than hours of curl(28) loops; switches only between whitelisted official
+   hosts (packages.termux.dev / packages-cf.termux.dev); non-official hosts
+   abort; effective repo.json hash is in the deb key (provenance-visible).
+Protections re-tested, never weakened: seccomp policy files byte-identical
+(T15), no `contents:write`, no fallback mirror, no gate bypass, a cache-save
+failure can never flip build success, and code-level `rm -rf` of runner
+cache paths is forbidden (T14) preserving the node24 fix.
+
+## Round 21 — Docker bind-mount parent fix + real-container smoke contract
+
+Post-mortem run 40717335376 (15:38:47Z): `mkdir: cannot create directory
+'/home/builder/.termux-build/chromium-sandboxed': Permission denied`,
+BUILD_RC=1 before ninja. Root cause (proven by the pinned upstream
+`scripts/run-docker.sh`): the Termux builder reuses ONE detached container;
+dockerd creates any *missing* bind-mount target path **as root:root** inside
+the image's filesystem. Our Layer-1 mount targets
+`/home/builder/.termux-build/_cache-aarch64`; the image never ships
+`.termux-build` (upstream creates it at build runtime as builder), so the
+leaf mount made dockerd plant a root-owned `.termux-build` parent and
+`build-package.sh` lost write access to its own top dir. The sccache mount
+never showed this because nothing mkdirs *beside* `.cache/sccache` —
+bind-mounted leaves inherit host-dir uid semantics, only intermediate
+parents are root-created.
+
+Fix (ownership-correct, minimal, no `chmod -R 777`, no new mounts):
+`Dockerfile.chromium-sccache` pre-creates `/home/builder/.termux-build/
+_cache-aarch64` and `/home/builder/.cache/sccache` `chown -R builder:builder`
+in the image. `.termux-build` is deliberately NOT bind-mounted at its own
+level — it also hosts non-cache state (`chromium-sandboxed` build dir,
+`_cache/python-3.14` host-tool artifacts); only the per-arch download leaf
+is mounted.
+
+Contract now *verified in the real container* by `docker_perms_smoke`
+(prepare-builder runs it twice: fresh create + after `rm -f` recreate):
+uid/gid + `docker inspect` Mounts + host dir ownership evidence,
+/proc/mounts rows for BOTH volumes, mkdir under `.termux-build`,
+create/read/remove inside it, dep-cache leaf write, restored dep-cache
+entries sha-readable (warm) or clean-empty (cold), sccache leaf writable
+simultaneously. Any failure aborts the job at ~20 min, not at timeout.
+
+Adjacent hardenings in this round:
+* preflight now demands a *real* transfer — Release 200 AND a bounded 1 MiB
+  ranged GET of `binary-aarch64/Packages(.xz|.gz)` per repo entry; a
+  Release-200-only pass no longer blesses multi-hundred-MB dependency pulls
+  (run 40662494279 lesson). Redirects are followed but the EFFECTIVE host
+  must still be official (off-whitelist → hard fail); curl rc is preserved
+  next to http code (404 vs 28 vs 7 vs TLS distinguishable in the log).
+* `docker_smoke_only` dispatch input: infrastructure-validation runs stop
+  after prepare-builder; compile, package gates and deb-reuse steps are
+  gated there ONLY — every normal run executes the security gates
+  unconditionally.
+* Save-guard: sccache/dep-cache saves are skipped unless the dirs hold
+  ≥10/≥1 files. Early-failed runs previously archived empty caches under
+  real keys; restores then risked choosing an empty archive over an older
+  healthy one. Existing caches are never modified by a skipped save.
+* Completed-DEB reuse flipped to explicit **opt-in** (`allow_deb_reuse`
+  default false). The fail-closed verifier is strong, but until two
+  independent full builds prove cross-run key stability in production,
+  skipping compilation must be a deliberate choice, not a default.
+
+## Round 22 — DEB cache-key integrity (final image identity + final repo state)
+
+Two key-correctness defects closed with minimal edits (no redesign):
+
+1. **Image tag was not an identity.** `deb_key()` hashed
+   `TERMUX_BUILDER_IMAGE_NAME` — a mutable tag. Same tag can now mean
+   different image content (base `:latest` digest drift on the fleet,
+   apt package version changes inside the RUN layer, Dockerfile edits);
+   under the old key a DEB built in such a *different* environment could
+   have been served from cache. `deb_key()` now requires the FINAL
+   custom image's content id (`docker image inspect --format {{.Id}}`,
+   shape-validated `^(sha256:)?[0-9a-f]{64}$`, or an explicit
+   `TERMUX_BUILDER_IMAGE_ID` for docker-less audits) and FAILS CLOSED
+   without it. The build step re-inspects the image it is about to boot
+   and aborts on `IMAGE DRIFT` versus the key's image id (same-image
+   contract; inert when reuse is off — no new docker dependency there).
+   Image determinism note: the Dockerfile's apt layer is content-
+   deterministic per package version set; id churn therefore correctly
+   tracks security/package updates. We deliberately do NOT pin versions
+   (would suppress security updates); the cost of a rotated key is one
+   extra full build, never a wrong reuse.
+
+2. **Key was computed before the inputs it claims to cover.** The DEB key
+   step ran *before* `download-preflight` (which can rewrite repo.json
+   via official mirror-switch) and before `prepare-builder` (which
+   produces the final image). Ordering is now: recipe → sccache base key
+   (unchanged early position; its inputs do not mutate) → restores →
+   preflight → zram → prepare-builder → **compute final DEB key**
+   (post-preflight repo.json + final image id) → restore/verify completed
+   deb → conditional build (drift-checked) → package gates (unconditional
+   on normal runs) → guarded saves. All four consumers (restore key,
+   verify `DEB_KEY`, save manifest, cache-save key) reference the single
+   `steps.debkey` output; a mirror-switch failure path leaves no
+   REUSED=1 possible (preflight fails the job first).
+
+Regression coverage: T19 reproducibility (same id+inputs → same key),
+T20 image-id change → key change, T21a/b fail-closed (missing/malformed
+id, via docker-shim), T22 repo.json change → key change, T23 preflight
+MIRROR-SWITCH reflected in the final key (function-executed, not
+string-grep), T24 step ordering, T25 single-key identity + drift guard,
+T26 compile-skip vs always-gates, T27 smoke-only/opt-in invariants.
+Suite total: 43 cache-layer checks.
+
+Round 22 addendum (run 40823773715): the first production attempt of the
+post-prepare key step died fail-closed with
+`blob sha256:58a7… expected at /var/lib/containerd/io.containerd.content.
+v1.content/blobs/…: blob not found` — our free-space replacement (node24
+era) deletes containerd's CONTENT store at the end of prepare_builder.
+Upstream free-space.sh ran before any docker use; relocated into
+prepare-builder it silently broke image-config inspection (the build kept
+working only because run-docker reuses the already-created detached
+container whose snapshot is extracted). Correct ordering is therefore
+enforced in code: `docker build` -> record `image inspect .Id` into
+`$d/.builder-image-id` + verify live container `.Image == imgid` (both
+while blobs exist) -> cleanup -> later steps consume the FILE and the
+CONTAINER metadata only; the workflow never inspects the image after
+prepare (regression-pinned by T28).
+
+## Round 23 — deterministic builder-image fingerprint for the DEB key
+
+Task-C hypothesis CONFIRMED empirically: the raw `docker image inspect
+.Id` is NOT stable across rebuilds of identical inputs — run
+40825927463 recorded `7ccda63d…` and run 40834221022 (same commit,
+same base `:latest` digest `e2de051a…`, same Dockerfile) recorded
+`0b9d985a…`. The image config embeds a per-build `created` timestamp,
+so keying the DEB cache on the raw id rotated the key every run and
+made Layer-3 reuse unhittable (40834221022 hit `REUSED=0 no-cached-deb`
+and had to recompile).
+
+Fix: the DEB key now hashes `image_fingerprint = sha256(base image id +
+sorted `dpkg -W '${Package} ${Version}'` + Dockerfile content hash)` —
+three reproducible components. Security property preserved: any real
+environment change (base `:latest` drift, apt security update, Dockerfile
+edit) changes a component and rotates the key, so a stale DEB is NEVER
+reused under a different environment; an unchanged environment rebuilds
+to the same fingerprint and CAN reuse. We do not pin package versions
+(no security-update suppression); we do not map a changed image back to
+an old key. The raw docker image id is still recorded
+(`.builder-image-raw`) and the build step still asserts the live
+container's `.Image` equals it (same-image contract within a run); the
+fingerprint is recorded in `.builder-image-id`. Both are written by
+prepare_builder BEFORE the free-space step.
+
+Task-D: `prepare_builder`'s free-space subset no longer runs
+`rm -rf /var/lib/containerd/io.containerd.content.v1.content`. That
+directly gutted the docker daemon content store (broke post-prepare
+image inspection — run 40823773715; version-fragile; would starve other
+jobs on a shared runner) while disk pressure was absent (root fs
+94G avail / 36% used after the remaining cleanup). Replaced by
+daemon-managed `docker image prune -f` (reclaims the previous run's
+dangling rebuild of our tag). All node24 protections (forbidden
+runner-runtime paths) unchanged.
+
+Tests: T30a-e image_fingerprint determinism + base/pkg/dockerfile
+sensitivity + fail-closed; T31 deb_key reproducibility on the
+fingerprint; T32 no direct containerd/docker storage deletion +
+`docker image prune -f` present. T24/T28 updated for the two-file
+record. Suite 51 checks; full port suite 60/60.
+
+## Round 24 — L4: 지속 검증 소스 캐시 (perf/ci-source-cache, PR #24 후속)
+
+배경(A/B): PR #24 GO 이후 잔여 위험(R12 보고서 §N)이 실측으로 확인되었다.
+pinned de1dd3d1에서 소스 tarball은 `termux_step_setup_variables.sh:118`의
+`TERMUX_PKG_CACHEDIR=$TERMUX_TOPDIR/<pkg>/cache`로, arch-independent .deb는
+`$TERMUX_TOPDIR/_cache-all`로 내려받히며, 둘 다 컨테이너 overlay에만 존재해
+컨테이너 재생성 시 소실된다(L1 바인드는 `_cache-aarch64` 리프만 마운트).
+콜드 풀빌드 2건(fp-cold-full.log, keybuild2-full.log)의 다운로드 URL 목록은
+완전 동일(53건, ~2.19 GB) — 매 실행이 같은 파일을 다시 내리는 것이 반복 비용의
+정체다. ffmpeg.org curl(28)/(35)로 빌드가 사망한 40834221022가 실질 장애 사례.
+
+설계(C): upstream 방식 위에 최소 어댑터 — 스크립트 수정 없이 ci.sh 함수 2개
+(`source-cache-restore`/`source-cache-collect`)와 전용 바인드
+`.termux-srccache`(/home/builder/.termux-srccache, 이미지 레이어에서
+builder 소유 사전 생성 — Round 21 바인드-부모 교훈 준용).
+신뢰 모델은 3중 fail-closed:
+  1) 저장 게이트 — 파일 sha256 ∈ T. T = termux-packages 모든 */build.sh의
+     64-hex 선언 해시 ∪ 매 실행 GPG 검증되는 `<repo>-json` 인덱스의
+     SHA256SUM 값. SKIP_CHECKSUM/빈 SHA256 파일은 T에 진입 불가 → 영속
+     캐시에 무조건 미수용. 항목은 `<sha12>__<인코딩 이름>` 내용주소 저장
+     (동일 basename·상이한 해시 공존, 버전 변경 보존).
+  2) 복원 게이트 — 이름의 sha12 재계산 일치분만 tmp+원자 mv로 복사, 불일치
+     격리 삭제, 기존 타깃 절대 덮어쓰지 않음.
+  3) 빌드 게이트(upstream 무변경) — termux_download이 사용 시점에 레시피/
+     인덱스 체크섬으로 재검증, 불일치 시 재다운로드. 캐시 오염의 최악 결과는
+     재다운로드일 뿐이며 검증 우회는 구조적으로 불가능.
+Packages.gz 기반 ubuntu deb(mesa hostbuild)와 elf-cleaner은 선언 해시 집합이
+없어 v1에서 의도적 미포함(문서화 잔여 위험). `.termux-build`/`_cache` 통째
+바인드는 하지 않는다(host-tool 경로 보호, Round 21 불변).
+
+성능(D/I): DEB 재사용(4.4 min) 경로는 L4 스텝이 `reused != '1'` 게이트로
+전부 스킵 — 캐시 IO 0. 미스 시에만 ~2.3 GB 복원(콜드 빌드 90분 대비 분 단위),
+완전 워밍 시 collect new=0 → save 스킵으로 재업로드 없음. 저장 용량은
+cap(기본 6 GB, 실측 ~2.3 GB 대비 여유)+연령(45일) prune로 유계.
+save-gate(has_new)로 빈 캐시 승진 차단(Round 21 가드 철학 동일).
+
+검증(E): 캐시 스위트 T33a–j/T34a–i/T40 추가(72 checks) — cold/warm 바이트
+동일 + warm 무망(죽은 포트에서도 termux_download 즉시 return), 손상 격리,
+동일 basename/상이한 sha 공존, 미선언 해시 미수용, 인덱스 파일 제외,
+크기/연령 prune, 경로 가드, 동시 collect 원자성(이 테스트가 실제 경합을
+발견 → 스크립트 게시도 tmp+mv로 원자화), DEB-키 코어( deb_key,
+deb_reuse_*, image_fingerprint)가 9ecb6e3과 바이트 동일함을 git show로 검증.
+
+### Round 24 addendum — run 40862002110 (branch bootstrap) findings
+1. **Actions cache branch scoping**: caches saved on `perf/ci-cache-layers`
+   are invisible to `perf/ci-source-cache` workflow_dispatch runs (only
+   same-branch + default-branch scopes are restorable; PR-base sharing
+   applies to PR events only). First run on the new branch therefore
+   restored NOTHING (sccache/depcache/L4 all miss → cold compile died at
+   94% on the 240-min guard, RC=124 — a bootstrap cost, not an L4 defect;
+   the same run SAVED all layers under its branch scope, so the next run
+   is warm). Dual restore-key fallbacks (`...-<base>-`, `...-`) then keep
+   working within the branch even when port-input-hash rotates.
+2. **Deb hash anchor is format-dependent**: repo.json here is
+   `pkg_format: debian`; the `<repo>-json` maps exist only in pacman mode.
+   The GPG-anchored deb hashes are the SHA256 stanzas of the
+   `<repo>*-Packages` files (verified per run against the gpg-verified
+   Release). v1 shipped json-only, so all 29 `_cache-all` debs were
+   correctly REJECTED as unverified (fail-closed behaved). Fixed:
+   collect now unions both anchors; T33k pins the debian path
+   (uppercase SHA256 normalized).
+3. Per-entry `L4 ACCEPT` audit log lines added (new entries only).
+
+### Round 24 addendum 2 — tarball preservation adapter (largest repeated cost)
+`x11-packages/chromium/build.sh:65` deletes the 1.87 GB extracted tarball
+("keep more space") BEFORE collect can see it — so L4 could not persist the
+single biggest per-rebuild download (github release; the exact failure
+class we are hardening). prepare_recipe now rewrites that ONE line in OUR
+CLONE ONLY (stock chromium untouched; sha256-verification untouched) to
+`:` + quoted audit note — the container has ~94 GB free after free-space,
+so the space rationale does not apply on this fleet. bash -n contract +
+T41 pin the substitution (quoted: an unquoted `( )` in the note was caught
+by [10] during development — evidence the local gates earn their keep).
+
+## Round 25 — Full security/functional audit + verification hardening (2026-10-30)
+
+Scope: read-only full audit of the R12 policy (Phase A), failure/boundary
+scenario inventory of runtime-target scripts + packaging glue (Phase B,
+F1-F22 ledger in chromium-evidence/r12/REPORT-R12-FULL-AUDIT-AO.md),
+test/CI verification (Phase C) and MAIN-device spot re-validation of the
+C3 artifact (Phase D). NO shipping security policy was touched: policy C++
+stays byte-identical (T15/T34i/[47]-[51]), no allowlist change, no
+disposition change, no key relaxation (T43 pins sensitivity INCREASE only).
+
+Findings fixed in this round (verification-integrity, minimal changes):
+
+1. Generated post_get_source hook (F1/F11): the fail-closed contract leaned
+   on build-package.sh's external `set -euo pipefail` (pinned de1dd3d1 line
+   21 — verified) plus a stale `>= 8 records` counter (19 records exist).
+   Now: transformer rc captured from PIPESTATUS, stderr tee'd into the
+   evidence log, EVERY unconditional rule (R1 R2 R3 R4 R5 R7 R9a R10 R11
+   R12) must appear as `] <id> `, and the anti-injection completion marker
+   is required. Stub matrix proves refusal with AND without builder options.
+2. CI Package gates (F2/F3): plain substring rule grep let `R1` match
+   R10/R11/R12 lines; an absent evidence mirror was WARN-only. Now anchored
+   `] <id> ` grep, build-log fallback for the mirror, and an empty evidence
+   chain on a FRESH build REFUSES (REUSED=1 legitimately skips evidence
+   discovery — the deb was gated on its originating run and the
+   manifest/chrome-sha/R12-marker chain re-verifies the bytes).
+3. DEB gates (F4c/F17): added bin/chromium-sandboxed ->
+   chromium-shield-wrapper.sh symlink-target assertion (a lost `ln -sfr`
+   repoint previously shipped an unsheilded bin entry silently) and a
+   no-maintainer-scripts invariant (preinst/postinst/prerm/postrm).
+4. deb_key dead inputs (F18): production recipe lives in x11-packages/
+   (PKG_DST), but the key hashed `packages/chromium-sandboxed` —
+   recipe_sha was a constant over an empty set and upstream detection was
+   dead; the T7/T8 packages/ fixtures masked it. Both layouts are now
+   hashed; T42 (untracked x11 recipe edit rotates the key) and T43
+   (repo.json rotates the key) pin the fix; T34i re-pinned accordingly
+   (deb_key intentionally upgraded, everything else still byte-pinned to
+   9ecb6e3). CI DEB_KEY rotates once — expected, documented.
+5. wrapper_guard (F12): set-but-empty PREFIX fell through the mixed-identity
+   check while the wrapper's `${PREFIX:-default}` exec'd the DEFAULT
+   installation. The guard now compares the wrapper's EFFECTIVE root; the
+   selftest expectation was flipped to refuse.
+6. Anti-injection scan (F11a): unreadable .cc targets (dangling symlink,
+   EACCES) escaped as an uncaught OSError traceback invisible to the log;
+   now a named `(unreadable <type>)` offender (fail closed, actionable).
+7. x11_gate (F14): the LD_PRELOAD assignment was an unquoted expansion —
+   spaces in the preload path word-split and the gate could measure an
+   UNSHEILDED binary. Array expansion; suite X1/X2.
+
+Contract suite: port/tests/verification_hardening_test.py (22 checks,
+harness [53]). Cache suite 75 -> 77 (T42/T43).
+
+Accepted/document-only findings (no code change this round, §N of the
+audit report): census cross-instance false-PASS window (F12; mitigated by
+cleanup_all + serial gate policy), device_gate trap/lock gaps (F13),
+remote_gate dpkg-interruption recovery (F15), CDP port collisions (F16),
+PulseAudio stale-socket preference (F5b), gnp_shim fork-inheritance
+coverage rests on R7/R8 (F22), deb-cache same-trust-domain tamper model
+(F19; package gates re-run regardless), publish_apt signing debt (F21;
+known, pre-approved design), co-install share-path conflicts (F6; fix
+already exists on hotfix/chromium-side-by-side-package-paths, unmerged —
+release-readiness item), report-accuracy correction: run 40646555506 was
+overall FAILURE (Save sccache/Upload/Post, node24 infra), NOT "all green"
+— the full-green proof for the R12 code line is the stacked-branch runs
+(40729241856/40745613135/40757904721 + C3 40903720830).
+
+Device spot (Phase D, MAIN SM-F956N Android17 6.1.162, this round):
+C3 artifact deb 93ad9894... payload diff -r == candidate-verified
+07ee85eb tree (0 differences; chrome 2f488177 == Build-ID ad45cce0 era
+binary) -> device evidence transfers; r12_spot.sh V40x10 + VS(strace)x3:
+13/13 cdp_crashes 0, hist-31 0, renderer Seccomp_filters min/max 2/2 and
+NoNewPrivs min 1 across ~10,200 census rows, VS strace set_tid_address
+36/36 allowed-continues, 0 traps, 0 SIGSYS kill lines; --no-sandbox
+tripwire 0; dpkg -4 / real profile untouched.
+
+## Round 26 — F6 release blocker resolved: side-by-side package path isolation (2026-10-30)
+
+Blocker (audit F6, confirmed against real artifacts): the sandboxed recipe
+inherited every stock-Chromium-owned installer path (share/applications/
+chromium.desktop, share/man/man1/chromium.1, icons hicolor/*/apps/chromium.png,
+metainfo/chromium.appdata.xml, bin/chromedriver, bin/headless_shell) — co-
+install with stock chromium is a dpkg file-ownership collision, and
+--force-overwrite would clobber stock (forbidden by project rails). The
+installed -4 tree still demonstrates the surface (f6 suite C2b; identity
+gate rejects the real pre-F6 deb listing exactly these paths — B7).
+
+Port: hotfix/chromium-side-by-side-package-paths (aebee77/40d7aba/1f7b612,
+never CI-verified) cherry-picked onto PR #26 HEAD; every intent preserved
+(fail-closed counted anchors, real-deb ownership gate, launcher isolation),
+plus TWO latent regressions the untested hotfix carried, found by this
+round's local CI-equivalent suites and fixed:
+1. rewrite_identity re-derived the second blind replace from `text`,
+   discarding the lib-dir move (main's chained form restored; pin A1).
+2. package_identity_gate stripped "./" BEFORE the trailing-slash skip, so
+   the package-root row became "" and raised on EVERY real deb (order
+   fixed; pin B1 with a well-formed deb — must PASS).
+
+F6 decisions (documented, human-reviewable):
+- Launcher isolation (hotfix intent kept): CHROME_DESKTOP, /etc/chromium
+  config dir and the fallback profile dir move under -sandboxed names.
+  Consequence: builds from this branch default to ~/.config/chromium-sandboxed
+  — the installed -4 continues using ~/.config/chromium (untouched); profile
+  migration for promoted builds is a human release-notes decision, NOT
+  performed here.
+- Ownership gate placement: inside Package gates, BEFORE any artifact use;
+  it also runs on REUSED=1 (proven: forged-consistent pre-F6 cache passes
+  content gates by design — bytes are honestly hashed — and is then refused
+  by the release chain; suite D1a/D1b).
+- Hardening interplay preserved: identity gate added without touching the
+  Round 25 hook/evidence/symlink/maintainer gates (suite [53] 22/22 still
+  green with the fixture extended to the isolated member set; DEB key
+  rotates again via port-input-hash — sensitivity direction only).
+
+Verification: new [54] suite 28 checks (rewrite chain/drift fail-closed,
+launcher isolation/idempotence, audit tamper negatives x3, gate positive +
+6 negatives + REAL pre-F6 deb refusal, install-set disjointness (static +
+real stock deb when F6_STOCK_DEB is provided; pool-retention absent today,
+proxy via installed tree C2b), reuse-chain refusal, stale-key refusal).
+Cache suite 78 green; hardening 22 green; full harness re-run recorded in
+the audit evidence (RC=0). CI: full build + REUSED dispatches on
+fix/f6-side-by-side (publish=false) with PACKAGE-IDENTITY-PASS as the new
+gate line; results appended to the F6 evidence section of the A–O report.
+
+
+## Round 27 — profile isolation defect fix + TESTBED tooling (2026-10-31)
+
+TESTBED (A13) evidence proved the Round-26 launcher isolation was incomplete:
+the only user-data-dir branch was upstream's ROOT failsafe, so regular users
+shared ~/.config/chromium — 3413 profile files (incl Default/Preferences)
+were written during a test run (evidence: chromium-evidence/r12/testbed2/00,01).
+Fix (minimal, in rewrite_launcher): anchored fail-closed injection of
+`set -- --user-data-dir="${XDG_CONFIG_HOME:-${HOME}/.config}/chromium-sandboxed" "$@"`
+for every user, skipped when any of "$@"/CHROMIUM_USER_FLAGS/CHROMIUM_FLAGS
+already carries --user-data-dir (explicit wins via chromium last-occurrence;
+no duplicates), set -- preserves whitespace, root block retained with the
+isolated path. audit() gains the injection needle (tamper-refusal).
+[54] extended 30→38: six REAL sh executions (default/XDG/explicit-arg/
+env-flags/spaces-HOME/root-simulated) + two upstream-drift fail-closed cases.
+
+Tooling: ws_proof/dl_proof retired the hardcoded .phc-main defaults —
+strict resolution (PHC_WRAPPER env → installed package on PATH → loud
+SystemExit) plus /proc/pid/exe cross-verification gates feeding the verdict
+(no PASS without an exe-verified packaged chrome). T3/T4 execution evidence
+is collected on TESTBED (Phase 4); nothing here claims unexecuted passes.
+
+
+### Round 27 addendum — crashpad isolation (TESTBED-proven, 2026-11-03)
+TESTBED measurement after the user-data-dir fix: the old profile was STILL
+written once per run — exactly one file, `~/.config/chromium/Crash Reports/
+settings.dat` (40 B). Cause: crashpad derives its database from the product
+name, not from --user-data-dir, so an isolated profile alone cannot stop it.
+Fix (launcher): export `BREAKPAD_DUMP_LOCATION` into the effective profile's
+`Crash Reports` (default isolated dir, or the explicit --user-data-dir when
+the user supplied one); an explicit BREAKPAD_DUMP_LOCATION env always wins.
+Verified on device: after the fix the old-profile tree hash and the
+settings.dat mtime were byte-stable across default/XDG/explicit/env runs.
+Second finding: the diagnostic tool `dl_proof.py` launches chrome DIRECTLY
+(bypassing the packaged launcher), so it reproduced the same write; the tool
+now pins BREAKPAD_DUMP_LOCATION to its throw-away test profile. Product path
+(wrapper -> launcher) and tool path are therefore both clean; the only writes
+ever observed in the stock profile are the two pre-fix ones (22:03 old
+launcher, 22:07 dl_proof), both recorded in the evidence logs.
+
+## Round 28 — single-lineage consolidation + cache structure normalisation (2026-11-03)
+
+Scope: investigation, patching and verification ONLY. No PR was merged or
+closed, no branch deleted, `main` was not pushed to, no release/deploy ran.
+
+### 28.1 Branch/PR lineage (measured, not quoted from reports)
+
+The R12 work is ONE linear stack on top of `main` (457e7ee):
+
+    main
+     └─ r12-bionic-set-tid-address           PR#22   +7   (bae5316)
+        └─ perf/ci-cache-layers             PR#24  +13   (9ecb6e3)
+           └─ perf/ci-source-cache          PR#25   +4   (304faba)
+              └─ audit/r12-full-verification PR#26  +5   (9570a3e)
+                 └─ fix/f6-side-by-side     PR#27   +6   (3995f75)
+                    └─ fix/r12-profile-isolation   +3   (b9e0064)  [no PR]
+
+`git merge-base --is-ancestor` shows every other branch is either already
+contained in `main` (all merged PR heads #1-#21) or carries no transferable
+work. No duplicate patch exists ACROSS branches; the duplication is INSIDE the
+stack:
+
+  * 99c0ce7 + 2b53516 + 85125e3 + db1aa61 (the "R12 fallback mirror" experiment)
+    are net-zero: `git diff 99c0ce7^ db1aa61 --stat` is EMPTY, i.e. the removal
+    reverted the addition byte-for-byte. Droppable without touching the tree.
+  * hotfix/chromium-side-by-side-package-paths (3 commits) is a parallel F6
+    attempt whose first two patch-ids are IDENTICAL to d4ea9af/6278bd7 in the
+    stack; the third (1f7b612) is the pre-Round-25 variant of de2a63a.
+  * diag/ci-node24 = 4 stack commits + an equivalent removal (96e0964, different
+    patch-id because it was rebased) + two throw-away probe workflows.
+
+Integration branch `integration/r12-main`: rebase of the stack onto `main`
+dropping the four net-zero commits => 34 commits, and `git rev-parse
+HEAD^{tree}` is byte-identical to b9e0064's tree
+(`a2dba2b83e33bcb41f9a1fd14ffc1f5e08f78794`). Content-wise the consolidation
+is a pure fast-forward: 38 -> 34 commits with ZERO behavioural delta.
+
+### 28.2 Why every R27 CI run failed (root cause, log-proven)
+
+F6-era runs found the prebuilt dependency: `Found chromium-host-tools in
+.../termux-x11/dists/x11` + `extracting ... to _cache-aarch64` (pre-ninja
+14-24 min). From 2026-10-31 the same pin logs
+`Download of chromium-host-tools@156.0.8078.47 from .../termux-main failed,
+building instead` -> `termux - building chromium-host-tools for arch aarch64`
+(14,487 ninja edges, 160-219 min). The live x11 repo now carries only
+156.0.8078.79 while the pin `de1dd3d1` demands 156.0.8078.47, so termux falls
+back to a source build that consumes the 240-minute BUILD_TIMEOUT_GUARD before
+the target's 28,877 edges start => RC=124 on every run. Same class of drift:
+libexpat 2.9.0 (pinned) vs 2.10.0 (live); run7 logged 17 "building instead"
+fallbacks. F6 was green because the prebuilt 8078.47 still existed then.
+
+### 28.3 Dependency-deb persistence (the fix)
+
+Upstream already implements exactly this: `--reuse-built-packages`
+(build-package.sh:548/573) => termux_download_deb_pac.sh:116-125: when the
+Packages lookup yields no hash and `$TERMUX_OUTPUT_DIR/<pkg>_<ver>_<arch>.deb`
+exists, it `ln -sf`s that deb into `_cache-aarch64` and returns 0. Dependency
+builds use the DEFAULT output dir (termux_run_build-package passes no -o), i.e.
+`<termux-packages>/output`, which is on the bind-mounted workspace. So:
+
+  * `ci.sh dep-output-collect` copies every non-target deb from `output/` into
+    `.termux-depcache/deps/` with a sha256 MANIFEST (runs on `always()` so a
+    guard-expired run still persists the host-tools deb it finished hours
+    earlier);
+  * `ci.sh dep-output-seed` copies them back into `output/` before the build;
+  * `build-package.sh` gains `--reuse-built-packages`.
+
+`deps/` is deliberately OUTSIDE the `_cache-aarch64` bind mount so termux can
+never mistake it for a repo hit; the only consumer is the upstream reuse
+branch. Fail-closed validation on both sides: manifest sha256 must match, the
+deb must parse via dpkg-deb control AND member listing, Architecture must be
+aarch64, the filename must be exactly `<Package>_<Version>_<arch>.deb`, and
+`chromium-sandboxed_*` is refused (a stale target can never be reused).
+Version/arch drift self-rejects because termux only ever looks for the exact
+DEP_VERSION filename. Anything rejected simply falls back to the source build
+that would have happened anyway.
+
+Prune policy: `deps/` is exempt from the 30-day age rule (it is the only
+surviving copy of the host-tools deb) and bounded by count
+(TERMUX_DEPCACHE_MAX_DEPS, default 40) inside the existing 2 GiB cap. The
+prune loops were also hardened against `set -e` early-exit (`[ cond ] && cmd`
+inside a pipeline subshell aborted the loop after the first file).
+
+### 28.4 Cache roles: main produces, everything else restores
+
+Measured facts (2026-11-03):
+
+  * GitHub cache entries are scoped to the SAVING branch; only default-branch
+    entries are visible from other branches. Evidence: f6-runC3-era restored
+    the main-scoped `7.0.0-...-azure-...` entry while ALL chromium keys missed
+    on a fresh branch; run7 restored only same-branch generations.
+  * Repo inventory at 2026-11-03: 15 entries / ~7.9 GB against the 10 GB LRU
+    budget, 13 of them saved by ONE branch, with 5 near-identical sccache
+    archives (361-454 MB) and 2 L4 archives (2.13 GB each) differing only by
+    `<run_id>`. Older branch generations (F6, audit) had already been evicted —
+    the "warm lineage" was unreproducible, not merely unused.
+
+Design:
+
+  * `cache_producer` input (default false) + `Resolve cache role` step:
+    producer = `refs/heads/main` OR explicit `cache_producer=true`
+    (pre-merge warm-up only). Producers WRITE; every other ref restores
+    main-scoped entries via the default-branch fallback and writes nothing.
+  * Save gates: producer AND the pre-existing non-empty guards. A consumer run
+    therefore performs ZERO cache IO on the write side, cannot create a
+    branch-private silo, and cannot evict shared entries.
+  * L4 key becomes input-derived: `chromium-srccache-aarch64-v2-<termux_sha>-
+    <run_id>` with a `-v2-<termux_sha>-` prefix and the legacy `-v1-` prefix as
+    a second fallback (existing archives stay inheritable). sccache/depcache
+    keys were already input-derived (base = termux sha + revision +
+    port-input-hash; depcache = termux sha) and keep their namespaces so the
+    14k-object sccache archive and the depcache remain inheritable.
+  * DEB reuse cache keeps `chromium-deb-v1-<DEB_KEY>` (already a pure input
+    hash) and becomes producer-written only.
+
+Consequence to accept explicitly: after the merge, `main`'s FIRST run is cold
+(host-tools source build) and will end RC=124 — but it persists the dep debs
+and the sccache objects. The SECOND main run reuses host-tools (~15 min
+pre-ninja) and has the full guard for the target. That two-run cold start is
+the only remaining cost; key design cannot remove it because cache scope cannot
+be transferred between branches.
+
+### 28.5 Guard decision
+
+BUILD_TIMEOUT_GUARD stays 240 minutes. With host-tools reused, measured warm
+pre-ninja is 14-24 min (F6) and the target's 28,877 edges run at 56-326
+edges/min depending on runner pace; the guard must keep failing loudly rather
+than mask a slow runner, and the 350-minute job cap leaves no room for a
+300-minute inner guard plus diagnostics. Revisit only if a post-fix GREEN run
+shows the target itself exceeding ~200 min.
+
+### 28.6 Verification status (no unexecuted claim)
+
+Local: full harness incl. new suite [55] host-tools reuse (22 checks, real
+dpkg-deb fixtures) — see REPORT-R28-INTEGRATION.md for the recorded counts.
+CI: the two-run producer sequence on `integration/r12-main` is the acceptance
+test for §28.3/§28.4 (run A cold -> dep debs persisted; run B -> "Found
+chromium-host-tools in .../output", pre-ninja collapse, GREEN build). Until
+those runs exist, host-tools elimination is VERIFIED-BY-CONSTRUCTION ONLY and
+must not be reported as measured.
+
+## Round 33 — upstream 157 GetStackTop refactor (R8 anchor drift)
+
+### 33.1 Symptom
+The scheduled pipeline moved to upstream 157.0.8103.38/.50 and every build
+failed closed at the transformer:
+
+    [    PORT ERROR] R8 bionic stack-top cache (PA stack.cc): expected exactly one old form, found 0
+
+(auto-build issues #29/#32-#36; runs 42178147103 .. 43175216128).
+
+### 33.2 Root cause (measured against the real upstream file)
+`refs/tags/157.0.8103.50` changes `partition_alloc/stack/stack.cc`:
+
+* `void* GetStackTop()` -> `uintptr_t GetStackTop()` (return type widened);
+* the POSIX arm is now `#elif PA_BUILDFLAG(IS_POSIX) || PA_BUILDFLAG(IS_FUCHSIA)`
+  instead of a plain `#else`;
+* the base return becomes `reinterpret_cast<uintptr_t>(base) + size` (no
+  `PA_UNSAFE_TODO` wrapper).
+
+Our R8 anchor was written against 156's `void*` form, so the count was 0 and the
+port refused to build. Fail-closed behaviour is correct; the anchor was stale.
+
+### 33.3 Fix (shape-aware anchor, same security semantics)
+* `replace_optional_variants()` selects the single variant whose old form matches
+  the tree; ambiguous (2+) or unknown (0) shapes still raise `PortError`, and an
+  already-patched tree reports ALREADY_PRESENT with the variant label.
+* R8A has two approved bodies: `156 (void*)` (unchanged) and `157 (uintptr_t)`
+  (same bionic-guarded, main-thread-only single cache).
+* `TermuxPrewarmStackTop()` returns `reinterpret_cast<void*>(GetStackTop())` so
+  one definition compiles against both return types.
+* No syscall policy, packaging or release surface is touched.
+
+### 33.4 Verification status
+* Transformer run against the **real** 157.0.8103.50 sources (11 files fetched
+  from chromium.googlesource.com): every rule APPLIED, all markers VERIFIED,
+  re-apply idempotent.
+* Suite [57] pins the three shapes: 157 -> variant 157, re-apply -> ALREADY_PRESENT,
+  156 -> variant 156, unknown drift -> PORT ERROR.
+* Suite [52] T15d/T15d2/T15e now pin the shape-independent rule constants to
+  bae5316, the patch order, and the R8 security semantics of both variants.
+* Full harness: see the commit message for the exact suite count/RC. A real 157
+  build on `main` is the acceptance test and is NOT claimed here.
+
+### 33.5 Maintenance gate — do not build a version the recipe does not declare
+
+The 157 outage had a second cause beyond the R8 anchor: the daily probe targets
+`host-tools`' version and `prepare_recipe` aligns the chromium recipe to it. When
+termux bumps **chromium-host-tools before the chromium recipe** (157.0.8103.38 on
+2026-11-05 while the recipe still said 156.0.8078.79), that alignment produces a
+tree whose recipe/cr-patches are one version behind: the attempt died in
+`gn gen` with `Undefined identifier … //v8/BUILD.gn run_metagen` after 235 min
+(run 43453888322).
+
+`decide()` now refuses such a target:
+
+    action=skip reason=upstream-recipe-not-ready
+
+The previous validated baseline is kept, no issue is opened, and no 4-hour runner
+is burned. The build resumes automatically once termux bumps the chromium recipe
+(measured: master `f6bf3c45` declares 157.0.8103.50 in BOTH files).
+
+## Round 32 — device gate root cause: fork-unsafe main-thread test in R8
+
+R32 ran the 157.0.8103.50 deb on the remote testbed (clean, Android 13, aarch64):
+
+* `dpkg -i` path **PASS**;
+* renderer sandbox **activated** 15,423 times in 2 minutes
+  (`r12-bionic-tid: renderer allow active` + `Activated seccomp-bpf sandbox for
+  process type: renderer.`);
+* but every renderer died immediately:
+
+      couldn't open /proc/self/stat: Operation not permitted
+      libc: couldn't open /proc/self/stat: Operation not permitted
+      -> SIGABRT (ImmediateCrash), 30,848 times
+
+strace: `seccomp(SECCOMP_SET_MODE_FILTER)` -> handshake -> writev(2, message) ->
+`rt_sigaction(SIGABRT, SIG_DFL)` -> `tgkill(SIGABRT)`; all filter-using processes
+died by SIGABRT and **no SIGSYS kill** occurred.
+
+Cause: R8's cache predicate was
+`pthread_equal(pthread_self(), g_termux_main_thread)`, where the global was
+captured at static-init time and inherited across `fork()`. In a renderer the
+predicate is false, the cache is bypassed, and bionic's main-thread
+`pthread_getattr_np` opens `/proc/self/stat` (157-era bionic; 156 used
+`/proc/self/maps`), which the BPF denies -> LOG(FATAL) -> abort loop.
+
+Fix: replace the predicate with the fork-safe `gettid() == getpid()` (the same
+rule upstream 157 uses in `partition_alloc_base/debug/stack_trace.cc`), and add a
+bionic-guarded `#include <unistd.h>` so both are declared. The prewarm in
+`StartSeccompBPF` still fills the cache per process **before** the filter.
+
+Gate harness fixes (test tooling, not product): `remote_gate.sh` now points
+`bpf_evidence.sh` at `chromium-device-gate/extracted`; the existing
+presence-proxy path in `device_gate.sh` stays the fallback because this Android
+13 kernel does not export `Seccomp_filters`.
+
+Verification status: local transformer/harness only until the rebuilt deb is
+re-tested on the testbed; no device PASS is claimed here.
+
+## Round 32b — the actual renderer crash: the gnp shield was fork-unsafe
+
+After the R8 fork-safe change the testbed still showed the same fatal:
+
+    libc: couldn't open /proc/self/stat: Operation not permitted
+
+Bionic 13 implements `pthread_getattr_np()` for the main thread via
+`__find_main_stack_limits()` -> `__get_main_stack_startstack()`, which reads
+`/proc/self/stat` (and next `/proc/self/maps`) and `async_safe_fatal()`s when the
+read fails. The port's catch-all answer is `port/gnp_shim.c`
+(libtermux-gnp-fix.so, LD_PRELOADed by chromium-shield-wrapper.sh): a constructor
+snapshots the main thread's `pthread_attr_t` before any sandbox exists and hands
+it to later callers.
+
+Defect: the shield matched with `pthread_equal(thread, g_main_thread)`, where
+`g_main_thread` is the loading process's tid, inherited across `fork()`. In a
+renderer the predicate is false, the shield silently falls through to bionic, and
+the first post-activation main-thread `pthread_getattr_np()` aborts.
+
+Fix: recognise the child's own main thread with `gettid() == getpid()` (and keep
+`thread == pthread_self()` so only the calling main thread is served). The
+snapshot bounds stay exact because sandboxed children are forked, never exec'd,
+so the main stack mapping is a byte-copy at identical addresses.
+
+Verified on the testbed with the pre-built 157 chrome plus the recompiled shim
+(preload experiment, no CI rebuild needed):
+
+    activations=7  procstat_eperm=0
+    --dump-dom -> <body data-js="yes"><h1 id="x">ok-rendered</h1>
+
+Device PASS is still NOT claimed: the rebuilt deb must be re-gated, and
+`device_gate.sh` now launches the shipped shield wrapper (product path) instead
+of the raw binary.
+
+## Round 34 — maintainability P0 (protection, gate unit tests, action pins)
+
+Audit of the repository at `b13c8ec` rated maintainability ~7/10; the three P0
+items were applied:
+
+1. **main branch protection**: required status check `selftest`, no force pushes,
+   no branch deletion. `publisher-regression.yml` now runs the selftest on
+   **every** pull request (the old paths filter would have left docs-only PRs
+   permanently unmergeable once the check became required).
+2. **device-gate census extraction + unit tests**: the parsing that shipped three
+   real bugs on the R32 testbed (label prefix looked up in the wrong stream,
+   missing zygote->renderer reclassification, filter-count-only verdict on
+   kernels that hide `Seccomp_filters`) now lives in `port/gate_lib.sh` with
+   `gate_classify` / `gate_field` / `gate_present` / `gate_decide`.
+   `port/tests/gate_parsing_test.py` builds a fake `PROC_ROOT` and exercises the
+   real shell code (7 tests), wired into the harness as `[58]`. `gate_decide`
+   also fails on any crash signature, even when filters are exported.
+3. **GitHub Actions pinned to Node-24 major versions by SHA**:
+   checkout v5, cache/restore+save v5, upload-artifact v6, download-artifact v7;
+   local `./.github/actions/zram` unchanged. This removes the Node-20
+   deprecation warnings and hardens supply chain (no floating tags).
+
+Device-level behaviour is unchanged; `device_gate.sh` keeps its CLI and now
+requires `gate_lib.sh` next to it.
