@@ -23,17 +23,16 @@
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 static int (*g_real_gnp)(pthread_t, pthread_attr_t *);
 static pthread_attr_t g_main_attr;
-static pthread_t g_main_thread;
 static int g_main_ok;
 
 __attribute__((constructor)) static void termux_gnp_init(void) {
   g_real_gnp = (int (*)(pthread_t, pthread_attr_t *))
       dlsym(RTLD_NEXT, "pthread_getattr_np");
-  g_main_thread = pthread_self();
-  g_main_ok = (g_real_gnp != 0) && (g_real_gnp(g_main_thread, &g_main_attr) == 0);
+  g_main_ok = (g_real_gnp != 0) && (g_real_gnp(pthread_self(), &g_main_attr) == 0);
 }
 
 int pthread_getattr_np(pthread_t thread, pthread_attr_t *attr) {
@@ -41,7 +40,15 @@ int pthread_getattr_np(pthread_t thread, pthread_attr_t *attr) {
     g_real_gnp = (int (*)(pthread_t, pthread_attr_t *))
         dlsym(RTLD_NEXT, "pthread_getattr_np");
   }
-  if (g_main_ok && attr != 0 && pthread_equal(thread, g_main_thread)) {
+  /* Fork-safe main-thread test (Round 32): the constructor ran in the loading
+   * process, and sandboxed children are forked from it -- never exec'd -- so
+   * they inherit both this library and a byte-copy of the main stack mapping
+   * at the same addresses. pthread_equal(thread, g_main_thread) is FALSE in
+   * every forked child (the inherited tid belongs to the parent), which
+   * silently disabled this shield in renderers; gettid()==getpid() identifies
+   * the child's own main thread and the inherited snapshot bounds stay exact. */
+  if (g_main_ok && attr != 0 && gettid() == getpid() &&
+      pthread_equal(thread, pthread_self())) {
     *attr = g_main_attr;
     return 0;
   }
