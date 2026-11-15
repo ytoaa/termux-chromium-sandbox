@@ -53,7 +53,7 @@ jobs:
               | sed -n 's/^TERMUX_PKG_VERSION="\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -1
           }
           chromium=$(fetch_version x11-packages/chromium)
-          host=$(fetch_version chromium-host-tools)
+          host=$(fetch_version x11-packages/chromium-host-tools)
           echo "termux_ref=$ref chromium=${chromium:-?} host=${host:-?}"
           ready=no; reason="recipe-not-ready"
           if [ -n "${chromium:-}" ] && [ "$chromium" = "${host:-}" ]; then ready=yes; reason="versions-match"; fi
@@ -103,15 +103,15 @@ jobs:
           count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/cache/usage" --jq '.active_caches_count')
           gb=$(( bytes / 1000000000 ))
           echo "active caches: ${count}, ${gb} GB"
-          open=$(gh issue list --label cache-budget --state open --json number --jq '.[0].number // empty')
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label cache-budget --state open --json number --jq '.[0].number // empty')
           if [ "$bytes" -gt 8000000000 ]; then
             body="Cache pool is at **${gb} GB / ${count} entries** (limit 8 GB warning, 10 GB hard). Prune superseded generations (keep newest L4 + sccache + depcache)."
             if [ -n "$open" ]; then
-              gh issue comment "$open" --body "$body"
+              gh issue comment -R "$GITHUB_REPOSITORY" "$open" --body "$body"
             else
-              gh issue create --title "[cache] pool above 8 GB (${gb} GB, ${count} entries)" --label cache-budget --body "$body"
+              gh issue create -R "$GITHUB_REPOSITORY" --title "[cache] pool above 8 GB (${gb} GB, ${count} entries)" --label cache-budget --body "$body"
             fi
           elif [ -n "$open" ]; then
-            gh issue comment "$open" --body "Pool back to **${gb} GB / ${count} entries** — closing."
-            gh issue close "$open"
+            gh issue comment -R "$GITHUB_REPOSITORY" "$open" --body "Pool back to **${gb} GB / ${count} entries** — closing."
+            gh issue close -R "$GITHUB_REPOSITORY" "$open"
           fi
