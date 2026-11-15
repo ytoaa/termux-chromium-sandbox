@@ -15,10 +15,11 @@ the repository is self-explanatory without that workspace.
 
 ## Latest state snapshot (as of Round 34)
 
-* `main` = `da1fec7` (P0 maintainability), branch protection requires `selftest`.
+* `main` = `76b0bda` (P0+P1 maintainability), branch protection requires `selftest`.
 * Latest GREEN producer build: `43760242491` (157.0.8103.50, RC=0, gates PASS,
   artifact 160,998,876 B), run before the docs split.
-* Cache pool: 3 layers kept (L4 + sccache + depcache), ~3.9 GB at last audit.
+* Cache pool: 3 layers kept (L4 + sccache + depcache), ~3.85 GB at last audit.
+* Cache warm/budget workflow: `.github/workflows/cache-warm.yml` (probe + 8 GB guard).
 * Open PR 0, open issue 1 (#12 operational tracker), remote branches 3.
 * Known limits: testbed kernel hides `Seccomp_filters` (proxy criteria);
   `download-artifact` v7 validation pending the next daily run.
