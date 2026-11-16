@@ -163,3 +163,8 @@ F1–F22 중 미완 항목은 A–O 보고서 §F 장부 그대로 유효(본 �
 - checkout v5 SHA·cache v5 restore/save·upload-artifact v6 모두 정상, Node20 경고 0.
 - RC=0, 4,317s, 29,242/29,242, PORT GATES PASS, artifacts(build 160,998,876B + gate 5,846B).
 - download-artifact v7은 이 런에서 미실행 → 다음 daily 런에서 확인 대기(미검증 표기 유지).
+
+## 22. R34 브랜치 최소화 (필수 2개)
+- `r12-artifacts`(e70801a): archive tag `r34-archive/r12-artifacts-e70801a`로 동결 → 브랜치 삭제. tag에서 run-40616244636(빌드 로그·deb 파트·MANIFEST·publish-intent) 조회 가능 확인.
+- 원격 브랜치 **2개**: `main`(보호됨), `maintenance-state`(파이프라인 상태 채널 — 삭제 금지).
+- 로컬 브랜치 main만, 열린 PR 0.

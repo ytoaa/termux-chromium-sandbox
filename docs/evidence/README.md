@@ -20,6 +20,9 @@ the repository is self-explanatory without that workspace.
   artifact 160,998,876 B), run before the docs split.
 * Cache pool: 3 layers kept (L4 + sccache + depcache), ~3.85 GB at last audit.
 * Cache warm/budget workflow: `.github/workflows/cache-warm.yml` (probe + 8 GB guard).
-* Open PR 0, open issue 1 (#12 operational tracker), remote branches 3.
+* Open PR 0, open issue 1 (#12 operational tracker), **remote branches 2**:
+  `main` (code, protected) and `maintenance-state` (bot-owned pipeline state).
+  `r12-artifacts` was archived as tag `r34-archive/r12-artifacts-e70801a` and deleted;
+  its run-40616244636 evidence stays reachable from that tag.
 * Known limits: testbed kernel hides `Seccomp_filters` (proxy criteria);
   `download-artifact` v7 validation pending the next daily run.
